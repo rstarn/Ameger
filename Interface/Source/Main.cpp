@@ -290,12 +290,6 @@ namespace
         std::wstring name;
         Architecture architecture = Architecture::Unknown;
         bool by_name = false;
-        // Raw FILETIME creation stamp of the target, captured while
-        // QueryProcess already held a query handle (no extra OpenProcess).
-        // Used only to warn when injection lands late in the game's boot, the
-        // suspected trigger for a payload DllMain that refuses to initialize.
-        // 0 means "unknown".
-        ULONGLONG creation_time = 0;
     };
 
     struct WizardConfig
@@ -467,11 +461,9 @@ namespace
         return slash == std::wstring::npos ? std::wstring() : path.substr(0, slash + 1);
     }
 
-    std::wstring RuntimePath()
-    {
-        const std::wstring directory = ExecutableDirectory();
-        return directory.empty() ? std::wstring() : directory + kRuntime64;
-    }
+    // Runtime identity is now resolved by embedded SHA-256 (see
+    // DiscoverRuntimePath below) rather than by a fixed filename, so the
+    // shipped runtime DLL may carry a benign name.
 
     bool FileExists(const std::wstring & path)
     {
@@ -627,11 +619,20 @@ namespace
     // Picks a hijack-victim thread for the target with a pure
     // SystemProcessInformation query (nothing is opened, nothing is touched
     // in the target). Returns 0 when no suitable thread exists - the runtime
-    // then falls back to its own search. Scoring: a parked Waiting thread
-    // (except WrQueue) beats Running beats anything else. A Running thread
-    // is liable to be inside a scan/dispatch loop, where suspending it skews
-    // timing checks and parks anomalous state; a waiter sits in ntdll with a
-    // clean stack, so borrowing it for the 1-3 s shell run is lower-signal.
+    // then falls back to its own search.
+    //
+    // Scoring is constrained by the runtime's sponsor-thread accept gate:
+    // SR_HijackThread only honors a pre-opened sponsor handle when the victim
+    // is alertable OR Running. The Interface can observe thread state but NOT
+    // alertable state (that needs a live GetThreadContext), so a Waiting
+    // sponsor that is not in an alertable wait is rejected at runtime and the
+    // handle falls through to a full target handle-table scan
+    // (SystemExtendedHandleInformation) - the single loudest
+    // target-observable event in the acquisition trace. Therefore prefer
+    // Running threads: they are accepted by the runtime, the sponsor-thread
+    // fast path fires, and the scan is skipped. The trade is a sub-millisecond
+    // Running-thread suspension (well under GetTickCount64 granularity), which
+    // the runtime already accepts in its own 3-tier search tier 2/3.
     AMEGER_VMP_NOINLINE DWORD PickHijackThreadTid(DWORD target_pid)
     {
         AMEGER_VMP_ULTRA_BEGIN("ui_picktid");
@@ -712,11 +713,18 @@ namespace
                     }
 
                     int score = 1;
-                    if (thread->ThreadState == 5 && thread->WaitReason != 0x0F) // Waiting, not WrQueue
+                    // Running threads are accepted by the runtime's sponsor
+                    // validation (alertable || Running), so a Running sponsor
+                    // fires the fast path and skips the handle-table scan.
+                    if (thread->ThreadState == 2)
                     {
                         score = 3;
                     }
-                    else if (thread->ThreadState == 2) // Running
+                    // Waiting (except WrQueue) is the lower-tier fallback: a
+                    // non-alertable waiter is still rejected at runtime, which
+                    // is what triggers a handle-table scan. Kept as a fallback
+                    // only when no Running thread is available.
+                    else if (thread->ThreadState == 5 && thread->WaitReason != 0x0F)
                     {
                         score = 2;
                     }
@@ -724,10 +732,10 @@ namespace
                     // Deterministic main-thread bias: snapshot order is not
                     // guaranteed, so ties break toward the smallest TID. The
                     // main thread is created first (lowest TID) and is the
-                    // most likely to be in a stable alertable wait early in
-                    // boot; without this, late-boot thread-pool/Warden threads
-                    // win the lottery depending on enumeration order and the
-                    // payload's DllMain runs on a different thread each run.
+                    // most likely to be Running early in boot; without this,
+                    // late-boot thread-pool/Warden threads win the lottery
+                    // depending on enumeration order and the payload's DllMain
+                    // runs on a different thread each run.
                     if (score > best_score ||
                         (score == best_score && best_tid != 0 && tid < best_tid))
                     {
@@ -1302,14 +1310,111 @@ namespace
         return true;
     }
 
+    // Reconstructs the canonical uppercase SHA-256 hex embedded in the
+    // Interface by Build\Create.bat (AMEGER_RUNTIME_DLL_HASH0..7). Returns
+    // empty when no hash is embedded (dev/ungated build).
+    std::wstring ExpectedRuntimeHash()
+    {
+        constexpr uint32_t words[] =
+        {
+            AMEGER_RUNTIME_DLL_HASH0, AMEGER_RUNTIME_DLL_HASH1,
+            AMEGER_RUNTIME_DLL_HASH2, AMEGER_RUNTIME_DLL_HASH3,
+            AMEGER_RUNTIME_DLL_HASH4, AMEGER_RUNTIME_DLL_HASH5,
+            AMEGER_RUNTIME_DLL_HASH6, AMEGER_RUNTIME_DLL_HASH7
+        };
+        bool has_hash = false;
+        for (uint32_t w : words)
+        {
+            has_hash = has_hash || w != 0;
+        }
+        if (!has_hash)
+        {
+            return std::wstring();
+        }
+        constexpr wchar_t hex[] = L"0123456789ABCDEF";
+        std::wstring out;
+        out.reserve((sizeof(words) / sizeof(words[0])) * 8);
+        for (uint32_t w : words)
+        {
+            for (int shift = 28; shift >= 0; shift -= 4)
+            {
+                out.push_back(hex[(w >> shift) & 0x0F]);
+            }
+        }
+        return out;
+    }
+
+    // Locate the runtime DLL by SHA-256 identity rather than by a hardcoded
+    // filename. This decouples the host from the on-disk name, so the shipped
+    // runtime may carry a benign/random name without breaking discovery and
+    // filename-based tells are moot. Falls back to the legacy name only for
+    // ungated dev builds where no hash is embedded.
+    std::wstring DiscoverRuntimePath()
+    {
+        const std::wstring directory = ExecutableDirectory();
+        if (directory.empty())
+        {
+            return std::wstring();
+        }
+
+        const std::wstring expected = ExpectedRuntimeHash();
+        if (expected.empty())
+        {
+            const std::wstring legacy = directory + kRuntime64;
+            return FileExists(legacy) ? legacy : std::wstring();
+        }
+
+        WIN32_FIND_DATAW entry{};
+        const std::wstring pattern = directory + L"*.dll";
+        const HANDLE find = FindFirstFileExW(pattern.c_str(), FindExInfoStandard,
+            &entry, FindExSearchNameMatch, nullptr, 0);
+        if (find == INVALID_HANDLE_VALUE)
+        {
+            return std::wstring();
+        }
+
+        std::wstring hit;
+        do
+        {
+            if (wcscmp(entry.cFileName, L".") == 0 || wcscmp(entry.cFileName, L"..") == 0 ||
+                (entry.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0)
+            {
+                continue;
+            }
+            const std::wstring candidate = directory + entry.cFileName;
+            HANDLE file = CreateFileW(candidate.c_str(), GENERIC_READ, FILE_SHARE_READ,
+                nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+            if (file == INVALID_HANDLE_VALUE)
+            {
+                continue;
+            }
+            std::vector<BYTE> bytes;
+            if (ReadHandleBytes(file, bytes) && !bytes.empty())
+            {
+                const std::wstring digest = Sha256Hex(bytes);
+                if (!digest.empty() && _wcsicmp(digest.c_str(), expected.c_str()) == 0)
+                {
+                    hit = candidate;
+                }
+            }
+            CloseHandle(file);
+            if (!hit.empty())
+            {
+                break;
+            }
+        } while (FindNextFileW(find, &entry));
+        FindClose(find);
+        return hit;
+    }
+
     // Loads the runtime DLL and resolves its exported functions.
     AMEGER_VMP_NOINLINE bool LoadRuntime(Runtime & runtime)
     {
         AMEGER_VMP_ULTRA_BEGIN("ui_loadrt");
-        const std::wstring path = RuntimePath();
+        const std::wstring path = DiscoverRuntimePath();
         if (path.empty() || !FileExists(path))
         {
-            PrintError(L"The Ameger Injector runtime DLL is missing in Build\\Release.");
+            PrintError(L"The runtime DLL could not be located in Build\\Release (SHA-256 match failed).");
             return false;
         }
 
@@ -1641,8 +1746,7 @@ namespace
         return system_info.wProcessorArchitecture == PROCESSOR_ARCHITECTURE_AMD64 ? Architecture::X64 : Architecture::X86;
     }
 
-    AMEGER_VMP_NOINLINE bool QueryProcess(DWORD pid, std::wstring & name, Architecture & architecture,
-        ULONGLONG * creation_time = nullptr)
+    AMEGER_VMP_NOINLINE bool QueryProcess(DWORD pid, std::wstring & name, Architecture & architecture)
     {
         AMEGER_VMP_ULTRA_BEGIN("ui_queryp");
         HANDLE process = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
@@ -1659,22 +1763,6 @@ namespace
         DWORD length = static_cast<DWORD>(std::size(path));
         const BOOL queried = QueryFullProcessImageNameW(process, 0, path, &length);
         architecture = ProcessArchitecture(process);
-        // Reuse the handle already held for the name query: reading the
-        // creation stamp costs no extra OpenProcess (the project deliberately
-        // minimizes handle telemetry). The other three FILETIME outputs are
-        // required by the API but unused here.
-        if (creation_time)
-        {
-            FILETIME creation_ft{};
-            FILETIME exit_ft{};
-            FILETIME kernel_ft{};
-            FILETIME user_ft{};
-            if (GetProcessTimes(process, &creation_ft, &exit_ft, &kernel_ft, &user_ft))
-            {
-                *creation_time = (static_cast<ULONGLONG>(creation_ft.dwHighDateTime) << 32) |
-                    creation_ft.dwLowDateTime;
-            }
-        }
         CloseHandle(process);
         if (!queried)
         {
@@ -1743,56 +1831,11 @@ namespace
                 return false;
             }
             target.pid = pid;
-            return QueryProcess(pid, target.name, target.architecture, &target.creation_time);
+            return QueryProcess(pid, target.name, target.architecture);
         }
 
         AMEGER_VMP_ULTRA_END();
-        return QueryProcess(target.pid, target.name, target.architecture, &target.creation_time);
-    }
-
-    // Seconds since the target started, or 0 when unknown. 0 means "cannot
-    // prove late", so callers must allow the injection to proceed.
-    AMEGER_VMP_NOINLINE ULONGLONG TargetAgeSeconds(const TargetSelection & target)
-    {
-        AMEGER_VMP_ULTRA_BEGIN("ui_targetage");
-        if (!target.creation_time)
-        {
-            AMEGER_VMP_ULTRA_END();
-            return 0;
-        }
-        FILETIME now_ft{};
-        GetSystemTimeAsFileTime(&now_ft);
-        const ULONGLONG now = (static_cast<ULONGLONG>(now_ft.dwHighDateTime) << 32) |
-            now_ft.dwLowDateTime;
-        if (now <= target.creation_time)
-        {
-            AMEGER_VMP_ULTRA_END();
-            return 0;
-        }
-        AMEGER_VMP_ULTRA_END();
-        return (now - target.creation_time) / 10000000ull;
-    }
-
-    // Fail-fast late-boot gate. Returns true when injection may proceed.
-    // A target older than max_age_seconds is refused BEFORE any remote
-    // allocation: attempting it would hit payload DllMain FALSE (00400013)
-    // and leave unreclaimable loader dangles (inverted table + TLS index).
-    AMEGER_VMP_NOINLINE bool CheckEarlyBootTarget(const TargetSelection & target, ULONGLONG max_age_seconds)
-    {
-        AMEGER_VMP_ULTRA_BEGIN("ui_earlyboot");
-        const ULONGLONG age = TargetAgeSeconds(target);
-        if (age > max_age_seconds && max_age_seconds > 0)
-        {
-            fwprintf(stderr, L"%ls[x]%ls %ls is %llu seconds old; late injection will be refused by the payload (00400013).\n",
-                kRed, kReset, target.name.c_str(), age);
-            wprintf(L"    Relaunch the game AFTER this injector shows \"Waiting for %ls...\" and inject within the first seconds.\n",
-                target.requested_name.c_str());
-            wprintf(L"    Aborting without injecting so the target's loader state stays clean.\n");
-            AMEGER_VMP_ULTRA_END();
-            return false;
-        }
-        AMEGER_VMP_ULTRA_END();
-        return true;
+        return QueryProcess(target.pid, target.name, target.architecture);
     }
 
     AMEGER_VMP_NOINLINE bool SelectTarget(const std::wstring & configured_name, TargetSelection & target, bool & cancelled)
@@ -1805,32 +1848,10 @@ namespace
         for (;;)
         {
             const DWORD found = FindProcess(target.requested_name);
-            if (found && QueryProcess(found, target.name, target.architecture, &target.creation_time))
+            if (found && QueryProcess(found, target.name, target.architecture))
             {
                 target.pid = found;
                 wprintf(L"%ls[+]%ls %ls detected | PID: %ls%lu%ls\n", kGreen, kReset, target.name.c_str(), kGreen, static_cast<unsigned long>(found), kReset);
-                // Early-boot gate data: a target that has already been up for
-                // a while is the late-in-boot case that makes the payload's
-                // DllMain return FALSE (00400013). Warn here; the wizard
-                // enforces fail-fast after detection so a late target is never
-                // injected (which would only dirty loader state).
-                if (target.creation_time)
-                {
-                    FILETIME now_ft{};
-                    GetSystemTimeAsFileTime(&now_ft);
-                    const ULONGLONG now = (static_cast<ULONGLONG>(now_ft.dwHighDateTime) << 32) |
-                        now_ft.dwLowDateTime;
-                    if (now > target.creation_time)
-                    {
-                        const ULONGLONG age_seconds = (now - target.creation_time) / 10000000ull;
-                        if (age_seconds > 20ull)
-                        {
-                            wprintf(L"  %ls[!]%ls %ls has been running for %llus; injecting this late in the\n",
-                                kYellow, kReset, target.name.c_str(), age_seconds);
-                            wprintf(L"    game's boot is unreliable. Relaunch it and inject within the first seconds.\n");
-                        }
-                    }
-                }
                 return true;
             }
 
@@ -3284,7 +3305,7 @@ namespace
         {
             ++step;
             wprintf(L"\n\n[%ls%d%ls/%ls%d%ls] Verify string encryption...\n\n", kGreen, step, kReset, kGreen, total, kReset);
-            const std::wstring rt_path = RuntimePath();
+            const std::wstring rt_path = DiscoverRuntimePath();
             // Every entry is a literal that must not survive anywhere in the
             // shipped runtime DLL. Keep this list in step with the string tiers:
             // add a marker whenever a new sensitive name is introduced as a
@@ -3295,6 +3316,14 @@ namespace
                 "NtUserMsgWaitForMultipleObjectsEx",
                 "LdrpLoadDllInternal",
                 "ntdll.dll",
+                // VMProtect SDK import name. Present only when markers are
+                // compiled on without VMProtect rewriting the import table
+                // (i.e. an AMEGER_SKIP_VMP=1 build that forgot to disable
+                // markers). The protected build has VMProtect mangle this
+                // import, so a miss here is expected and harmless; a hit is a
+                // regression that leaks a vendor fingerprint the anti-cheat
+                // signature set keys on.
+                "VMProtectSDK64.dll",
             };
             const size_t marker_count = sizeof(markers) / sizeof(markers[0]);
             int marker_found = 0;
@@ -4377,11 +4406,6 @@ namespace
                 return 0;
             }
         }
-
-        // Note: late boot only warns (see SelectTarget). A hard refuse here
-        // would have blocked your 25s success: late DllMain is probabilistic
-        // (thread/state lottery), not guaranteed failure, so never abort on
-        // age alone.
 
         const int timeout_value = config.timeout;
 

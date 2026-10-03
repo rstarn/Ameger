@@ -108,6 +108,17 @@ echo.
 echo   %C_YELLOW%Warning: per-build sentinels unavailable; using default constants.%C_RESET%
 
 :seeds_ready
+rem AMEGER_SKIP_VMP=1 disables VMProtect application. VMProtect markers are
+rem only meaningful under protection: they call into the VMProtect SDK
+rem (VMProtectSDK64.lib import) and, when protection is applied, VMProtect
+rem rewrites the resulting import table to obscure it. Skipping protection
+rem leaves a plaintext VMProtectSDK64.dll import in the shipped DLL with no
+rem rewriting to hide it, AND still deploys VMProtectSDK64.dll alongside the
+rem EXE. Skip-vmp therefore also disables markers (unless the caller
+rem explicitly opted in via AMEGER_VMP_MARKERS) so an unprotected build
+rem carries zero VMProtect vendor artifacts.
+if /i "%AMEGER_SKIP_VMP%"=="1" if not defined AMEGER_VMP_MARKERS set "AMEGER_VMP_MARKERS=0"
+
 set "MARKER_ARGS="
 if defined AMEGER_VMP_MARKERS set "MARKER_ARGS=/p:AmegerVmpMarkers=%AMEGER_VMP_MARKERS%"
 set "VMP_SDK_ARGS="
@@ -210,6 +221,13 @@ call :verify "%OUT64%\Injector - x64.exe" "x64 Interface"
 if errorlevel 1 goto :verify_error
 call :verify "%DEPS_RELEASE%\Ameger Injector - x64.dll" "x64 runtime"
 if errorlevel 1 goto :verify_error
+rem Rename the verified runtime DLL to a benign, hash-derived name. The host
+rem Interface locates it by the embedded SHA-256 (DiscoverRuntimePath), not by
+rem name, so a non-screaming filename is free and carries no functional cost.
+rem H0 is '0x........'; :~2,8 yields the 8 hex chars without the 0x prefix.
+if exist "%DEPS_RELEASE%\Ameger Injector - x64.dll" ren "%DEPS_RELEASE%\Ameger Injector - x64.dll" "rtdll_%H0:~2,8%.dll"
+if errorlevel 1 goto :rename_error
+set "RUNTIME_DEPLOYED=%DEPS_RELEASE%\rtdll_%H0:~2,8%.dll"
 call :remove_import_artifacts "%DEPS_RELEASE%"
 if errorlevel 1 goto :cleanup_error
 call :sweep_artifacts
@@ -238,7 +256,7 @@ echo %C_GREEN%Build completed successfully.%C_RESET%
 echo.
 echo Cache:   %C_GREEN%%RELEASE_CACHE%%C_RESET%
 echo Interface x64: %C_GREEN%%OUT64%\Injector - x64.exe%C_RESET%
-echo Runtime DLL: %C_GREEN%%DEPS_RELEASE%\Ameger Injector - x64.dll%C_RESET%
+echo Runtime DLL: %C_GREEN%%RUNTIME_DEPLOYED%C_RESET%
 echo.
 if "%NO_PAUSE%"=="0" pause
 exit /b 0
@@ -389,6 +407,10 @@ goto :failure
 echo %C_RED%ERROR: one or more expected binaries are missing.%C_RESET%
 goto :failure
 
+:rename_error
+echo %C_RED%ERROR: unable to apply the benign runtime DLL name (staged under the legacy name).%C_RESET%
+goto :failure
+
 :cleanup_error
 echo %C_RED%ERROR: unable to remove generated import artifacts.%C_RESET%
 goto :failure
@@ -431,7 +453,7 @@ echo %C_GREEN%Build completed successfully.%C_RESET%
 echo.
 echo Cache:   %C_GREEN%%RELEASE_CACHE%%C_RESET%
 echo Interface x64: %C_GREEN%%OUT64%\Injector - x64.exe%C_RESET%
-echo Runtime DLL: %C_GREEN%%DEPS_RELEASE%\Ameger Injector - x64.dll%C_RESET%
+echo Runtime DLL: %C_GREEN%%RUNTIME_DEPLOYED%C_RESET%
 if "%NO_PAUSE%"=="0" pause
 exit /b 0
 
