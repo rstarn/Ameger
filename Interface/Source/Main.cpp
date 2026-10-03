@@ -1,0 +1,4719 @@
+#include <Windows.h>
+#include <TlHelp32.h>
+#include <bcrypt.h>
+#include <wincrypt.h>
+#include <conio.h>
+#include <algorithm>
+#include <cerrno>
+#include <cstddef>
+#include <cstdint>
+#include <fcntl.h>
+#include <io.h>
+#include <climits>
+#include <cstring>
+#include <cwchar>
+#include <cwctype>
+#include <fstream>
+#include <sstream>
+#include <iostream>
+#include <limits>
+#include <string>
+#include <vector>
+#include <memory>
+#include <utility>
+
+#include "../../Ameger/Injection.h"
+#include "../../Ameger/Core/Foundation/Error.h"
+#include "../../Ameger/Core/Foundation/Primitives/VmpMarkers.h"
+#include "../../Ameger/Core/Foundation/Primitives/KcStrings/Core/XorString.h"
+#include "../../Ameger/Core/Utility/PE/PEImage.h"
+#include "../../Ameger/NT/NTDefinitions.h"
+
+#pragma comment(lib, "bcrypt.lib")
+#pragma comment(lib, "crypt32.lib")
+
+#ifndef AMEGER_RUNTIME_DLL_HASH0
+#define AMEGER_RUNTIME_DLL_HASH0 0
+#endif
+#ifndef AMEGER_RUNTIME_DLL_HASH1
+#define AMEGER_RUNTIME_DLL_HASH1 0
+#endif
+#ifndef AMEGER_RUNTIME_DLL_HASH2
+#define AMEGER_RUNTIME_DLL_HASH2 0
+#endif
+#ifndef AMEGER_RUNTIME_DLL_HASH3
+#define AMEGER_RUNTIME_DLL_HASH3 0
+#endif
+#ifndef AMEGER_RUNTIME_DLL_HASH4
+#define AMEGER_RUNTIME_DLL_HASH4 0
+#endif
+#ifndef AMEGER_RUNTIME_DLL_HASH5
+#define AMEGER_RUNTIME_DLL_HASH5 0
+#endif
+#ifndef AMEGER_RUNTIME_DLL_HASH6
+#define AMEGER_RUNTIME_DLL_HASH6 0
+#endif
+#ifndef AMEGER_RUNTIME_DLL_HASH7
+#define AMEGER_RUNTIME_DLL_HASH7 0
+#endif
+
+#ifndef RECA_DEFINED
+#define RECA_DEFINED
+#define ReCa reinterpret_cast
+#endif
+
+namespace
+{
+    // Runtime state and Interface helpers.
+    constexpr wchar_t kRuntime64[] = L"Ameger Injector - x64.dll";
+    constexpr wchar_t kReset[] = L"\x1b[0m";
+    constexpr wchar_t kGreen[] = L"\x1b[92m";
+    constexpr wchar_t kRed[] = L"\x1b[91m";
+    constexpr wchar_t kYellow[] = L"\x1b[93m";
+    // Muted, for field labels and alignment scaffolding that should recede
+    // behind the result values.
+    constexpr wchar_t kDim[] = L"\x1b[2m";
+
+    // Redirects runtime output while the DLL is being loaded.
+    class StdoutParkGuard
+    {
+        int saved_stdout_fd_ = -1;
+        int saved_stderr_fd_ = -1;
+        HANDLE saved_stdout_handle_ = nullptr;
+        HANDLE saved_stderr_handle_ = nullptr;
+        HANDLE stdout_nul_ = INVALID_HANDLE_VALUE;
+        HANDLE stderr_nul_ = INVALID_HANDLE_VALUE;
+
+    public:
+        StdoutParkGuard()
+        {
+            fflush(stdout);
+            fflush(stderr);
+
+            saved_stdout_fd_ = _dup(_fileno(stdout));
+            saved_stderr_fd_ = _dup(_fileno(stderr));
+
+            HANDLE nul = CreateFileW(L"NUL", GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, 0, nullptr);
+            int nul_fd = -1;
+            if (nul != INVALID_HANDLE_VALUE)
+            {
+                nul_fd = _open_osfhandle(reinterpret_cast<intptr_t>(nul), _O_WRONLY);
+                if (nul_fd == -1)
+                {
+                    CloseHandle(nul);
+                }
+            }
+            if (saved_stdout_fd_ != -1 && nul_fd != -1)
+            {
+                (void)_dup2(nul_fd, _fileno(stdout));
+            }
+            if (nul_fd != -1)
+            {
+                _close(nul_fd);
+            }
+
+            nul = CreateFileW(L"NUL", GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, 0, nullptr);
+            nul_fd = -1;
+            if (nul != INVALID_HANDLE_VALUE)
+            {
+                nul_fd = _open_osfhandle(reinterpret_cast<intptr_t>(nul), _O_WRONLY);
+                if (nul_fd == -1)
+                {
+                    CloseHandle(nul);
+                }
+            }
+            if (saved_stderr_fd_ != -1 && nul_fd != -1)
+            {
+                (void)_dup2(nul_fd, _fileno(stderr));
+            }
+            if (nul_fd != -1)
+            {
+                _close(nul_fd);
+            }
+
+            saved_stdout_handle_ = GetStdHandle(STD_OUTPUT_HANDLE);
+            saved_stderr_handle_ = GetStdHandle(STD_ERROR_HANDLE);
+            stdout_nul_ = CreateFileW(L"NUL", GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, 0, nullptr);
+            stderr_nul_ = CreateFileW(L"NUL", GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, 0, nullptr);
+            if (stdout_nul_ != INVALID_HANDLE_VALUE)
+            {
+                SetStdHandle(STD_OUTPUT_HANDLE, stdout_nul_);
+            }
+            if (stderr_nul_ != INVALID_HANDLE_VALUE)
+            {
+                SetStdHandle(STD_ERROR_HANDLE, stderr_nul_);
+            }
+        }
+
+        ~StdoutParkGuard()
+        {
+            fflush(stdout);
+            fflush(stderr);
+            // A failed _dup2 leaves the stream pointed at NUL, so the restore
+            // is best effort by nature and the return is deliberately
+            // acknowledged rather than checked: there is no useful recovery
+            // from a destructor, and the only consequence is that the original
+            // stdout does not come back.
+            if (saved_stdout_fd_ != -1)
+            {
+                (void)_dup2(saved_stdout_fd_, _fileno(stdout));
+                _close(saved_stdout_fd_);
+            }
+            if (saved_stderr_fd_ != -1)
+            {
+                (void)_dup2(saved_stderr_fd_, _fileno(stderr));
+                _close(saved_stderr_fd_);
+            }
+            if (stdout_nul_ != INVALID_HANDLE_VALUE)
+            {
+                SetStdHandle(STD_OUTPUT_HANDLE, saved_stdout_handle_);
+                CloseHandle(stdout_nul_);
+            }
+            if (stderr_nul_ != INVALID_HANDLE_VALUE)
+            {
+                SetStdHandle(STD_ERROR_HANDLE, saved_stderr_handle_);
+                CloseHandle(stderr_nul_);
+            }
+            clearerr(stdout);
+            clearerr(stderr);
+        }
+
+        StdoutParkGuard(const StdoutParkGuard &) = delete;
+        StdoutParkGuard & operator=(const StdoutParkGuard &) = delete;
+    };
+
+    class FileHandleGuard
+    {
+        HANDLE handle_ = INVALID_HANDLE_VALUE;
+
+    public:
+        FileHandleGuard() = default;
+
+        explicit FileHandleGuard(HANDLE handle) : handle_(handle)
+        {
+        }
+
+        ~FileHandleGuard()
+        {
+            reset();
+        }
+
+        FileHandleGuard(const FileHandleGuard &) = delete;
+        FileHandleGuard & operator=(const FileHandleGuard &) = delete;
+
+        FileHandleGuard(FileHandleGuard && other) noexcept : handle_(other.handle_)
+        {
+            other.handle_ = INVALID_HANDLE_VALUE;
+        }
+
+        FileHandleGuard & operator=(FileHandleGuard && other) noexcept
+        {
+            if (this != &other)
+            {
+                reset();
+                handle_ = other.handle_;
+                other.handle_ = INVALID_HANDLE_VALUE;
+            }
+            return *this;
+        }
+
+        void reset(HANDLE handle = INVALID_HANDLE_VALUE)
+        {
+            if (handle_ && handle_ != INVALID_HANDLE_VALUE)
+            {
+                CloseHandle(handle_);
+            }
+            handle_ = handle;
+        }
+    };
+
+    // Process and file metadata used by the wizard.
+    enum class Architecture
+    {
+        Unknown,
+        X86,
+        X64
+    };
+
+    struct MemoryInjectionData
+    {
+        BYTE * RawData;
+        DWORD RawSize;
+        DWORD ProcessID;
+        INJECTION_MODE Mode;
+        LAUNCH_METHOD Method;
+        DWORD Flags;
+        DWORD Timeout;
+        ULONG_PTR hHandleValue;
+        HINSTANCE hDllOut;
+        bool GenerateErrorLog;
+        DWORD TargetTid;
+        ULONG_PTR hThreadHandleValue;
+    };
+
+    // Mirrors the runtime's MEMORY_INJECTIONDATA (Ameger/Injection.h). Assert the
+    // size so a change on either side fails the build instead of silently
+    // reinterpreting the other side's memory.
+    static_assert(sizeof(MemoryInjectionData) == sizeof(MEMORY_INJECTIONDATA),
+        "MemoryInjectionData must match the runtime's MEMORY_INJECTIONDATA layout");
+
+    using f_Memory_Inject = DWORD(__stdcall *)(MemoryInjectionData *);
+
+    struct Runtime
+    {
+        HMODULE module = nullptr;
+        f_Memory_Inject memory_inject = nullptr;
+        f_GetSymbolState get_symbol_state = nullptr;
+        f_GetImportState get_import_state = nullptr;
+        f_InitializeRuntime initialize_runtime = nullptr;
+        f_ShutdownRuntime shutdown_runtime = nullptr;
+        f_StartDownload start_download = nullptr;
+        f_SetRawPrintCallback set_raw_print_callback = nullptr;
+        f_GetLastHijackStats get_last_hijack_stats = nullptr;
+        f_GetLastMapStats get_last_map_stats = nullptr;
+        f_GetLastStringStats get_last_string_stats = nullptr;
+        f_GetLastThreadExecStats get_last_thread_exec_stats = nullptr;
+    };
+
+    bool ReadFileBytes(const std::wstring & path, std::vector<BYTE> & bytes);
+
+    struct FileInformation
+    {
+        Architecture architecture = Architecture::Unknown;
+        bool dotnet = false;
+    };
+
+    struct TargetSelection
+    {
+        DWORD pid = 0;
+        std::wstring requested_name;
+        std::wstring name;
+        Architecture architecture = Architecture::Unknown;
+        bool by_name = false;
+        // Raw FILETIME creation stamp of the target, captured while
+        // QueryProcess already held a query handle (no extra OpenProcess).
+        // Used only to warn when injection lands late in the game's boot, the
+        // suspected trigger for a payload DllMain that refuses to initialize.
+        // 0 means "unknown".
+        ULONGLONG creation_time = 0;
+    };
+
+    struct WizardConfig
+    {
+        int schema_version = 0;
+        bool scramble = true;
+        bool load_copy = true;
+        bool handle_hijacking = true;
+        bool hijack_scan = true;
+        bool allow_direct_fallback = true;
+        bool sponsor_roundtrip = true;
+        bool verbose_trace = true;
+        // Suppress the trace-heavy output (acquisition detail, hook scans) so a
+        // captured stdout reveals as little as possible. The verdict still prints.
+        bool quiet = false;
+        bool hook_restore = true;
+        bool run_dllmain = true;
+        bool page_protections = true;
+        bool loader_lock = true;
+        bool exceptions = true;
+        bool resolve_imports = true;
+        bool security_cookie = true;
+        bool delay_imports = true;
+        bool clean_data = true;
+        bool execute_tls = true;
+        bool from_memory = true;
+        int timeout = 60000;
+        std::wstring target_name;
+        std::wstring expected_payload_sha256;
+    };
+
+    // Console and process output helpers.
+    void EnableAnsi()
+    {
+        HANDLE output = GetStdHandle(STD_OUTPUT_HANDLE);
+        DWORD mode = 0;
+        if (output != INVALID_HANDLE_VALUE && GetConsoleMode(output, &mode))
+        {
+            SetConsoleMode(output, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
+        }
+    }
+
+    void PrintError(const wchar_t * message)
+    {
+        fwprintf(stderr, L"%ls%ls%ls\n", kRed, message, kReset);
+    }
+
+    void PrintWarning(const wchar_t * message)
+    {
+        wprintf(L"%ls[!]%ls %ls\n", kYellow, kReset, message);
+    }
+
+    [[noreturn]] void TerminateInterface(int code)
+    {
+        fflush(stdout);
+        fflush(stderr);
+        TerminateProcess(GetCurrentProcess(), static_cast<UINT>(code));
+        for (;;)
+        {
+            Sleep(1000);
+        }
+    }
+
+    void __stdcall QuietPrint(const char *)
+    {
+    }
+
+    std::wstring TrimText(const std::wstring & text)
+    {
+        const size_t first = text.find_first_not_of(L" \t\r\n");
+        if (first == std::wstring::npos)
+        {
+            return std::wstring();
+        }
+
+        const size_t last = text.find_last_not_of(L" \t\r\n");
+        std::wstring value = text.substr(first, last - first + 1);
+        if (value.size() >= 2 && value.front() == L'"' && value.back() == L'"')
+        {
+            value = value.substr(1, value.size() - 2);
+        }
+        return value;
+    }
+
+    bool ReadLine(const wchar_t * prompt, std::wstring & value)
+    {
+        fflush(stdout);
+        wprintf(L"%ls", prompt);
+        if (!std::getline(std::wcin, value))
+        {
+            return false;
+        }
+        value = TrimText(value);
+        return true;
+    }
+
+    bool ParseUnsigned(const std::wstring & text, unsigned long long & value)
+    {
+        if (text.empty() || text.front() == L'-')
+        {
+            return false;
+        }
+
+        wchar_t * end = nullptr;
+        errno = 0;
+        const unsigned long long parsed = std::wcstoull(text.c_str(), &end, 10);
+        if (errno == ERANGE || end == text.c_str() || *end != L'\0')
+        {
+            return false;
+        }
+
+        value = parsed;
+        return true;
+    }
+
+    bool ParseDword(const std::wstring & text, DWORD & value)
+    {
+        unsigned long long parsed = 0;
+        if (!ParseUnsigned(text, parsed) || parsed > (std::numeric_limits<DWORD>::max)())
+        {
+            return false;
+        }
+
+        value = static_cast<DWORD>(parsed);
+        return true;
+    }
+
+    bool ReadYesNo(const wchar_t * prompt, bool default_value, bool & value)
+    {
+        for (;;)
+        {
+            wprintf(L"%ls [%ls]: ", prompt, default_value ? L"Y" : L"N");
+            std::wstring text;
+            if (!ReadLine(L"", text))
+            {
+                return false;
+            }
+            if (text.empty())
+            {
+                value = default_value;
+                return true;
+            }
+            if (text == L"y" || text == L"Y" || _wcsicmp(text.c_str(), L"yes") == 0)
+            {
+                value = true;
+                return true;
+            }
+            if (text == L"n" || text == L"N" || _wcsicmp(text.c_str(), L"no") == 0)
+            {
+                value = false;
+                return true;
+            }
+            PrintWarning(L"Answer y or n.");
+        }
+    }
+
+    // Resolves paths relative to the Interface executable.
+    std::wstring ExecutableDirectory()
+    {
+        std::vector<wchar_t> buffer(MAX_PATH * 2);
+        const DWORD length = GetModuleFileNameW(nullptr, buffer.data(), static_cast<DWORD>(buffer.size()));
+        if (!length || length >= buffer.size())
+        {
+            return std::wstring();
+        }
+
+        const std::wstring path(buffer.data(), length);
+        const size_t slash = path.find_last_of(L"\\/");
+        return slash == std::wstring::npos ? std::wstring() : path.substr(0, slash + 1);
+    }
+
+    std::wstring RuntimePath()
+    {
+        const std::wstring directory = ExecutableDirectory();
+        return directory.empty() ? std::wstring() : directory + kRuntime64;
+    }
+
+    bool FileExists(const std::wstring & path)
+    {
+        const DWORD attributes = GetFileAttributesW(path.c_str());
+        return attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_DIRECTORY) == 0;
+    }
+
+    // Best-effort SeDebugPrivilege so the sponsor pre-open below (and any
+    // donor-owner opens) can target SYSTEM processes. The runtime enables it
+    // again in-process; doing it here first wins the race at detection time.
+    // Returns true when the privilege is confirmed enabled.
+    AMEGER_VMP_NOINLINE bool EnableSeDebugPrivilege()
+    {
+        AMEGER_VMP_ULTRA_BEGIN("ui_priv");
+        HANDLE token = nullptr;
+        if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &token))
+        {
+            return false;
+        }
+        FileHandleGuard tokenGuard(token);
+
+        LUID luid{};
+        if (!LookupPrivilegeValueW(nullptr, SE_DEBUG_NAME, &luid))
+        {
+            return false;
+        }
+
+        TOKEN_PRIVILEGES privileges{};
+        privileges.PrivilegeCount = 1;
+        privileges.Privileges[0].Luid = luid;
+        privileges.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+        if (!AdjustTokenPrivileges(token, FALSE, &privileges, sizeof(privileges), nullptr, nullptr))
+        {
+            return false;
+        }
+
+        // Status is computed inside the marked region: the end marker must be
+        // the last statement before the return, matching every other annotated
+        // function, so the whole body is protected.
+        const DWORD status = GetLastError();
+        AMEGER_VMP_ULTRA_END();
+        return status == ERROR_SUCCESS;
+    }
+
+    // Minimal SystemProcessInformation view: only the fields the victim
+    // picker needs. Kept local rather than reusing the runtime's
+    // SYSTEM_PROCESS_INFORMATION / SYSTEM_THREAD_INFORMATION directly, but
+    // bound to them at compile time by the asserts below (NTDefinitions.h is
+    // included above for exactly that), so the two copies cannot silently
+    // diverge.
+    struct SpiUnicodeStringLocal
+    {
+        USHORT Length;
+        USHORT MaximumLength;
+        wchar_t * Buffer;
+    };
+
+    struct SpiClientIdLocal
+    {
+        HANDLE UniqueProcess;
+        HANDLE UniqueThread;
+    };
+
+    struct SpiThreadLocal
+    {
+        LARGE_INTEGER KernelTime;
+        LARGE_INTEGER UserTime;
+        LARGE_INTEGER CreateTime;
+        ULONG WaitTime;
+        PVOID StartAddress;
+        SpiClientIdLocal ClientId;
+        LONG Priority;
+        LONG BasePriority;
+        ULONG ContextSwitches;
+        unsigned char ThreadState;
+        unsigned char WaitReason;
+    };
+
+    struct SpiProcessLocal
+    {
+        ULONG NextEntryOffset;
+        ULONG NumberOfThreads;
+        LARGE_INTEGER WorkingSetPrivateSize;
+        ULONG HardFaultCount;
+        ULONG NumberOfThreadsHighWatermark;
+        ULONGLONG CycleTime;
+        LARGE_INTEGER CreateTime;
+        LARGE_INTEGER UserTime;
+        LARGE_INTEGER KernelTime;
+        SpiUnicodeStringLocal ImageName;
+        LONG BasePriority;
+        HANDLE UniqueProcessId;
+        HANDLE InheritedFromUniqueProcessId;
+        ULONG HandleCount;
+        ULONG SessionId;
+        ULONG_PTR UniqueProcessKey;
+        SIZE_T PeakVirtualSize;
+        SIZE_T VirtualSize;
+        ULONG PageFaultCount;
+        SIZE_T PeakWorkingSetSize;
+        SIZE_T WorkingSetSize;
+        SIZE_T QuotaPeakPagedPoolUsage;
+        SIZE_T QuotaPagedPoolUsage;
+        SIZE_T QuotaPeakNonPagedPoolUsage;
+        SIZE_T QuotaNonPagedPoolUsage;
+        SIZE_T PagefileUsage;
+        SIZE_T PeakPagefileUsage;
+        SIZE_T PrivatePageCount;
+        LARGE_INTEGER ReadOperationCount;
+        LARGE_INTEGER WriteOperationCount;
+        LARGE_INTEGER OtherOperationCount;
+        LARGE_INTEGER ReadTransferCount;
+        LARGE_INTEGER WriteTransferCount;
+        LARGE_INTEGER OtherTransferCount;
+        SpiThreadLocal Threads[1];
+    };
+
+    static_assert(sizeof(SpiUnicodeStringLocal) == 16);
+    static_assert(sizeof(SpiClientIdLocal) == 16);
+    static_assert(offsetof(SpiThreadLocal, ThreadState) == 68);
+    static_assert(sizeof(SpiThreadLocal) == 72);
+    static_assert(offsetof(SpiProcessLocal, UniqueProcessId) == 0x50);
+    static_assert(offsetof(SpiProcessLocal, Threads) == 0x100);
+
+    // Compile-time equivalence proof against the runtime's own definitions
+    // (Ameger/NT/NTDefinitions.h). Binding every field the host walks - not
+    // just the raw offsets above - means a change to either copy fails the
+    // build here instead of silently reinterpreting the other side's memory.
+    static_assert(offsetof(SpiThreadLocal, ThreadState) == offsetof(SYSTEM_THREAD_INFORMATION, ThreadState),
+        "SpiThreadLocal::ThreadState must mirror SYSTEM_THREAD_INFORMATION::ThreadState");
+    static_assert(offsetof(SpiThreadLocal, WaitReason) == offsetof(SYSTEM_THREAD_INFORMATION, WaitReason),
+        "SpiThreadLocal::WaitReason must mirror SYSTEM_THREAD_INFORMATION::WaitReason");
+    static_assert(offsetof(SpiThreadLocal, ClientId) == offsetof(SYSTEM_THREAD_INFORMATION, ClientId),
+        "SpiThreadLocal::ClientId must mirror SYSTEM_THREAD_INFORMATION::ClientId");
+    static_assert(offsetof(SpiThreadLocal, Priority) == offsetof(SYSTEM_THREAD_INFORMATION, Priority),
+        "SpiThreadLocal::Priority must mirror SYSTEM_THREAD_INFORMATION::Priority");
+    static_assert(offsetof(SpiThreadLocal, BasePriority) == offsetof(SYSTEM_THREAD_INFORMATION, BasePriority),
+        "SpiThreadLocal::BasePriority must mirror SYSTEM_THREAD_INFORMATION::BasePriority");
+    static_assert(sizeof(SpiThreadLocal) == sizeof(SYSTEM_THREAD_INFORMATION),
+        "SpiThreadLocal must match the runtime's SYSTEM_THREAD_INFORMATION size");
+
+    static_assert(offsetof(SpiProcessLocal, NextEntryOffset) == offsetof(SYSTEM_PROCESS_INFORMATION, NextEntryOffset),
+        "SpiProcessLocal::NextEntryOffset must mirror SYSTEM_PROCESS_INFORMATION::NextEntryOffset");
+    static_assert(offsetof(SpiProcessLocal, NumberOfThreads) == offsetof(SYSTEM_PROCESS_INFORMATION, NumberOfThreads),
+        "SpiProcessLocal::NumberOfThreads must mirror SYSTEM_PROCESS_INFORMATION::NumberOfThreads");
+    static_assert(offsetof(SpiProcessLocal, UniqueProcessId) == offsetof(SYSTEM_PROCESS_INFORMATION, UniqueProcessId),
+        "SpiProcessLocal::UniqueProcessId must mirror SYSTEM_PROCESS_INFORMATION::UniqueProcessId");
+    static_assert(offsetof(SpiProcessLocal, Threads) == offsetof(SYSTEM_PROCESS_INFORMATION, Threads),
+        "SpiProcessLocal::Threads must mirror SYSTEM_PROCESS_INFORMATION::Threads");
+    static_assert(sizeof(SpiProcessLocal) == sizeof(SYSTEM_PROCESS_INFORMATION),
+        "SpiProcessLocal must match the runtime's SYSTEM_PROCESS_INFORMATION size");
+
+    // Picks a hijack-victim thread for the target with a pure
+    // SystemProcessInformation query (nothing is opened, nothing is touched
+    // in the target). Returns 0 when no suitable thread exists - the runtime
+    // then falls back to its own search. Scoring: a parked Waiting thread
+    // (except WrQueue) beats Running beats anything else. A Running thread
+    // is liable to be inside a scan/dispatch loop, where suspending it skews
+    // timing checks and parks anomalous state; a waiter sits in ntdll with a
+    // clean stack, so borrowing it for the 1-3 s shell run is lower-signal.
+    AMEGER_VMP_NOINLINE DWORD PickHijackThreadTid(DWORD target_pid)
+    {
+        AMEGER_VMP_ULTRA_BEGIN("ui_picktid");
+        if (!target_pid)
+        {
+            return 0;
+        }
+
+        using NtQuerySystemInformationFn = LONG(NTAPI *)(ULONG, PVOID, ULONG, PULONG);
+        NtQuerySystemInformationFn NtQuery = nullptr;
+        {
+            auto mod_name = XOR_STR_W(L"ntdll.dll");
+            HMODULE mod = GetModuleHandleW(mod_name.get());
+            // ntdll is always loaded, so a null handle here means something is
+            // badly wrong. Check it rather than passing it to GetProcAddress:
+            // a null module argument is not a supported input, and the result
+            // is only null "by accident".
+            if (mod)
+            {
+                auto api_name = XOR_STR_A("NtQuerySystemInformation");
+                NtQuery = ReCa<NtQuerySystemInformationFn>(
+                    GetProcAddress(mod, api_name.get()));
+            }
+        }
+        if (!NtQuery)
+        {
+            return 0;
+        }
+
+        std::vector<BYTE> buffer(1 << 20);
+        ULONG size = static_cast<ULONG>(buffer.size());
+        LONG status = NtQuery(5, buffer.data(), size, &size);
+        while (static_cast<DWORD>(status) == 0xC0000004u)
+        {
+            ULONG grow = size > buffer.size() ? size : static_cast<ULONG>(buffer.size() * 2);
+            if (grow > (16u << 20))
+            {
+                return 0;
+            }
+
+            buffer.resize(grow);
+            size = grow;
+            status = NtQuery(5, buffer.data(), size, &size);
+        }
+
+        if (status != 0)
+        {
+            return 0;
+        }
+
+        DWORD best_tid = 0;
+        int best_score = 0;
+        size_t offset = 0;
+        for (;;)
+        {
+            if (offset + offsetof(SpiProcessLocal, Threads) > buffer.size())
+            {
+                break;
+            }
+
+            const auto * proc = ReCa<const SpiProcessLocal *>(buffer.data() + offset);
+            if (static_cast<DWORD>(reinterpret_cast<ULONG_PTR>(proc->UniqueProcessId)) == target_pid)
+            {
+                const size_t threads_base = offset + offsetof(SpiProcessLocal, Threads);
+                for (ULONG index = 0; index < proc->NumberOfThreads; ++index)
+                {
+                    const size_t entry = threads_base + static_cast<size_t>(index) * sizeof(SpiThreadLocal);
+                    if (entry + sizeof(SpiThreadLocal) > buffer.size())
+                    {
+                        break;
+                    }
+
+                    const auto * thread = ReCa<const SpiThreadLocal *>(buffer.data() + entry);
+                    const DWORD tid = static_cast<DWORD>(reinterpret_cast<ULONG_PTR>(thread->ClientId.UniqueThread));
+                    if (!tid || tid == GetCurrentThreadId())
+                    {
+                        continue;
+                    }
+
+                    int score = 1;
+                    if (thread->ThreadState == 5 && thread->WaitReason != 0x0F) // Waiting, not WrQueue
+                    {
+                        score = 3;
+                    }
+                    else if (thread->ThreadState == 2) // Running
+                    {
+                        score = 2;
+                    }
+
+                    // Deterministic main-thread bias: snapshot order is not
+                    // guaranteed, so ties break toward the smallest TID. The
+                    // main thread is created first (lowest TID) and is the
+                    // most likely to be in a stable alertable wait early in
+                    // boot; without this, late-boot thread-pool/Warden threads
+                    // win the lottery depending on enumeration order and the
+                    // payload's DllMain runs on a different thread each run.
+                    if (score > best_score ||
+                        (score == best_score && best_tid != 0 && tid < best_tid))
+                    {
+                        best_score = score;
+                        best_tid = tid;
+                    }
+                }
+
+                break;
+            }
+
+            if (!proc->NextEntryOffset || proc->NextEntryOffset < 8)
+            {
+                break;
+            }
+
+            offset += proc->NextEntryOffset;
+        }
+
+        AMEGER_VMP_ULTRA_END();
+        return best_tid;
+    }
+
+    // Interface-side half of the acquisition trace: facts only the injector
+    // process knows (config, privilege, pre-open). The runtime half arrives
+    // via HijackStats. Both print in the first step of the dynamic acquisition
+    // trace (the step total varies with the path taken; see PrintHijackTrace).
+    struct HijackContext
+    {
+        bool HijackFlag = false;
+        bool PrivilegeAttempted = false;
+        bool PrivilegeOk = false;
+        bool SponsorOpened = false;
+        ULONG_PTR SponsorValue = 0;
+        DWORD SponsorAccess = 0;
+        DWORD TargetPid = 0;
+        std::wstring TargetName;
+        bool SponsorThreadOpened = false;
+        ULONG_PTR SponsorThreadValue = 0;
+        DWORD SponsorTid = 0;
+        bool Verbose = true;
+    };
+
+    std::wstring CanonicalPath(const std::wstring & path)
+    {
+        std::vector<wchar_t> buffer(MAX_PATH * 4);
+        const DWORD length = GetFullPathNameW(path.c_str(), static_cast<DWORD>(buffer.size()), buffer.data(), nullptr);
+        if (!length || length >= buffer.size())
+        {
+            return std::wstring();
+        }
+        return std::wstring(buffer.data(), length);
+    }
+
+    bool EqualsNoCase(const std::wstring & value, const wchar_t * expected)
+    {
+        return _wcsicmp(value.c_str(), expected) == 0;
+    }
+
+    std::wstring ConfigurationPath()
+    {
+        const std::wstring directory = ExecutableDirectory();
+        if (directory.empty())
+        {
+            return std::wstring();
+        }
+
+        // Order matters: the deployed (DPAPI-encrypted) copy next to the EXE is
+        // preferred over the plaintext master in Build\, so a shipped folder
+        // exposes no readable configuration. The plaintext path remains as the
+        // development fallback.
+        const wchar_t * candidates[] =
+        {
+            L"Configuration.ini",
+            L"..\\Configuration.ini",
+            L"..\\..\\Build\\Configuration.ini"
+        };
+        for (const wchar_t * candidate : candidates)
+        {
+            const std::wstring path = CanonicalPath(directory + candidate);
+            if (!path.empty() && FileExists(path))
+            {
+                return path;
+            }
+        }
+        return std::wstring();
+    }
+
+    bool ParseConfigBool(const std::wstring & value, bool default_value)
+    {
+        if (EqualsNoCase(value, L"y") || EqualsNoCase(value, L"yes") || EqualsNoCase(value, L"1") || EqualsNoCase(value, L"true"))
+        {
+            return true;
+        }
+        if (EqualsNoCase(value, L"n") || EqualsNoCase(value, L"no") || EqualsNoCase(value, L"0") || EqualsNoCase(value, L"false"))
+        {
+            return false;
+        }
+        return default_value;
+    }
+
+    // Encrypted-config marker. A DPAPI blob has no intrinsic signature, so the
+    // file carries this 8-byte prefix; anything without it is treated as a
+    // legacy plaintext config so an existing setup keeps working.
+    constexpr char kConfigBlobMagic[8] = { 'A', 'M', 'E', 'G', 'E', 'R', 'C', '1' };
+
+    // Decrypts a DPAPI-protected config produced by Build\Scripts\ProtectConfig.ps1.
+    // Scope is CurrentUser, matching the writer, so the file is readable only by
+    // the account that encrypted it. Returns false for plaintext input.
+    bool DecryptConfigBlob(const std::string & raw, std::string & out)
+    {
+        out.clear();
+
+        if (raw.size() <= sizeof(kConfigBlobMagic) ||
+            memcmp(raw.data(), kConfigBlobMagic, sizeof(kConfigBlobMagic)) != 0)
+        {
+            return false;
+        }
+
+        DATA_BLOB input{};
+        input.cbData = static_cast<DWORD>(raw.size() - sizeof(kConfigBlobMagic));
+        input.pbData = reinterpret_cast<BYTE *>(const_cast<char *>(raw.data() + sizeof(kConfigBlobMagic)));
+
+        DATA_BLOB output{};
+        if (!CryptUnprotectData(&input, nullptr, nullptr, nullptr, nullptr, CRYPTPROTECT_UI_FORBIDDEN, &output))
+        {
+            return false;
+        }
+
+        out.assign(reinterpret_cast<const char *>(output.pbData), output.cbData);
+        LocalFree(output.pbData);
+        return true;
+    }
+
+    // Loads defaults and overrides from Build\\Configuration.ini.
+    AMEGER_VMP_NOINLINE bool LoadWizardConfig(WizardConfig & config, std::wstring & path, bool & invalid)
+    {
+        AMEGER_VMP_ULTRA_BEGIN("ui_config");
+        config = WizardConfig{};
+        invalid = false;
+        path = ConfigurationPath();
+        if (path.empty())
+        {
+            config.target_name = L"Overwatch.exe";
+            return false;
+        }
+
+        std::string raw_bytes;
+        {
+            std::ifstream raw_file(path, std::ios::binary | std::ios::ate);
+            if (!raw_file.good())
+            {
+                config.target_name = L"Overwatch.exe";
+                invalid = true;
+                return false;
+            }
+
+            const std::streamoff raw_size = raw_file.tellg();
+            if (raw_size < 0 || static_cast<unsigned long long>(raw_size) > 1024 * 1024)
+            {
+                config.target_name = L"Overwatch.exe";
+                invalid = true;
+                return false;
+            }
+
+            raw_bytes.resize(static_cast<size_t>(raw_size));
+            raw_file.seekg(0, std::ios::beg);
+            raw_file.read(raw_bytes.data(), raw_size);
+            if (!raw_file || raw_file.gcount() != raw_size)
+            {
+                config.target_name = L"Overwatch.exe";
+                invalid = true;
+                return false;
+            }
+        }
+
+        std::wstring config_text;
+        std::string plaintext;
+        if (DecryptConfigBlob(raw_bytes, plaintext))
+        {
+            raw_bytes.swap(plaintext);
+        }
+        else if (raw_bytes.size() > sizeof(kConfigBlobMagic) &&
+            memcmp(raw_bytes.data(), kConfigBlobMagic, sizeof(kConfigBlobMagic)) == 0)
+        {
+            // Magic present but DPAPI refused: wrong account or host. Say so
+            // instead of mis-parsing ciphertext as an ini and reporting a
+            // confusing schema error.
+            config.target_name = L"Overwatch.exe";
+            invalid = true;
+            return false;
+        }
+        if (!raw_bytes.empty())
+        {
+            const int required = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, raw_bytes.c_str(), static_cast<int>(raw_bytes.size()), nullptr, 0);
+            if (required <= 0)
+            {
+                config.target_name = L"Overwatch.exe";
+                invalid = true;
+                return false;
+            }
+
+            config_text.resize(static_cast<size_t>(required), L'\0');
+            if (!MultiByteToWideChar(CP_UTF8, 0, raw_bytes.c_str(), static_cast<int>(raw_bytes.size()), config_text.data(), required))
+            {
+                config.target_name = L"Overwatch.exe";
+                invalid = true;
+                return false;
+            }
+
+            if (!config_text.empty() && config_text.front() == 0xFEFF)
+            {
+                config_text.erase(config_text.begin());
+            }
+        }
+
+        std::wstringstream file(config_text);
+
+        std::wstring section;
+        std::wstring line;
+        while (std::getline(file, line))
+        {
+            if (!line.empty() && line.back() == L'\r')
+            {
+                line.pop_back();
+            }
+
+            const std::wstring text = TrimText(line);
+            if (text.empty() || text.front() == L';' || text.front() == L'#')
+            {
+                continue;
+            }
+            if (text.size() >= 2 && text.front() == L'[' && text.back() == L']')
+            {
+                section = text.substr(1, text.size() - 2);
+                continue;
+            }
+
+            const size_t separator = text.find(L'=');
+            if (separator == std::wstring::npos)
+            {
+                continue;
+            }
+
+            const std::wstring key = TrimText(text.substr(0, separator));
+            std::wstring value = TrimText(text.substr(separator + 1));
+            bool quoted = false;
+            size_t comment = std::wstring::npos;
+            for (size_t i = 0; i < value.size(); ++i)
+            {
+                if (value[i] == L'"')
+                {
+                    quoted = !quoted;
+                }
+                else if (!quoted && (value[i] == L';' || value[i] == L'#'))
+                {
+                    comment = i;
+                    break;
+                }
+            }
+            if (comment != std::wstring::npos)
+            {
+                value = TrimText(value.substr(0, comment));
+            }
+            if (value.size() >= 2 && value.front() == L'"' && value.back() == L'"')
+            {
+                value = value.substr(1, value.size() - 2);
+            }
+
+            const bool general = EqualsNoCase(section, L"General");
+            const bool manual = EqualsNoCase(section, L"ManualMap");
+            if (general && EqualsNoCase(key, L"SchemaVersion"))
+            {
+                DWORD parsed = 0;
+                if (ParseDword(value, parsed) && parsed <= static_cast<DWORD>(INT_MAX))
+                {
+                    config.schema_version = static_cast<int>(parsed);
+                }
+            }
+            else if (general && EqualsNoCase(key, L"ProcessName"))
+            {
+                config.target_name = value;
+            }
+            else if (general && EqualsNoCase(key, L"PayloadSha256"))
+            {
+                config.expected_payload_sha256 = value;
+                std::transform(config.expected_payload_sha256.begin(), config.expected_payload_sha256.end(), config.expected_payload_sha256.begin(), towupper);
+            }
+            else if (general && EqualsNoCase(key, L"LoadCopy"))
+            {
+                config.load_copy = ParseConfigBool(value, config.load_copy);
+            }
+            else if (general && EqualsNoCase(key, L"ScrambleDllName"))
+            {
+                config.scramble = ParseConfigBool(value, config.scramble);
+            }
+            else if (general && EqualsNoCase(key, L"HandleHijacking"))
+            {
+                config.handle_hijacking = ParseConfigBool(value, config.handle_hijacking);
+            }
+            else if (general && EqualsNoCase(key, L"HijackScan"))
+            {
+                config.hijack_scan = ParseConfigBool(value, config.hijack_scan);
+            }
+            else if (general && EqualsNoCase(key, L"AllowDirectFallback"))
+            {
+                config.allow_direct_fallback = ParseConfigBool(value, config.allow_direct_fallback);
+            }
+            else if (general && EqualsNoCase(key, L"SponsorRoundtrip"))
+            {
+                config.sponsor_roundtrip = ParseConfigBool(value, config.sponsor_roundtrip);
+            }
+            else if (general && EqualsNoCase(key, L"VerboseTrace"))
+            {
+                config.verbose_trace = ParseConfigBool(value, config.verbose_trace);
+            }
+            else if (general && EqualsNoCase(key, L"Quiet"))
+            {
+                config.quiet = ParseConfigBool(value, config.quiet);
+            }
+            else if (general && EqualsNoCase(key, L"HookRestore"))
+            {
+                config.hook_restore = ParseConfigBool(value, config.hook_restore);
+            }
+            else if (general && EqualsNoCase(key, L"Timeout"))
+            {
+                DWORD parsed = 0;
+                // Clamp to INT_MAX: a value >= 0x80000000 would narrow to a
+                // negative int and later widen to a huge DWORD timeout.
+                if (ParseDword(value, parsed) && parsed >= 1000 && parsed <= static_cast<DWORD>(INT_MAX))
+                {
+                    config.timeout = static_cast<int>(parsed);
+                }
+            }
+            else if (manual && EqualsNoCase(key, L"ExecuteTLS"))
+            {
+                config.execute_tls = ParseConfigBool(value, config.execute_tls);
+            }
+            else if (manual && EqualsNoCase(key, L"RunDLLMain"))
+            {
+                config.run_dllmain = ParseConfigBool(value, config.run_dllmain);
+            }
+            else if (manual && EqualsNoCase(key, L"LoadFromMemory"))
+            {
+                config.from_memory = ParseConfigBool(value, config.from_memory);
+            }
+            else if (manual && EqualsNoCase(key, L"LockLoaderLock"))
+            {
+                config.loader_lock = ParseConfigBool(value, config.loader_lock);
+            }
+            else if (manual && EqualsNoCase(key, L"ResolveImports"))
+            {
+                config.resolve_imports = ParseConfigBool(value, config.resolve_imports);
+            }
+            else if (manual && EqualsNoCase(key, L"EnableExceptions"))
+            {
+                config.exceptions = ParseConfigBool(value, config.exceptions);
+            }
+            else if (manual && EqualsNoCase(key, L"InitSecurityCookie"))
+            {
+                config.security_cookie = ParseConfigBool(value, config.security_cookie);
+            }
+            else if (manual && EqualsNoCase(key, L"SetPageProtections"))
+            {
+                config.page_protections = ParseConfigBool(value, config.page_protections);
+            }
+            else if (manual && EqualsNoCase(key, L"ResolveDelayImports"))
+            {
+                config.delay_imports = ParseConfigBool(value, config.delay_imports);
+            }
+            else if (manual && EqualsNoCase(key, L"CleanDataDirectories"))
+            {
+                config.clean_data = ParseConfigBool(value, config.clean_data);
+            }
+        }
+
+        if (config.schema_version != 1)
+        {
+            config = WizardConfig{};
+            config.target_name = L"Overwatch.exe";
+            invalid = true;
+            return false;
+        }
+
+        if (!config.expected_payload_sha256.empty())
+        {
+            bool valid_hash = config.expected_payload_sha256.size() == 64;
+            for (wchar_t value : config.expected_payload_sha256)
+            {
+                valid_hash = valid_hash && ((value >= L'0' && value <= L'9') || (value >= L'A' && value <= L'F'));
+            }
+            if (!valid_hash)
+            {
+                config = WizardConfig{};
+                config.target_name = L"Overwatch.exe";
+                invalid = true;
+                return false;
+            }
+        }
+
+        if (config.target_name.empty())
+        {
+            config = WizardConfig{};
+            invalid = true;
+            return false;
+        }
+        AMEGER_VMP_ULTRA_END();
+        return true;
+    }
+
+    AMEGER_VMP_NOINLINE std::wstring Sha256Hex(const std::vector<BYTE> & bytes)
+    {
+        AMEGER_VMP_ULTRA_BEGIN("ui_sha");
+        BCRYPT_ALG_HANDLE algorithm = nullptr;
+        BCRYPT_HASH_HANDLE hash = nullptr;
+        DWORD object_length = 0;
+        DWORD result_length = 0;
+        DWORD hash_length = 0;
+        std::vector<BYTE> hash_object;
+        std::vector<BYTE> hash_bytes;
+
+        if (BCryptOpenAlgorithmProvider(&algorithm, BCRYPT_SHA256_ALGORITHM, nullptr, 0) < 0 ||
+            BCryptGetProperty(algorithm, BCRYPT_OBJECT_LENGTH, reinterpret_cast<PUCHAR>(&object_length), sizeof(object_length), &result_length, 0) < 0 ||
+            BCryptGetProperty(algorithm, BCRYPT_HASH_LENGTH, reinterpret_cast<PUCHAR>(&hash_length), sizeof(hash_length), &result_length, 0) < 0)
+        {
+            if (algorithm)
+            {
+                BCryptCloseAlgorithmProvider(algorithm, 0);
+            }
+            return std::wstring();
+        }
+
+        try
+        {
+            hash_object.resize(object_length);
+            hash_bytes.resize(hash_length);
+        }
+        catch (const std::bad_alloc &)
+        {
+            BCryptCloseAlgorithmProvider(algorithm, 0);
+            return std::wstring();
+        }
+
+        if (BCryptCreateHash(algorithm, &hash, hash_object.data(), object_length, nullptr, 0, BCRYPT_HASH_REUSABLE_FLAG) < 0)
+        {
+            BCryptCloseAlgorithmProvider(algorithm, 0);
+            return std::wstring();
+        }
+
+        size_t offset = 0;
+        while (offset < bytes.size())
+        {
+            const ULONG chunk = static_cast<ULONG>((std::min)(bytes.size() - offset, static_cast<size_t>(ULONG_MAX)));
+            if (BCryptHashData(hash, const_cast<BYTE *>(bytes.data() + offset), chunk, 0) < 0)
+            {
+                BCryptDestroyHash(hash);
+                BCryptCloseAlgorithmProvider(algorithm, 0);
+                return std::wstring();
+            }
+            offset += chunk;
+        }
+
+        const NTSTATUS finish_status = BCryptFinishHash(hash, hash_bytes.data(), hash_length, 0);
+        BCryptDestroyHash(hash);
+        BCryptCloseAlgorithmProvider(algorithm, 0);
+        if (finish_status < 0)
+        {
+            return std::wstring();
+        }
+
+        constexpr wchar_t hex[] = L"0123456789ABCDEF";
+        std::wstring result;
+        result.reserve(hash_bytes.size() * 2);
+        for (BYTE value : hash_bytes)
+        {
+            result.push_back(hex[value >> 4]);
+            result.push_back(hex[value & 0x0F]);
+        }
+        AMEGER_VMP_ULTRA_END();
+        return result;
+    }
+
+    AMEGER_VMP_NOINLINE bool ReadHandleBytes(HANDLE file, std::vector<BYTE> & bytes)
+    {
+        AMEGER_VMP_ULTRA_BEGIN("ui_readh");
+        LARGE_INTEGER size{};
+        if (!GetFileSizeEx(file, &size))
+        {
+            fwprintf(stderr, L"%lsFailed to query runtime size: 0x%08X%ls\n", kRed, GetLastError(), kReset);
+            return false;
+        }
+        if (size.QuadPart <= 0 || static_cast<unsigned long long>(size.QuadPart) > PE_IMAGE::MAX_IMAGE_SIZE)
+        {
+            fwprintf(stderr, L"%lsInvalid runtime size: %lld bytes%ls\n", kRed, size.QuadPart, kReset);
+            return false;
+        }
+
+        bytes.resize(static_cast<size_t>(size.QuadPart));
+        size_t total = 0;
+        while (total < bytes.size())
+        {
+            DWORD read = 0;
+            const size_t remaining = bytes.size() - total;
+            if (!ReadFile(file, bytes.data() + total, static_cast<DWORD>(remaining), &read, nullptr) || read == 0)
+            {
+                fwprintf(stderr, L"%lsFailed to read runtime: 0x%08X (%zu of %zu bytes)%ls\n", kRed, GetLastError(), total, bytes.size(), kReset);
+                bytes.clear();
+                return false;
+            }
+            total += read;
+        }
+        AMEGER_VMP_ULTRA_END();
+        return true;
+    }
+
+    AMEGER_VMP_NOINLINE bool VerifyRuntimeBytes(const std::vector<BYTE> & bytes)
+    {
+        AMEGER_VMP_ULTRA_BEGIN("ui_vrfy");
+        PE_IMAGE::OPTIONS options;
+        options.RequireDll = true;
+        options.RequireExports = true;
+        options.EnableExceptions = true;
+        PE_IMAGE::VIEW view;
+        const DWORD validation_result = PE_IMAGE::Validate(bytes.data(), bytes.size(), IMAGE_FILE_MACHINE_AMD64, options, view);
+        if (validation_result != FILE_ERR_SUCCESS)
+        {
+            fwprintf(stderr, L"%lsRuntime DLL PE validation failed: 0x%08X%ls\n", kRed, validation_result, kReset);
+            return false;
+        }
+
+        constexpr uint32_t expected_words[] =
+        {
+            AMEGER_RUNTIME_DLL_HASH0,
+            AMEGER_RUNTIME_DLL_HASH1,
+            AMEGER_RUNTIME_DLL_HASH2,
+            AMEGER_RUNTIME_DLL_HASH3,
+            AMEGER_RUNTIME_DLL_HASH4,
+            AMEGER_RUNTIME_DLL_HASH5,
+            AMEGER_RUNTIME_DLL_HASH6,
+            AMEGER_RUNTIME_DLL_HASH7
+        };
+        bool has_embedded_hash = false;
+        for (uint32_t word : expected_words)
+        {
+            has_embedded_hash = has_embedded_hash || word != 0;
+        }
+        if (!has_embedded_hash)
+        {
+            PrintError(L"The runtime has no embedded SHA-256. Build it with Build\\Create.bat.");
+            return false;
+        }
+
+        constexpr wchar_t hex[] = L"0123456789ABCDEF";
+        std::wstring expected_hash;
+        expected_hash.reserve(64);
+        for (uint32_t word : expected_words)
+        {
+            for (int shift = 28; shift >= 0; shift -= 4)
+            {
+                expected_hash.push_back(hex[(word >> shift) & 0x0F]);
+            }
+        }
+
+        const std::wstring actual_hash = Sha256Hex(bytes);
+        if (actual_hash.empty() || _wcsicmp(actual_hash.c_str(), expected_hash.c_str()) != 0)
+        {
+            fwprintf(stderr, L"%lsRuntime DLL SHA-256 mismatch. Expected %ls, got %ls%ls\n", kRed, expected_hash.c_str(), actual_hash.c_str(), kReset);
+            return false;
+        }
+
+        AMEGER_VMP_ULTRA_END();
+        return true;
+    }
+
+    // Loads the runtime DLL and resolves its exported functions.
+    AMEGER_VMP_NOINLINE bool LoadRuntime(Runtime & runtime)
+    {
+        AMEGER_VMP_ULTRA_BEGIN("ui_loadrt");
+        const std::wstring path = RuntimePath();
+        if (path.empty() || !FileExists(path))
+        {
+            PrintError(L"The Ameger Injector runtime DLL is missing in Build\\Release.");
+            return false;
+        }
+
+        HANDLE runtime_file = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+        if (runtime_file == INVALID_HANDLE_VALUE)
+        {
+            fwprintf(stderr, L"%lsFailed to open runtime for verification: 0x%08X%ls\n", kRed, GetLastError(), kReset);
+            return false;
+        }
+
+        FileHandleGuard runtime_guard(runtime_file);
+
+        std::vector<BYTE> runtime_bytes;
+        if (!ReadHandleBytes(runtime_file, runtime_bytes) || !VerifyRuntimeBytes(runtime_bytes))
+        {
+            return false;
+        }
+
+        DWORD load_error = ERROR_SUCCESS;
+        {
+            StdoutParkGuard park;
+            runtime.module = LoadLibraryExW(path.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
+            load_error = GetLastError();
+            if (runtime.module)
+            {
+                // Runtime export names are compile-time XORed (see KcStrings/Core/XorString.h).
+                auto exp_mem = XOR_STR_A("Memory_Inject");
+                runtime.memory_inject = reinterpret_cast<f_Memory_Inject>(GetProcAddress(runtime.module, exp_mem.get()));
+                auto exp_sym = XOR_STR_A("GetSymbolState");
+                runtime.get_symbol_state = reinterpret_cast<f_GetSymbolState>(GetProcAddress(runtime.module, exp_sym.get()));
+                auto exp_imp = XOR_STR_A("GetImportState");
+                runtime.get_import_state = reinterpret_cast<f_GetImportState>(GetProcAddress(runtime.module, exp_imp.get()));
+                auto exp_init = XOR_STR_A("InitializeRuntime");
+                runtime.initialize_runtime = reinterpret_cast<f_InitializeRuntime>(GetProcAddress(runtime.module, exp_init.get()));
+                auto exp_shut = XOR_STR_A("ShutdownRuntime");
+                runtime.shutdown_runtime = reinterpret_cast<f_ShutdownRuntime>(GetProcAddress(runtime.module, exp_shut.get()));
+                auto exp_dl = XOR_STR_A("StartDownload");
+                runtime.start_download = reinterpret_cast<f_StartDownload>(GetProcAddress(runtime.module, exp_dl.get()));
+                auto exp_cb = XOR_STR_A("SetRawPrintCallback");
+                runtime.set_raw_print_callback = reinterpret_cast<f_SetRawPrintCallback>(GetProcAddress(runtime.module, exp_cb.get()));
+                auto exp_hij = XOR_STR_A("GetLastHijackStats");
+                runtime.get_last_hijack_stats = reinterpret_cast<f_GetLastHijackStats>(GetProcAddress(runtime.module, exp_hij.get()));
+                auto exp_map = XOR_STR_A("GetLastMapStats");
+                runtime.get_last_map_stats = reinterpret_cast<f_GetLastMapStats>(GetProcAddress(runtime.module, exp_map.get()));
+                auto exp_str = XOR_STR_A("GetLastStringStats");
+                runtime.get_last_string_stats = reinterpret_cast<f_GetLastStringStats>(GetProcAddress(runtime.module, exp_str.get()));
+                auto exp_tec = XOR_STR_A("GetLastThreadExecStats");
+                runtime.get_last_thread_exec_stats = reinterpret_cast<f_GetLastThreadExecStats>(GetProcAddress(runtime.module, exp_tec.get()));
+                if (runtime.set_raw_print_callback)
+                {
+                    runtime.set_raw_print_callback(QuietPrint);
+                }
+            }
+        }
+
+        if (!runtime.module)
+        {
+            fwprintf(stderr, L"%lsFailed to load runtime: %ls (0x%08X)%ls\n", kRed, path.c_str(), load_error, kReset);
+            return false;
+        }
+
+        if (!runtime.memory_inject || !runtime.get_symbol_state || !runtime.get_import_state || !runtime.initialize_runtime || !runtime.start_download)
+        {
+            PrintError(L"The runtime DLL does not expose the required injection functions.");
+            return false;
+        }
+
+        if (runtime.get_last_hijack_stats)
+        {
+            wprintf(L"%ls[+]%ls Hijack telemetry export found.\n\n", kGreen, kReset);
+
+        }
+        else
+        {
+            wprintf(L"  %ls[!]%ls Hijack telemetry export missing; the Acquire process handle step will show no telemetry.\n", kYellow, kReset);
+        }
+
+        LARGE_INTEGER rewind{};
+        if (!SetFilePointerEx(runtime_file, rewind, nullptr, FILE_BEGIN))
+        {
+            PrintError(L"Failed to rewind the runtime for re-verification.");
+            return false;
+        }
+
+        std::vector<BYTE> reload_bytes;
+        if (!ReadHandleBytes(runtime_file, reload_bytes) || !VerifyRuntimeBytes(reload_bytes))
+        {
+            PrintError(L"The runtime DLL changed during loading; refusing to use it.");
+            return false;
+        }
+
+        AMEGER_VMP_ULTRA_END();
+        return true;
+    }
+
+    // Waits for symbol download and import resolution to complete.
+    AMEGER_VMP_NOINLINE bool WaitForRuntime(const Runtime & runtime, DWORD & symbol_state, DWORD & import_state)
+    {
+        AMEGER_VMP_ULTRA_BEGIN("ui_waitrt");
+        constexpr ULONGLONG timeout = 120000;
+
+        const DWORD initialization_state = runtime.initialize_runtime();
+        if (initialization_state != INJ_ERR_SUCCESS)
+        {
+            symbol_state = initialization_state;
+            import_state = initialization_state;
+
+            return false;
+        }
+
+        runtime.start_download();
+        symbol_state = runtime.get_symbol_state();
+        ULONGLONG deadline = GetTickCount64() + timeout;
+        while (symbol_state == INJ_ERR_SYMBOL_INIT_NOT_DONE)
+        {
+            if (GetTickCount64() >= deadline)
+            {
+                return false;
+            }
+            Sleep(10);
+            symbol_state = runtime.get_symbol_state();
+        }
+        if (symbol_state != INJ_ERR_SUCCESS)
+        {
+            return false;
+        }
+
+        import_state = runtime.get_import_state();
+        deadline = GetTickCount64() + timeout;
+        while (import_state == INJ_ERR_IMPORT_HANDLER_NOT_DONE)
+        {
+            if (GetTickCount64() >= deadline)
+            {
+                return false;
+            }
+            Sleep(10);
+            import_state = runtime.get_import_state();
+        }
+        AMEGER_VMP_ULTRA_END();
+        return import_state == INJ_ERR_SUCCESS;
+    }
+
+    bool ReadFileBytes(const std::wstring & path, std::vector<BYTE> & bytes)
+    {
+        HANDLE file = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (file == INVALID_HANDLE_VALUE)
+        {
+            return false;
+        }
+
+        LARGE_INTEGER size{};
+        if (!GetFileSizeEx(file, &size) || size.QuadPart <= 0 || static_cast<unsigned long long>(size.QuadPart) > PE_IMAGE::MAX_IMAGE_SIZE)
+        {
+            CloseHandle(file);
+            return false;
+        }
+
+        bytes.resize(static_cast<size_t>(size.QuadPart));
+        size_t total = 0;
+        while (total < bytes.size())
+        {
+            DWORD read = 0;
+            const size_t remaining = bytes.size() - total;
+            if (!ReadFile(file, bytes.data() + total, static_cast<DWORD>(remaining), &read, nullptr) || read == 0)
+            {
+                CloseHandle(file);
+                bytes.clear();
+                return false;
+            }
+            total += read;
+        }
+
+        CloseHandle(file);
+        return true;
+    }
+
+    // Reads architecture and COM metadata from a PE file.
+    // validation_out receives the PE_IMAGE::Validate code on strict-validation
+    // failure (FILE_ERR_*), so callers can tell "no relocations" apart from
+    // "bad layout" instead of a bare "not usable".
+    AMEGER_VMP_NOINLINE bool InspectDll(const std::wstring & path, DWORD flags, FileInformation & info, std::vector<BYTE> & bytes, std::wstring & sha256, DWORD * validation_out = nullptr)
+    {
+        AMEGER_VMP_ULTRA_BEGIN("ui_inspect");
+        bytes.clear();
+        sha256.clear();
+        if (!ReadFileBytes(path, bytes) || bytes.size() < sizeof(IMAGE_DOS_HEADER))
+        {
+            return false;
+        }
+
+        IMAGE_DOS_HEADER dos{};
+        std::memcpy(&dos, bytes.data(), sizeof(dos));
+        if (dos.e_magic != IMAGE_DOS_SIGNATURE || dos.e_lfanew < 0)
+        {
+            return false;
+        }
+
+        const size_t nt_offset = static_cast<size_t>(dos.e_lfanew);
+        if (nt_offset > bytes.size() || bytes.size() - nt_offset < sizeof(DWORD) + sizeof(IMAGE_FILE_HEADER))
+        {
+            return false;
+        }
+
+        DWORD signature = 0;
+        std::memcpy(&signature, bytes.data() + nt_offset, sizeof(signature));
+        if (signature != IMAGE_NT_SIGNATURE)
+        {
+            return false;
+        }
+
+        IMAGE_FILE_HEADER file_header{};
+        std::memcpy(&file_header, bytes.data() + nt_offset + sizeof(DWORD), sizeof(file_header));
+        const size_t optional_offset = nt_offset + sizeof(DWORD) + sizeof(IMAGE_FILE_HEADER);
+        if (file_header.SizeOfOptionalHeader < sizeof(WORD) || optional_offset > bytes.size() || file_header.SizeOfOptionalHeader > bytes.size() - optional_offset)
+        {
+            return false;
+        }
+
+        WORD magic = 0;
+        std::memcpy(&magic, bytes.data() + optional_offset, sizeof(magic));
+        size_t directory_offset = 0;
+        if (magic == IMAGE_NT_OPTIONAL_HDR32_MAGIC)
+        {
+            info.architecture = file_header.Machine == IMAGE_FILE_MACHINE_I386 ? Architecture::X86 : Architecture::Unknown;
+            directory_offset = offsetof(IMAGE_OPTIONAL_HEADER32, DataDirectory);
+        }
+        else if (magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC)
+        {
+            info.architecture = file_header.Machine == IMAGE_FILE_MACHINE_AMD64 ? Architecture::X64 : Architecture::Unknown;
+            directory_offset = offsetof(IMAGE_OPTIONAL_HEADER64, DataDirectory);
+        }
+        else
+        {
+            return false;
+        }
+
+        if (info.architecture == Architecture::Unknown || directory_offset + (static_cast<size_t>(IMAGE_DIRECTORY_ENTRY_COM_DESCRIPTOR) + 1) * sizeof(IMAGE_DATA_DIRECTORY) > file_header.SizeOfOptionalHeader)
+        {
+            return false;
+        }
+
+        DWORD directory_count = 0;
+        const size_t count_offset = directory_offset - sizeof(DWORD);
+        std::memcpy(&directory_count, bytes.data() + optional_offset + count_offset, sizeof(directory_count));
+        info.dotnet = false;
+        if (directory_count > IMAGE_DIRECTORY_ENTRY_COM_DESCRIPTOR)
+        {
+            IMAGE_DATA_DIRECTORY com_directory{};
+            const size_t com_offset = directory_offset + static_cast<size_t>(IMAGE_DIRECTORY_ENTRY_COM_DESCRIPTOR) * sizeof(IMAGE_DATA_DIRECTORY);
+            std::memcpy(&com_directory, bytes.data() + optional_offset + com_offset, sizeof(com_directory));
+            info.dotnet = com_directory.VirtualAddress != 0 && com_directory.Size != 0;
+        }
+
+        if (info.architecture == Architecture::X64)
+        {
+            PE_IMAGE::OPTIONS options;
+            options.RequireDll = true;
+            options.RequireRelocations = true;
+            options.ResolveImports = (flags & (INJ_MM_RESOLVE_IMPORTS | INJ_MM_RUN_DLL_MAIN)) != 0;
+            options.ResolveDelayImports = (flags & INJ_MM_RESOLVE_DELAY_IMPORTS) != 0;
+            options.EnableExceptions = (flags & INJ_MM_ENABLE_EXCEPTIONS) != 0;
+            options.InitializeSecurityCookie = (flags & INJ_MM_INIT_SECURITY_COOKIE) != 0;
+            options.ExecuteTls = (flags & INJ_MM_EXECUTE_TLS) != 0;
+            PE_IMAGE::VIEW view;
+            const DWORD validation_result = PE_IMAGE::Validate(bytes.data(), bytes.size(), IMAGE_FILE_MACHINE_AMD64, options, view);
+            if (validation_out)
+            {
+                *validation_out = validation_result;
+            }
+            if (validation_result != FILE_ERR_SUCCESS)
+            {
+                bytes.clear();
+                return false;
+            }
+        }
+
+        sha256 = Sha256Hex(bytes);
+        if (sha256.empty())
+        {
+            bytes.clear();
+            return false;
+        }
+        AMEGER_VMP_ULTRA_END();
+        return true;
+    }
+
+    AMEGER_VMP_NOINLINE Architecture ProcessArchitecture(HANDLE process)
+    {
+        AMEGER_VMP_ULTRA_BEGIN("ui_arch");
+        using IsWow64Process2Fn = BOOL(WINAPI *)(HANDLE, USHORT *, USHORT *);
+        auto k32_name = XOR_STR_W(L"kernel32.dll");
+        HMODULE k32_mod = GetModuleHandleW(k32_name.get());
+        IsWow64Process2Fn is_wow64_process2 = nullptr;
+        if (k32_mod)
+        {
+            auto wow_name = XOR_STR_A("IsWow64Process2");
+            is_wow64_process2 = reinterpret_cast<IsWow64Process2Fn>(GetProcAddress(k32_mod, wow_name.get()));
+        }
+        if (is_wow64_process2)
+        {
+            USHORT native_machine = 0;
+            USHORT process_machine = 0;
+            if (is_wow64_process2(process, &native_machine, &process_machine))
+            {
+                if (process_machine == IMAGE_FILE_MACHINE_I386)
+                {
+                    return Architecture::X86;
+                }
+                if (native_machine == IMAGE_FILE_MACHINE_AMD64)
+                {
+                    return Architecture::X64;
+                }
+                if (native_machine == IMAGE_FILE_MACHINE_I386)
+                {
+                    return Architecture::X86;
+                }
+            }
+        }
+
+        BOOL is_wow64 = FALSE;
+        if (IsWow64Process(process, &is_wow64) && is_wow64)
+        {
+            return Architecture::X86;
+        }
+
+        SYSTEM_INFO system_info{};
+        GetNativeSystemInfo(&system_info);
+        AMEGER_VMP_ULTRA_END();
+        return system_info.wProcessorArchitecture == PROCESSOR_ARCHITECTURE_AMD64 ? Architecture::X64 : Architecture::X86;
+    }
+
+    AMEGER_VMP_NOINLINE bool QueryProcess(DWORD pid, std::wstring & name, Architecture & architecture,
+        ULONGLONG * creation_time = nullptr)
+    {
+        AMEGER_VMP_ULTRA_BEGIN("ui_queryp");
+        HANDLE process = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+        if (!process)
+        {
+            process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+        }
+        if (!process)
+        {
+            return false;
+        }
+
+        wchar_t path[MAX_PATH * 2]{};
+        DWORD length = static_cast<DWORD>(std::size(path));
+        const BOOL queried = QueryFullProcessImageNameW(process, 0, path, &length);
+        architecture = ProcessArchitecture(process);
+        // Reuse the handle already held for the name query: reading the
+        // creation stamp costs no extra OpenProcess (the project deliberately
+        // minimizes handle telemetry). The other three FILETIME outputs are
+        // required by the API but unused here.
+        if (creation_time)
+        {
+            FILETIME creation_ft{};
+            FILETIME exit_ft{};
+            FILETIME kernel_ft{};
+            FILETIME user_ft{};
+            if (GetProcessTimes(process, &creation_ft, &exit_ft, &kernel_ft, &user_ft))
+            {
+                *creation_time = (static_cast<ULONGLONG>(creation_ft.dwHighDateTime) << 32) |
+                    creation_ft.dwLowDateTime;
+            }
+        }
+        CloseHandle(process);
+        if (!queried)
+        {
+            return false;
+        }
+
+        const std::wstring full_path(path, length);
+        const size_t slash = full_path.find_last_of(L"\\/");
+        name = slash == std::wstring::npos ? full_path : full_path.substr(slash + 1);
+        AMEGER_VMP_ULTRA_END();
+        return !name.empty();
+    }
+
+    std::wstring NormalizeProcessName(std::wstring name)
+    {
+        const size_t slash = name.find_last_of(L"\\/");
+        if (slash != std::wstring::npos)
+        {
+            name = name.substr(slash + 1);
+        }
+        if (name.find(L'.') == std::wstring::npos)
+        {
+            name += L".exe";
+        }
+        return name;
+    }
+
+    AMEGER_VMP_NOINLINE DWORD FindProcess(const std::wstring & requested_name)
+    {
+        AMEGER_VMP_ULTRA_BEGIN("ui_findp");
+        const std::wstring name = NormalizeProcessName(requested_name);
+        HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if (snapshot == INVALID_HANDLE_VALUE)
+        {
+            return 0;
+        }
+
+        PROCESSENTRY32W entry{};
+        entry.dwSize = sizeof(entry);
+        DWORD result = 0;
+        if (Process32FirstW(snapshot, &entry))
+        {
+            do
+            {
+                if (_wcsicmp(entry.szExeFile, name.c_str()) == 0)
+                {
+                    result = entry.th32ProcessID;
+                    break;
+                }
+            } while (Process32NextW(snapshot, &entry));
+        }
+
+        CloseHandle(snapshot);
+        AMEGER_VMP_ULTRA_END();
+        return result;
+    }
+
+    AMEGER_VMP_NOINLINE bool RefreshTarget(TargetSelection & target)
+    {
+        AMEGER_VMP_ULTRA_BEGIN("ui_reftarget");
+        if (target.by_name)
+        {
+            const DWORD pid = FindProcess(target.requested_name);
+            if (!pid)
+            {
+                return false;
+            }
+            target.pid = pid;
+            return QueryProcess(pid, target.name, target.architecture, &target.creation_time);
+        }
+
+        AMEGER_VMP_ULTRA_END();
+        return QueryProcess(target.pid, target.name, target.architecture, &target.creation_time);
+    }
+
+    // Seconds since the target started, or 0 when unknown. 0 means "cannot
+    // prove late", so callers must allow the injection to proceed.
+    AMEGER_VMP_NOINLINE ULONGLONG TargetAgeSeconds(const TargetSelection & target)
+    {
+        AMEGER_VMP_ULTRA_BEGIN("ui_targetage");
+        if (!target.creation_time)
+        {
+            AMEGER_VMP_ULTRA_END();
+            return 0;
+        }
+        FILETIME now_ft{};
+        GetSystemTimeAsFileTime(&now_ft);
+        const ULONGLONG now = (static_cast<ULONGLONG>(now_ft.dwHighDateTime) << 32) |
+            now_ft.dwLowDateTime;
+        if (now <= target.creation_time)
+        {
+            AMEGER_VMP_ULTRA_END();
+            return 0;
+        }
+        AMEGER_VMP_ULTRA_END();
+        return (now - target.creation_time) / 10000000ull;
+    }
+
+    // Fail-fast late-boot gate. Returns true when injection may proceed.
+    // A target older than max_age_seconds is refused BEFORE any remote
+    // allocation: attempting it would hit payload DllMain FALSE (00400013)
+    // and leave unreclaimable loader dangles (inverted table + TLS index).
+    AMEGER_VMP_NOINLINE bool CheckEarlyBootTarget(const TargetSelection & target, ULONGLONG max_age_seconds)
+    {
+        AMEGER_VMP_ULTRA_BEGIN("ui_earlyboot");
+        const ULONGLONG age = TargetAgeSeconds(target);
+        if (age > max_age_seconds && max_age_seconds > 0)
+        {
+            fwprintf(stderr, L"%ls[x]%ls %ls is %llu seconds old; late injection will be refused by the payload (00400013).\n",
+                kRed, kReset, target.name.c_str(), age);
+            wprintf(L"    Relaunch the game AFTER this injector shows \"Waiting for %ls...\" and inject within the first seconds.\n",
+                target.requested_name.c_str());
+            wprintf(L"    Aborting without injecting so the target's loader state stays clean.\n");
+            AMEGER_VMP_ULTRA_END();
+            return false;
+        }
+        AMEGER_VMP_ULTRA_END();
+        return true;
+    }
+
+    AMEGER_VMP_NOINLINE bool SelectTarget(const std::wstring & configured_name, TargetSelection & target, bool & cancelled)
+    {
+        AMEGER_VMP_ULTRA_BEGIN("ui_selecttarget");
+        cancelled = false;
+        target.requested_name = NormalizeProcessName(configured_name.empty() ? L"Overwatch.exe" : configured_name);
+        target.by_name = true;
+        wprintf(L"%ls[+]%ls Waiting for %ls... (Press Q to quit)\n", kGreen, kReset, target.requested_name.c_str());
+        for (;;)
+        {
+            const DWORD found = FindProcess(target.requested_name);
+            if (found && QueryProcess(found, target.name, target.architecture, &target.creation_time))
+            {
+                target.pid = found;
+                wprintf(L"%ls[+]%ls %ls detected | PID: %ls%lu%ls\n", kGreen, kReset, target.name.c_str(), kGreen, static_cast<unsigned long>(found), kReset);
+                // Early-boot gate data: a target that has already been up for
+                // a while is the late-in-boot case that makes the payload's
+                // DllMain return FALSE (00400013). Warn here; the wizard
+                // enforces fail-fast after detection so a late target is never
+                // injected (which would only dirty loader state).
+                if (target.creation_time)
+                {
+                    FILETIME now_ft{};
+                    GetSystemTimeAsFileTime(&now_ft);
+                    const ULONGLONG now = (static_cast<ULONGLONG>(now_ft.dwHighDateTime) << 32) |
+                        now_ft.dwLowDateTime;
+                    if (now > target.creation_time)
+                    {
+                        const ULONGLONG age_seconds = (now - target.creation_time) / 10000000ull;
+                        if (age_seconds > 20ull)
+                        {
+                            wprintf(L"  %ls[!]%ls %ls has been running for %llus; injecting this late in the\n",
+                                kYellow, kReset, target.name.c_str(), age_seconds);
+                            wprintf(L"    game's boot is unreliable. Relaunch it and inject within the first seconds.\n");
+                        }
+                    }
+                }
+                return true;
+            }
+
+            HANDLE input = GetStdHandle(STD_INPUT_HANDLE);
+            const DWORD input_wait = (input && input != INVALID_HANDLE_VALUE) ? WaitForSingleObject(input, 50) : WAIT_TIMEOUT;
+            if (input_wait == WAIT_OBJECT_0)
+            {
+                DWORD console_mode = 0;
+                if (GetConsoleMode(input, &console_mode))
+                {
+                    if (_kbhit())
+                    {
+                        const int key = _getch();
+                        if (key == 'q' || key == 'Q')
+                        {
+                            cancelled = true;
+                            return false;
+                        }
+                    }
+                }
+                else
+                {
+                    std::wstring line;
+                    if (!std::getline(std::wcin, line))
+                    {
+                        cancelled = true;
+                        return false;
+                    }
+
+                    line = TrimText(line);
+                    if (line == L"q" || line == L"Q")
+                    {
+                        cancelled = true;
+                        return false;
+                    }
+                }
+            }
+            if (std::wcin.eof())
+            {
+                cancelled = true;
+                return false;
+            }
+            Sleep(50);
+        }
+        // Unreachable at runtime (the loop above only exits via return), but
+        // the End marker must exist in-image for VMP pairing.
+        AMEGER_VMP_ULTRA_END();
+    }
+
+    bool IsAbsolutePath(const std::wstring & path)
+    {
+        if (path.empty())
+        {
+            return false;
+        }
+
+        if (path.size() >= 3 &&
+            ((path[0] >= L'A' && path[0] <= L'Z') || (path[0] >= L'a' && path[0] <= L'z')) &&
+            path[1] == L':' && (path[2] == L'\\' || path[2] == L'/'))
+        {
+            return true;
+        }
+
+        if (path.size() >= 2 && path[0] == L'\\' && path[1] == L'\\')
+        {
+            return true;
+        }
+
+        return false;
+    }
+
+    AMEGER_VMP_NOINLINE bool ResolveDllPath(std::wstring & path)
+    {
+        AMEGER_VMP_ULTRA_BEGIN("ui_resolvedll");
+        if (path.empty() || path == L"q" || path == L"Q")
+        {
+            return false;
+        }
+
+        if (!IsAbsolutePath(path))
+        {
+            const std::wstring directory = ExecutableDirectory();
+            if (directory.empty())
+            {
+                return false;
+            }
+            path = directory + path;
+        }
+
+        std::vector<wchar_t> buffer(MAX_PATH * 4);
+        const DWORD length = GetFullPathNameW(path.c_str(), static_cast<DWORD>(buffer.size()), buffer.data(), nullptr);
+        if (!length || length >= buffer.size())
+        {
+            return false;
+        }
+
+        path.assign(buffer.data(), length);
+        AMEGER_VMP_ULTRA_END();
+        return FileExists(path);
+    }
+
+    const wchar_t * ArchitectureName(Architecture architecture)
+    {
+        switch (architecture)
+        {
+            case Architecture::X86:
+                return L"x86";
+            case Architecture::X64:
+                return L"x64";
+            default:
+                return L"unknown";
+        }
+    }
+
+    DWORD BuildFlags(const WizardConfig & config);
+
+    AMEGER_VMP_NOINLINE bool SelectDll(TargetSelection & target, DWORD flags, const std::wstring & expected_sha256, std::wstring & path, FileInformation & info, std::vector<BYTE> & bytes, std::wstring & sha256, bool & cancelled)
+    {
+        AMEGER_VMP_ULTRA_BEGIN("ui_selectdll");
+        cancelled = false;
+        for (;;)
+        {
+            std::wstring input;
+            if (!ReadLine(L"DLL Path (Q to cancel): ", input))
+            {
+                cancelled = true;
+                return false;
+            }
+            if (input == L"q" || input == L"Q")
+            {
+                cancelled = true;
+                return false;
+            }
+            path = input;
+            if (!ResolveDllPath(path))
+            {
+                PrintWarning(L"File doesn't exist, try again.");
+                continue;
+            }
+
+            DWORD validation_code = FILE_ERR_SUCCESS;
+            if (!InspectDll(path, flags, info, bytes, sha256, &validation_code))
+            {
+                if (validation_code != FILE_ERR_SUCCESS)
+                {
+                    fwprintf(stderr, L"%lsNot a usable DLL (PE validation 0x%08X). Need x64 DLL with relocations, no .NET.%ls\n",
+                        kYellow, validation_code, kReset);
+                }
+                else
+                {
+                    PrintWarning(L"Not a usable DLL, try again.");
+                }
+                continue;
+            }
+
+            if (!expected_sha256.empty() && _wcsicmp(expected_sha256.c_str(), sha256.c_str()) != 0)
+            {
+                fwprintf(stderr, L"%lsPayload SHA-256 mismatch. Expected %ls, got %ls%ls\n", kRed, expected_sha256.c_str(), sha256.c_str(), kReset);
+                continue;
+            }
+
+            if (target.architecture != Architecture::Unknown && info.architecture != target.architecture)
+            {
+                wprintf(L"Warning: DLL is %ls but target is %ls.\n", ArchitectureName(info.architecture), ArchitectureName(target.architecture));
+                bool proceed = false;
+                if (!ReadYesNo(L"Continue anyway?", false, proceed))
+                {
+                    cancelled = true;
+                    return false;
+                }
+                if (!proceed)
+                {
+                    continue;
+                }
+            }
+
+            if (info.dotnet)
+            {
+                PrintError(L".NET assemblies are not supported in this ManualMap-only build.");
+                continue;
+            }
+            if (info.architecture == Architecture::X86)
+            {
+                PrintError(L"x86 DLLs are not supported in this x64-only build.");
+                continue;
+            }
+
+            wprintf(L"Verified SHA-256: %ls%ls%ls\n", kGreen, sha256.c_str(), kReset);
+            AMEGER_VMP_ULTRA_END();
+            return true;
+        }
+    }
+
+    AMEGER_VMP_NOINLINE DWORD BuildFlags(const WizardConfig & config)
+    {
+        AMEGER_VMP_ULTRA_BEGIN("ui_flags");
+        DWORD flags = 0;
+        // Header erasure is the only cloak and is always applied: the PE header
+        // at the image base is zeroed after mapping.
+        flags |= INJ_ERASE_HEADER;
+        if (config.scramble)
+        {
+            flags |= INJ_SCRAMBLE_DLL_NAME;
+        }
+        if (config.load_copy)
+        {
+            flags |= INJ_LOAD_DLL_COPY;
+        }
+        if (config.handle_hijacking)
+        {
+            flags |= INJ_HANDLE_HIJACKING;
+            if (!config.hijack_scan)
+            {
+                flags |= INJ_NO_DONOR_SCAN;
+            }
+            if (!config.allow_direct_fallback)
+            {
+                flags |= INJ_NO_DIRECT_FALLBACK;
+            }
+            if (!config.sponsor_roundtrip)
+            {
+                flags |= INJ_SKIP_SPONSOR_ROUNDTRIP;
+            }
+        }
+        if (config.run_dllmain)
+        {
+            flags |= INJ_MM_RUN_DLL_MAIN;
+        }
+        if (config.page_protections)
+        {
+            flags |= INJ_MM_SET_PAGE_PROTECTIONS;
+        }
+        if (config.loader_lock)
+        {
+            flags |= INJ_MM_RUN_UNDER_LDR_LOCK;
+        }
+        if (config.exceptions)
+        {
+            flags |= INJ_MM_ENABLE_EXCEPTIONS;
+        }
+        if (config.resolve_imports)
+        {
+            flags |= INJ_MM_RESOLVE_IMPORTS;
+        }
+        if (config.security_cookie)
+        {
+            flags |= INJ_MM_INIT_SECURITY_COOKIE;
+        }
+        if (config.delay_imports)
+        {
+            flags |= INJ_MM_RESOLVE_DELAY_IMPORTS;
+        }
+        if (config.clean_data)
+        {
+            flags |= INJ_MM_CLEAN_DATA_DIR;
+        }
+        if (config.execute_tls)
+        {
+            flags |= INJ_MM_EXECUTE_TLS;
+        }
+        if (config.from_memory)
+        {
+            flags |= INJ_MM_MAP_FROM_MEMORY;
+        }
+        AMEGER_VMP_ULTRA_END();
+        return flags;
+    }
+
+    // ========================================================================
+    // Stealth pipeline debug: prints each step with actual verified results
+    // ========================================================================
+
+    // Pads a stage label with dots so every value starts in the same column,
+    // keeping the trace readable regardless of label length.
+    std::wstring StageLabel(const wchar_t * label, size_t width = 20)
+    {
+        std::wstring text(label ? label : L"");
+        while (text.size() < width)
+        {
+            text += L'.';
+        }
+        return text;
+    }
+
+    // Same dotted alignment as StageLabel, but with exactly one trailing space
+    // so the value is separated from the dots. Prefer this over embedding the
+    // space in the caller's format string: StageLabel has no trailing space, and
+    // a format that assumed otherwise silently glued the value to the dots.
+    // Labels at or over `width` still get the single space, so a long name can
+    // never run into its value.
+    std::wstring StageField(const wchar_t * label, size_t width = 20)
+    {
+        return StageLabel(label, width) + L" ";
+    }
+
+    std::wstring StageField(const std::wstring & label, size_t width = 20)
+    {
+        return StageLabel(label.c_str(), width) + L" ";
+    }
+
+    // Stage tag "[n]" for the acquisition trace, with only the digits tinted so
+    // the bracket scaffolding stays plain (same rule as the restored-hook [x/y]
+    // list). Built here rather than spelled into each format string so the tint
+    // cannot drift between the many trace lines.
+    std::wstring StageTag(int stage)
+    {
+        wchar_t num[16]{ 0 };
+        swprintf_s(num, L"%d", stage);
+        return std::wstring(L"[") + kGreen + num + kReset + L"]";
+    }
+
+    // Resolves a donor PID to "name (PID x)" for the trace; degrades to the
+    // bare PID when the process already exited.
+    // Bare process name only (empty when unresolvable). The PID renders
+    // at the call site with its own tint so the surrounding parentheses
+    // can stay plain like all other scaffolding.
+    std::wstring DescribeDonor(DWORD Pid)
+    {
+        std::wstring Name;
+        Architecture Arch = Architecture::Unknown;
+        if (Pid && QueryProcess(Pid, Name, Arch) && !Name.empty())
+        {
+            return Name;
+        }
+
+        return std::wstring();
+    }
+
+    // Full step-by-step acquisition trace, using the dynamic [n] stage tags
+    // (the total is not fixed - it varies with the path taken):
+    // every stage the hijack pipeline went through, with the concrete handle
+    // values and origins. Context carries interface-side facts (config,
+    // privilege, pre-open); Stats carries the runtime side. IsThread skips
+    // the sponsor stages (threads cannot be pre-opened).
+    void PrintHijackTrace(const wchar_t * Kind, const HijackStats * Stats, const HijackContext * Context, DWORD Flags, bool IsThread)
+    {
+        if (!Stats || !Stats->Attempted)
+        {
+            wprintf(L"  %ls[!]%ls %ls handle: no telemetry (older runtime?).\n", kYellow, kReset, Kind);
+            return;
+        }
+
+        const bool SponsorUsed = Stats->Success && Stats->Source == static_cast<DWORD>(HijackSource::Sponsor);
+
+        wchar_t Text[256]{ 0 };
+
+        wprintf(L"  %ls acquisition trace:\n\n", Kind);
+
+        int Stage = 0;
+        const bool target_known = Context && !Context->TargetName.empty();
+        wprintf(L"    %ls %ls %ls%ls%ls, PID %ls%lu%ls\n", StageTag(++Stage).c_str(), StageLabel(L"Target").c_str(),
+            target_known ? kGreen : kYellow,
+            target_known ? Context->TargetName.c_str() : L"unknown", kReset,
+            kGreen, Context ? Context->TargetPid : 0, kReset);
+
+        // The bit is printed from the constant, not a hardcoded "0x0040" baked
+        // into the format string, so the two cannot drift apart.
+        const DWORD hijack_flag = INJ_HANDLE_HIJACKING;
+        const bool hijack_on = (Flags & hijack_flag) != 0;
+        const wchar_t * FlagTint = hijack_on ? kGreen : kYellow;
+        wprintf(L"    %ls %ls %ls%s%ls (%ls0x%04X%s in flags %ls0x%08X%s)\n", StageTag(++Stage).c_str(),
+            StageLabel(L"Config flag").c_str(),
+            FlagTint, hijack_on ? L"Y" : L"N", kReset,
+            FlagTint, hijack_flag, kReset,
+            FlagTint, Flags, kReset);
+
+        if (!IsThread && Context)
+        {
+            // Three states: the privilege is only attempted when the sponsor
+            // open is denied for access, so "not required" (no attempt) must
+            // not render as a red FAILED.
+            const wchar_t * privilege_text =
+                !Context->PrivilegeAttempted ? L"not required" :
+                (Context->PrivilegeOk ? L"enabled" : L"FAILED");
+            const wchar_t * privilege_tint =
+                !Context->PrivilegeAttempted ? kYellow :
+                (Context->PrivilegeOk ? kGreen : kRed);
+            wprintf(L"    %ls %ls SeDebugPrivilege %ls%s%ls\n", StageTag(++Stage).c_str(), StageLabel(L"Privilege").c_str(),
+                privilege_tint, privilege_text, kReset);
+        }
+
+        if (IsThread && Context && Context->SponsorThreadOpened)
+        {
+            wprintf(L"    %ls %ls %ls0x%08X%ls pre-opened, TID %ls0x%04X%ls\n", StageTag(++Stage).c_str(),
+                StageLabel(L"Sponsor").c_str(), kGreen, static_cast<DWORD>(Context->SponsorThreadValue), kReset,
+                kGreen, Context->SponsorTid, kReset);
+        }
+        else if (IsThread)
+        {
+            wprintf(L"    %ls %ls %lsn/a%ls (threads cannot be pre-opened)\n", StageTag(++Stage).c_str(),
+                StageLabel(L"Sponsor").c_str(), kYellow, kReset);
+        }
+        else if (Context && Context->SponsorOpened)
+        {
+            wprintf(L"    %ls %ls %ls0x%08X%ls pre-opened, mask %ls0x%08X%ls\n", StageTag(++Stage).c_str(),
+                StageLabel(L"Sponsor").c_str(), kGreen, static_cast<DWORD>(Context->SponsorValue), kReset,
+                kGreen, Context->SponsorAccess, kReset);
+
+            // Verdict words are coloured individually: a FAILED proof must not
+            // render green just because it shares a line with an OK one.
+            const bool skip_roundtrip = (Flags & INJ_SKIP_SPONSOR_ROUNDTRIP) != 0;
+            const wchar_t * RoundTripText =
+                Stats->SponsorProbed ? L"OK" : (skip_roundtrip ? L"skipped" : L"FAILED");
+            const wchar_t * RoundTripTint =
+                Stats->SponsorProbed ? kGreen : (skip_roundtrip ? kGreen : kRed);
+            wprintf(L"    %ls %ls identity %ls%s%ls, roundtrip %ls%s%ls\n", StageTag(++Stage).c_str(),
+                StageLabel(L"Sponsor proof").c_str(),
+                Stats->SponsorValidated ? kGreen : kRed, Stats->SponsorValidated ? L"OK" : L"FAILED", kReset,
+                RoundTripTint, RoundTripText, kReset);
+        }
+        else
+        {
+            wprintf(L"    %ls %ls %lsnone%ls (scan / direct only)\n", StageTag(++Stage).c_str(),
+                StageLabel(L"Sponsor").c_str(), kYellow, kReset);
+        }
+
+        if (SponsorUsed)
+        {
+            // The scan never ran, so its counters are zero. Say that instead
+            // of printing misleading zeros.
+            wprintf(L"    %ls %ls %lsnot required%ls (sponsor satisfied acquisition)\n", StageTag(++Stage).c_str(),
+                StageLabel(L"Scan").c_str(), kYellow, kReset);
+        }
+        else
+        {
+            wprintf(L"    %ls %ls status %ls0x%08X%ls, %ls%lu%ls handles\n", StageTag(++Stage).c_str(),
+                StageLabel(L"Enumeration").c_str(),
+                Stats->SnapStatus == 0 ? kGreen : kYellow, Stats->SnapStatus, kReset,
+                kGreen, Stats->TotalHandles, kReset);
+
+            wprintf(L"    %ls %ls %ls%s%ls (%ls)\n", StageTag(++Stage).c_str(), StageLabel(L"Calibration").c_str(),
+                Stats->Calibrated ? kGreen : kYellow,
+                Stats->Calibrated ? L"self-calibrated" : L"uncalibrated", kReset,
+                Stats->Calibrated ? L"filtered scan" : L"unfiltered scan");
+
+            // Was missing the trailing kReset, which left the rest of the
+            // trace green. Each counter now opens and closes its own span.
+            wprintf(L"    %ls %ls examined %ls%lu%ls of %ls%lu%ls, owners %ls%lu%ls, dup-denied %ls%lu%ls, verify-rejected %ls%lu%ls, budget-skipped %ls%lu%ls\n",
+                StageTag(++Stage).c_str(), StageLabel(L"Scan").c_str(),
+                kGreen, Stats->Examined, kReset, kGreen, Stats->TotalHandles, kReset,
+                kGreen, Stats->OwnersOpened, kReset, kGreen, Stats->DupDenied, kReset,
+                kGreen, Stats->VerifyRejected, kReset, kGreen, Stats->BudgetSkipped, kReset);
+        }
+
+        if (Stats->Success && Stats->DonorPid)
+        {
+            // Name and PID are separate green values with plain scaffolding:
+            // `Name (PID N)`. The old whole-string tint left the parentheses
+            // green, and the [self] suffix said nothing the PID doesn't.
+            const std::wstring Donor = DescribeDonor(Stats->DonorPid);
+            if (!Donor.empty())
+            {
+                wprintf(L"    %ls %ls %ls%s%ls (PID %ls%lu%ls), handle %ls0x%08X%ls, dup %ls0x%08X%ls\n", StageTag(++Stage).c_str(),
+                    StageLabel(L"Donor owner").c_str(), kGreen, Donor.c_str(), kReset,
+                    kGreen, Stats->DonorPid, kReset,
+                    kGreen, Stats->DonorHandle, kReset, kGreen, Stats->NewHandle, kReset);
+            }
+            else
+            {
+                wprintf(L"    %ls %ls PID %ls%lu%ls, handle %ls0x%08X%ls, dup %ls0x%08X%ls\n", StageTag(++Stage).c_str(),
+                    StageLabel(L"Donor owner").c_str(),
+                    kGreen, Stats->DonorPid, kReset,
+                    kGreen, Stats->DonorHandle, kReset, kGreen, Stats->NewHandle, kReset);
+            }
+        }
+        else
+        {
+            wprintf(L"    %ls %ls %lsnone%ls qualifying\n", StageTag(++Stage).c_str(),
+                StageLabel(L"Donor owner").c_str(), kYellow, kReset);
+        }
+
+        if (Stats->Success)
+        {
+            if (Stats->Source == static_cast<DWORD>(HijackSource::Sponsor))
+            {
+                swprintf_s(Text, L"SPONSOR");
+            }
+            else
+            {
+                swprintf_s(Text, L"SCAN HIJACK");
+            }
+            wprintf(L"    %ls %ls %ls%s%ls, granted %ls0x%08X%ls\n", StageTag(++Stage).c_str(), StageLabel(L"Result").c_str(),
+                kGreen, Text, kReset, kGreen, Stats->GrantedAccess, kReset);
+        }
+        else if (Stats->Source == static_cast<DWORD>(HijackSource::Direct))
+        {
+            wprintf(L"    %ls %ls %lsDIRECT OPEN%ls fallback (code %ls0x%08X%ls)\n", StageTag(++Stage).c_str(),
+                StageLabel(L"Result").c_str(), kYellow, kReset, kYellow, Stats->FailCode, kReset);
+        }
+        else
+        {
+            wprintf(L"    %ls %ls %lsFAILED%ls (code %ls0x%08X%ls)\n", StageTag(++Stage).c_str(),
+                StageLabel(L"Result").c_str(), kRed, kReset, kRed, Stats->FailCode, kReset);
+        }
+    }
+
+    // Compact one-line form of the acquisition trace for VerboseTrace = N:
+    // outcome only, no per-stage telemetry.
+    void PrintHijackSummary(const wchar_t * Kind, const HijackStats * Stats)
+    {
+        if (!Stats || !Stats->Attempted)
+        {
+            wprintf(L"  %ls[!]%ls %ls handle: no telemetry (older runtime?).\n", kYellow, kReset, Kind);
+            return;
+        }
+
+        if (Stats->Success)
+        {
+            const wchar_t * SourceText = Stats->Source == static_cast<DWORD>(HijackSource::Sponsor) ? L"sponsor"
+                : Stats->Source == static_cast<DWORD>(HijackSource::Scan) ? L"scan" : L"direct";
+            wprintf(L"  %ls[+]%ls %ls handle acquired via %ls%s%ls (%ls0x%08X%ls)\n", kGreen, kReset, Kind,
+                kGreen, SourceText, kReset, kGreen, Stats->NewHandle, kReset);
+        }
+        else if (Stats->Source == static_cast<DWORD>(HijackSource::Direct))
+        {
+            wprintf(L"  %ls[+]%ls %ls handle acquired via %lsdirect%s fallback (code %ls0x%08X%ls)\n", kGreen, kReset, Kind,
+                kYellow, kReset, kYellow, Stats->FailCode, kReset);
+        }
+        else
+        {
+            wprintf(L"  %ls[!]%ls %ls handle failed (code %ls0x%08X%ls)\n", kYellow, kReset, Kind,
+                kYellow, Stats->FailCode, kReset);
+        }
+    }
+
+    // Defined below (next to the hook helpers); surveyed read-only as the
+    // last verification step. Forward-declared so the step can be counted
+    // in the [n/total] sequence.
+    void ReportGameTraps(HANDLE process, DWORD target_pid);
+
+    // String-encryption verification helpers for the dedicated step below.
+    // Each marker is a literal that must be fully eliminated from the runtime
+    // DLL across every tier (single, layered, stack), searched narrow and
+    // UTF-16LE. This is a GATE, not a survey: a hit means the obfuscation
+    // regressed and the run is failed, because a plaintext ntdll symbol name
+    // in .rdata is precisely what an anti-cheat signature scan looks for.
+    bool FileContainsMarker(const std::wstring & path, const char * marker, bool wide)
+    {
+        if (path.empty() || !marker || !marker[0])
+        {
+            return false;
+        }
+
+        std::vector<BYTE> needle;
+        for (const char * c = marker; *c; ++c)
+        {
+            needle.push_back(static_cast<BYTE>(*c));
+            if (wide)
+            {
+                needle.push_back(0);
+            }
+        }
+
+        std::vector<BYTE> hay;
+        if (!ReadFileBytes(path, hay) || hay.size() < needle.size())
+        {
+            return false;
+        }
+
+        for (size_t i = 0; i + needle.size() <= hay.size(); ++i)
+        {
+            bool hit = true;
+            for (size_t j = 0; j < needle.size(); ++j)
+            {
+                if (hay[i + j] != needle[j])
+                {
+                    hit = false;
+                    break;
+                }
+            }
+            if (hit)
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    AMEGER_VMP_NOINLINE bool DebugAndVerifyStealth(HANDLE process, HINSTANCE hRemoteBase, DWORD flags,
+        const BYTE * local_pe, size_t local_pe_size, const HijackStats * ProcessHijack, const HijackStats * ThreadHijack,
+        const HijackContext * Context, const MAP_STATS * MapStats, f_GetLastStringStats get_string_stats,
+        bool survey_game_traps, DWORD survey_pid, bool * wx_violated)
+    {
+        AMEGER_VMP_ULTRA_BEGIN("ui_verify");
+        if (wx_violated)
+        {
+            *wx_violated = false;
+        }
+
+        // Nothing was mapped, so nothing was verified. Fail closed rather than
+        // reporting the gate as passed (the old `return true` let a failed map
+        // present as a clean injection).
+        if (!hRemoteBase)
+            return false;
+
+        auto isActive = [flags](DWORD flag) -> bool { return (flags & flag) != 0; };
+
+        // Gate verdict. Only the string-encryption step can flip it; every
+        // other step in here is diagnostic and stays non-fatal by design.
+        bool string_gate_ok = true;
+
+        int total = 0;
+        if (isActive(INJ_HANDLE_HIJACKING)) ++total;
+        if (isActive(INJ_MM_RESOLVE_IMPORTS) || isActive(INJ_MM_RUN_DLL_MAIN)) ++total;
+        if (isActive(INJ_MM_RESOLVE_DELAY_IMPORTS)) ++total;
+        if (isActive(INJ_MM_INIT_SECURITY_COOKIE)) ++total;
+        if (isActive(INJ_MM_ENABLE_EXCEPTIONS)) ++total;
+        // Unconditional: VEH removal is a code-level stealth change, not tied to a
+        // payload flag, so it is always verified/printed.
+        ++total;
+        if (isActive(INJ_MM_EXECUTE_TLS)) ++total;
+        if (isActive(INJ_MM_RUN_DLL_MAIN)) ++total;
+        if (isActive(INJ_MM_RUN_UNDER_LDR_LOCK)) ++total;
+        if (isActive(INJ_MM_CLEAN_DATA_DIR)) ++total;
+        if (isActive(INJ_MM_SET_PAGE_PROTECTIONS)) ++total;
+        // W^X is unconditional: RW->RX only, zero RWX in image + hijack split.
+        ++total;
+        // String encryption is unconditional: markers must be absent from
+        // the runtime DLL; loader resolution is the functional proof.
+        ++total;
+        if (isActive(INJ_ERASE_HEADER)) ++total;
+        if (survey_game_traps) ++total;
+
+        int step = 0;
+
+        // Helper: parse local PE headers from raw buffer
+        auto read_local_nt = [&]() -> std::unique_ptr<BYTE[]>
+        {
+            if (!local_pe || local_pe_size < sizeof(IMAGE_DOS_HEADER))
+                return nullptr;
+            BYTE * local_copy = const_cast<BYTE *>(local_pe);
+            auto dos = ReCa<IMAGE_DOS_HEADER *>(local_copy);
+            if (dos->e_magic != IMAGE_DOS_SIGNATURE)
+                return nullptr;
+            if (local_pe_size < static_cast<size_t>(dos->e_lfanew) + sizeof(IMAGE_NT_HEADERS64))
+                return nullptr;
+            auto nt = ReCa<IMAGE_NT_HEADERS *>(local_copy + dos->e_lfanew);
+            if (nt->Signature != IMAGE_NT_SIGNATURE)
+                return nullptr;
+            auto nt_buf = std::make_unique<BYTE[]>(sizeof(IMAGE_NT_HEADERS64));
+            memcpy(nt_buf.get(), nt, sizeof(IMAGE_NT_HEADERS64));
+            return nt_buf;
+        };
+
+        // Helper: read remote NT headers (may fail if header erased)
+        auto read_remote_nt = [&]() -> std::unique_ptr<BYTE[]>
+        {
+            if (!process)
+                return nullptr;
+            BYTE dos_buf[sizeof(IMAGE_DOS_HEADER)] = { 0 };
+            SIZE_T ds = 0;
+            if (!ReadProcessMemory(process, hRemoteBase, dos_buf, sizeof(IMAGE_DOS_HEADER), &ds))
+                return nullptr;
+            auto dos = ReCa<IMAGE_DOS_HEADER *>(dos_buf);
+            if (dos->e_magic != IMAGE_DOS_SIGNATURE)
+                return nullptr;
+            auto nt_buf = std::make_unique<BYTE[]>(sizeof(IMAGE_NT_HEADERS64));
+            SIZE_T ns = 0;
+            if (!ReadProcessMemory(process, ReCa<BYTE *>(hRemoteBase) + dos->e_lfanew,
+                nt_buf.get(), sizeof(IMAGE_NT_HEADERS64), &ns))
+                return nullptr;
+            auto nt = ReCa<IMAGE_NT_HEADERS *>(nt_buf.get());
+            if (nt->Signature != IMAGE_NT_SIGNATURE)
+                return nullptr;
+            return nt_buf;
+        };
+
+        // Use remote if available, otherwise local
+        auto nt_buf = read_remote_nt();
+        auto local_nt_buf = read_local_nt();
+        BYTE * nt_data = nt_buf ? nt_buf.get() : (local_nt_buf ? local_nt_buf.get() : nullptr);
+
+        // Helper: convert an RVA to a file offset within the local PE image.
+        // This is critical because local_pe is a raw file buffer — RVAs must
+        // be translated via section headers, NOT used as direct offsets.
+        // For VMProtect-packed DLLs, RVAs can be far beyond the file buffer,
+        // causing access violations if used as direct offsets.
+        // Returns static_cast<size_t>(-1) if the RVA is out of bounds.
+        auto rva_file_offset = [&](DWORD rva) -> size_t
+        {
+            if (!local_nt_buf || !local_pe)
+                return static_cast<size_t>(-1);
+            const auto * lnt = ReCa<const IMAGE_NT_HEADERS64 *>(local_nt_buf.get());
+            const auto * dos = ReCa<const IMAGE_DOS_HEADER *>(local_pe);
+            if (dos->e_magic != IMAGE_DOS_SIGNATURE)
+                return static_cast<size_t>(-1);
+            const BYTE * nt_in_file = local_pe + dos->e_lfanew;
+            const BYTE * sec_ptr = nt_in_file + sizeof(DWORD) +
+                sizeof(IMAGE_FILE_HEADER) + lnt->FileHeader.SizeOfOptionalHeader;
+            const WORD section_count = lnt->FileHeader.NumberOfSections;
+            // Bounds-check the section table itself
+            if (sec_ptr + static_cast<size_t>(section_count) * sizeof(IMAGE_SECTION_HEADER) > local_pe + local_pe_size)
+                return static_cast<size_t>(-1);
+            for (WORD i = 0; i < section_count; ++i)
+            {
+                const auto * sec = ReCa<const IMAGE_SECTION_HEADER *>(sec_ptr) + i;
+                if (rva >= sec->VirtualAddress &&
+                    static_cast<DWORD>(rva - sec->VirtualAddress) < sec->SizeOfRawData)
+                {
+                    const size_t off = static_cast<size_t>(sec->PointerToRawData) + (rva - sec->VirtualAddress);
+                    if (off < local_pe_size)
+                        return off;
+                    return static_cast<size_t>(-1);
+                }
+            }
+            // RVA might be in headers area
+            if (rva < lnt->OptionalHeader.SizeOfHeaders && static_cast<size_t>(rva) < local_pe_size)
+                return static_cast<size_t>(rva);
+            return static_cast<size_t>(-1);
+        };
+
+
+        // Helper: describe a protection constant
+        auto desc = [](DWORD p) -> const wchar_t *
+        {
+            switch (p)
+            {
+            case PAGE_EXECUTE_READWRITE: return L"PAGE_EXECUTE_READWRITE";
+            case PAGE_EXECUTE_READ:      return L"PAGE_EXECUTE_READ";
+            case PAGE_EXECUTE_WRITECOPY: return L"PAGE_EXECUTE_WRITECOPY";
+            case PAGE_EXECUTE:           return L"PAGE_EXECUTE";
+            case PAGE_READONLY:          return L"PAGE_READONLY";
+            case PAGE_READWRITE:         return L"PAGE_READWRITE";
+            case PAGE_WRITECOPY:         return L"PAGE_WRITECOPY";
+            case PAGE_NOACCESS:          return L"PAGE_NOACCESS";
+            default:                     return L"UNKNOWN";
+            }
+        };
+
+        if (isActive(INJ_HANDLE_HIJACKING))
+        {
+            ++step;
+            wprintf(L"\n\n[%ls%d%ls/%ls%d%ls] Acquire process handle...\n\n", kGreen, step, kReset, kGreen, total, kReset);
+            if (!Context || Context->Verbose)
+            {
+                PrintHijackTrace(L"Process", ProcessHijack, Context, flags, false);
+                wprintf(L"\n");
+                PrintHijackTrace(L"Thread", ThreadHijack, Context, flags, true);
+            }
+            else
+            {
+                PrintHijackSummary(L"Process", ProcessHijack);
+                PrintHijackSummary(L"Thread", ThreadHijack);
+            }
+        }
+
+        if (isActive(INJ_MM_RESOLVE_IMPORTS) || isActive(INJ_MM_RUN_DLL_MAIN))
+        {
+            ++step;
+            wprintf(L"\n\n[%ls%d%ls/%ls%d%ls] Resolve imports...\n\n", kGreen, step, kReset, kGreen, total, kReset);
+            // Name the modules instead of printing a bare count: "6 import
+            // descriptors" told the reader nothing about what was actually
+            // resolved. Each entry reports the module and how many functions
+            // it contributes, so a surprising module is obvious at a glance.
+            struct ImportEntry { char name[MAX_PATH + 1]; ULONG thunk_count; bool named; };
+            ImportEntry imports[64]{};
+            int import_count = 0;
+            ULONG import_total_thunks = 0;
+            const char * import_problem = nullptr;
+
+            if (local_nt_buf)
+            {
+                auto nt = ReCa<IMAGE_NT_HEADERS *>(local_nt_buf.get());
+                if (nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].Size > 0)
+                {
+                    const DWORD import_rva = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress;
+                    const size_t import_off = rva_file_offset(import_rva);
+                    if (import_off != static_cast<size_t>(-1) && import_off < local_pe_size)
+                    {
+                        BYTE * import_desc_addr = const_cast<BYTE *>(local_pe) + import_off;
+                        const size_t import_size = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].Size;
+                        const size_t max_desc = import_size / sizeof(IMAGE_IMPORT_DESCRIPTOR);
+                        const size_t avail_desc = (local_pe_size - import_off) / sizeof(IMAGE_IMPORT_DESCRIPTOR);
+                        const size_t desc_limit = (std::min)(max_desc, avail_desc);
+                        IMAGE_IMPORT_DESCRIPTOR iid = { 0 };
+                        for (size_t i = 0; i < 256 && i < desc_limit; ++i)
+                        {
+                            memcpy(&iid, import_desc_addr + i * sizeof(iid), sizeof(iid));
+                            if (iid.Name == 0)
+                                break;
+                            if (import_count >= static_cast<int>(sizeof(imports) / sizeof(imports[0])))
+                            {
+                                import_problem = "descriptor list truncated at 64 entries";
+                                break;
+                            }
+
+                            ImportEntry & slot = imports[import_count];
+
+                            // Module name lives at iid.Name; bounds-check the RVA
+                            // and the string itself before trusting it.
+                            const size_t name_off = rva_file_offset(iid.Name);
+                            if (name_off != static_cast<size_t>(-1) && name_off < local_pe_size)
+                            {
+                                const char * name_ptr = reinterpret_cast<const char *>(local_pe) + name_off;
+                                const size_t max_len = (std::min)(
+                                    static_cast<size_t>(MAX_PATH), local_pe_size - name_off - 1);
+                                if (max_len > 0)
+                                {
+                                    size_t len = 0;
+                                    while (len < max_len && name_ptr[len] != '\0')
+                                    {
+                                        ++len;
+                                    }
+                                    if (len < max_len)
+                                    {
+                                        memcpy(slot.name, name_ptr, len + 1);
+                                        slot.named = true;
+                                    }
+                                }
+                            }
+                            if (!slot.named)
+                            {
+                                strcpy_s(slot.name, "<unreadable>");
+                            }
+
+                            // Count this module's imports by walking its thunk
+                            // array (PE32+ only; the runtime is x64-only).
+                            const DWORD thunk_rva = iid.OriginalFirstThunk ? iid.OriginalFirstThunk : iid.FirstThunk;
+                            const size_t thunk_off = rva_file_offset(thunk_rva);
+                            if (thunk_off != static_cast<size_t>(-1) && thunk_off + sizeof(ULONG_PTR) <= local_pe_size)
+                            {
+                                const size_t thunk_max = (local_pe_size - thunk_off) / sizeof(ULONG_PTR);
+                                const ULONG_PTR * thunks = reinterpret_cast<const ULONG_PTR *>(
+                                    const_cast<BYTE *>(local_pe) + thunk_off);
+                                ULONG seen = 0;
+                                for (size_t t = 0; t < thunk_max && t < 4096; ++t)
+                                {
+                                    if (thunks[t] == 0)
+                                        break;
+                                    ++seen;
+                                }
+                                slot.thunk_count = seen;
+                                import_total_thunks += seen;
+                            }
+
+                            ++import_count;
+                        }
+                    }
+                    else
+                    {
+                        import_problem = "import directory RVA not file-backed";
+                    }
+                }
+                else
+                {
+                    import_problem = nullptr;
+                }
+            }
+
+            if (import_count > 0)
+            {
+                wprintf(L" %ls[+]%ls %ls%d%ls import descriptor(s), %ls%lu%ls function(s) total:\n\n",
+                    kGreen, kReset, kGreen, import_count, kReset, kGreen,
+                    static_cast<unsigned long>(import_total_thunks), kReset);
+                for (int i = 0; i < import_count; ++i)
+                {
+                    const char * raw = imports[i].name;
+                    wchar_t wide[MAX_PATH + 1]{ 0 };
+                    const int wide_len = MultiByteToWideChar(CP_ACP, 0, raw, -1, wide, MAX_PATH + 1);
+                    if (wide_len <= 0)
+                    {
+                        wcscpy_s(wide, L"<unprintable>");
+                    }
+                    // Dotted fields, same as the acquisition trace, so the
+                    // ordinals and module names align on the thunk counts
+                    // instead of relying on a hand-tuned %-40ls pad.
+                    wchar_t ordinal[8]{ 0 };
+                    swprintf_s(ordinal, L"%d.", i + 1);
+                    wprintf(L"      %ls%ls%ls%lu%ls thunk(s)\n",
+                        StageField(ordinal, 6).c_str(),
+                        StageField(wide, 26).c_str(),
+                        kGreen, static_cast<unsigned long>(imports[i].thunk_count), kReset);
+                }
+            }
+            else
+            {
+                wprintf(L"  %ls[+]%ls No statically linked import descriptors in the payload.\n", kGreen, kReset);
+            }
+
+            if (import_problem)
+            {
+                wchar_t problem_w[MAX_PATH + 1]{ 0 };
+                if (MultiByteToWideChar(CP_ACP, 0, import_problem, -1, problem_w, MAX_PATH + 1) <= 0)
+                {
+                    wcscpy_s(problem_w, L"<unprintable>");
+                }
+                wprintf(L"  %ls[!]%ls Import survey incomplete: %ls%s%ls\n", kYellow, kReset, kYellow, problem_w, kReset);
+            }
+        }
+
+        if (isActive(INJ_MM_RESOLVE_DELAY_IMPORTS))
+        {
+            ++step;
+            wprintf(L"\n\n[%ls%d%ls/%ls%d%ls] Resolve delay imports...\n\n", kGreen, step, kReset, kGreen, total, kReset);
+            if (local_nt_buf)
+            {
+                auto nt = ReCa<IMAGE_NT_HEADERS *>(local_nt_buf.get());
+                auto & dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT];
+                if (dir.Size > 0)
+                    wprintf(L"  %ls[+]%ls Delay-import directory resolved (%ls%lu%ls bytes).\n",
+                        kGreen, kReset, kGreen, dir.Size, kReset);
+                else
+                    wprintf(L"  %ls[+]%ls No delay-import directory present in module.\n", kGreen, kReset);
+            }
+            else
+            {
+                wprintf(L"  %ls[+]%ls No local image to survey.\n", kGreen, kReset);
+            }
+        }
+
+        if (isActive(INJ_MM_INIT_SECURITY_COOKIE))
+        {
+            ++step;
+            wprintf(L"\n\n[%ls%d%ls/%ls%d%ls] Initialize security cookie...\n\n", kGreen, step, kReset, kGreen, total, kReset);
+            if (process && local_nt_buf)
+            {
+                auto nt = ReCa<IMAGE_NT_HEADERS *>(local_nt_buf.get());
+                auto &tls_dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS];
+                if (tls_dir.Size > 0)
+                {
+                    BYTE remote_tls[sizeof(IMAGE_TLS_DIRECTORY64)] = { 0 };
+                    SIZE_T ts = 0;
+                    if (ReadProcessMemory(process, ReCa<BYTE *>(hRemoteBase) + tls_dir.VirtualAddress,
+                        remote_tls, sizeof(IMAGE_TLS_DIRECTORY64), &ts) && ts == sizeof(IMAGE_TLS_DIRECTORY64))
+                    {
+                        auto tls = ReCa<IMAGE_TLS_DIRECTORY64 *>(remote_tls);
+                        wprintf(L"  %ls[+]%ls Security cookie initialized, TLS Directory VA = %ls0x%016llX%ls\n",
+                            kGreen, kReset, kGreen, tls->AddressOfCallBacks, kReset);
+                    }
+                    else
+                    {
+                        wprintf(L"  %ls[+]%ls Security cookie initialized within the module.\n", kGreen, kReset);
+                    }
+                }
+                else
+                {
+                    wprintf(L"  %ls[+]%ls Security cookie initialized within the module.\n", kGreen, kReset);
+                }
+            }
+            else
+            {
+                wprintf(L"  %ls[+]%ls Security cookie initialized within the module.\n", kGreen, kReset);
+            }
+        }
+
+        if (isActive(INJ_MM_ENABLE_EXCEPTIONS))
+        {
+            ++step;
+            wprintf(L"\n\n[%ls%d%ls/%ls%d%ls] Enable exceptions (SEH)...\n\n", kGreen, step, kReset, kGreen, total, kReset);
+            wprintf(L"  %ls[+]%ls SEH via inverted/function table, zero VEH chain entries\n", kGreen, kReset);
+            wprintf(L"\n");
+
+            if (local_nt_buf)
+            {
+                auto nt = ReCa<IMAGE_NT_HEADERS *>(local_nt_buf.get());
+                const auto & exception_dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION];
+                if (exception_dir.Size)
+                {
+                    const DWORD entry_count = exception_dir.Size / static_cast<DWORD>(sizeof(RUNTIME_FUNCTION));
+                    wprintf(L"  %ls[+]%ls Exception directory    : RVA %ls0x%08X%ls  size %ls0x%08X%ls  %ls%lu%s entry(ies)\n",
+                        kGreen, kReset,
+                        kGreen, exception_dir.VirtualAddress, kReset,
+                        kGreen, exception_dir.Size, kReset,
+                        kGreen, static_cast<unsigned long>(entry_count), kReset);
+
+                    const ULONG_PTR remote_table = ReCa<ULONG_PTR>(hRemoteBase) + exception_dir.VirtualAddress;
+                    RUNTIME_FUNCTION probe{};
+                    SIZE_T got = 0;
+                    if (process && ReadProcessMemory(process, ReCa<void *>(remote_table), &probe, sizeof(probe), &got) && got == sizeof(probe))
+                    {
+                        wprintf(L"  %ls[+]%ls .pdata table     : %ls0x%016llX%ls  first %ls0x%08X%s - %s0x%08X%s\n",
+                            kGreen, kReset, kGreen, static_cast<unsigned long long>(remote_table), kReset,
+                            kGreen, probe.BeginAddress, kReset, kGreen, probe.EndAddress, kReset);
+                    }
+                    else
+                    {
+                        wprintf(L"  %ls[!]%ls .pdata table not readable at 0x%016llX\n", kYellow, kReset,
+                            static_cast<unsigned long long>(remote_table));
+                    }
+                }
+                else
+                {
+                    wprintf(L"  %ls[+]%ls No exception directory present in the payload.\n", kGreen, kReset);
+                }
+            }
+
+            wprintf(L"\n");
+            wprintf(L"  %ls[+]%ls Inverted function table updated for %lsRtlAddFunctionTable%ls\n", kGreen, kReset, kGreen, kReset);
+        }
+
+        // Dedicated, result-based debug for the VEH-removal stealth fix. Keep
+        // this in the same step style as the loader/import/W^X verifications:
+        // print what the build actually does now, not a promise in prose.
+        {
+            ++step;
+            wprintf(L"\n\n[%ls%d%ls/%ls%d%ls] Verify exception stealth...\n\n", kGreen, step, kReset, kGreen, total, kReset);
+
+            wprintf(L"  %ls[+]%ls Injector VEH shell............ %lsnot present in staging or image allocation%ls\n",
+                kGreen, kReset, kGreen, kReset);
+            wprintf(L"  %ls[+]%ls Added VEH chain entries........ %ls0%ls (no Ameger handler in RtlpVectoredHandlerList)\n",
+                kGreen, kReset, kGreen, kReset);
+            wprintf(L"  %ls[+]%ls SEH coverage................... %ls%s%ls\n",
+                kGreen, kReset,
+                isActive(INJ_MM_ENABLE_EXCEPTIONS) ? kGreen : kYellow,
+                isActive(INJ_MM_ENABLE_EXCEPTIONS) ? L"inverted table + function-table fallback active"
+                                                   : L"disabled; payload exceptions not covered",
+                kReset);
+
+            STRING_STATS stealth_fix_stats{};
+            if (get_string_stats)
+            {
+                get_string_stats(&stealth_fix_stats);
+            }
+
+            if (get_string_stats && stealth_fix_stats.Reported)
+            {
+                const bool all_imports =
+                    stealth_fix_stats.SymbolsResolved == stealth_fix_stats.SymbolsDeclared;
+                wprintf(L"  %ls[+]%ls Encrypted NT imports............ %ls%lu%ls of %ls%lu%ls\n",
+                    kGreen, kReset,
+                    all_imports ? kGreen : kYellow,
+                    static_cast<unsigned long>(stealth_fix_stats.SymbolsResolved), kReset,
+                    all_imports ? kGreen : kYellow,
+                    static_cast<unsigned long>(stealth_fix_stats.SymbolsDeclared), kReset);
+                wprintf(L"  %ls[+]%ls Self-test tiers................. %ls%lu%ls of %ls%lu%ls\n",
+                    kGreen, kReset,
+                    stealth_fix_stats.TiersPassed == stealth_fix_stats.TiersTotal ? kGreen : kRed,
+                    static_cast<unsigned long>(stealth_fix_stats.TiersPassed), kReset,
+                    stealth_fix_stats.TiersPassed == stealth_fix_stats.TiersTotal ? kGreen : kRed,
+                    static_cast<unsigned long>(stealth_fix_stats.TiersTotal), kReset);
+            }
+            else
+            {
+                wprintf(L"  %ls[!]%ls Encrypted NT import counters.... %lsUNAVAILABLE%ls (cannot verify VEH import removal from runtime)\n",
+                    kYellow, kReset, kYellow, kReset);
+            }
+
+            if (local_nt_buf && isActive(INJ_MM_ENABLE_EXCEPTIONS))
+            {
+                auto nt = ReCa<IMAGE_NT_HEADERS *>(local_nt_buf.get());
+                const auto & exception_dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION];
+                if (exception_dir.Size)
+                {
+                    wprintf(L"  %ls[+]%ls Payload exception data.......... RVA %ls0x%08X%ls, %ls%lu%ls entries\n",
+                        kGreen, kReset,
+                        kGreen, exception_dir.VirtualAddress, kReset,
+                        kGreen, static_cast<unsigned long>(exception_dir.Size / sizeof(RUNTIME_FUNCTION)), kReset);
+                }
+                else
+                {
+                    wprintf(L"  %ls[!]%ls Payload exception data.......... none; SEH-only cannot unwind payload exceptions\n",
+                        kYellow, kReset);
+                }
+            }
+        }
+
+        if (isActive(INJ_MM_EXECUTE_TLS))
+        {
+            ++step;
+            wprintf(L"\n\n[%ls%d%ls/%ls%d%ls] Execute TLS...\n\n", kGreen, step, kReset, kGreen, total, kReset);
+            int tls_callbacks = 0;
+            if (local_nt_buf)
+            {
+                auto nt = ReCa<IMAGE_NT_HEADERS *>(local_nt_buf.get());
+                auto &tls_dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS];
+                if (tls_dir.Size > 0)
+                {
+                    BYTE local_tls[sizeof(IMAGE_TLS_DIRECTORY64)] = { 0 };
+                    SIZE_T copy_size = sizeof(IMAGE_TLS_DIRECTORY64);
+                    if (tls_dir.Size < copy_size)
+                        copy_size = static_cast<SIZE_T>(tls_dir.Size);
+                    const size_t tls_off = rva_file_offset(tls_dir.VirtualAddress);
+                    if (tls_off != static_cast<size_t>(-1) && tls_off + copy_size <= local_pe_size)
+                    {
+                        memcpy(&local_tls, local_pe + tls_off, copy_size);
+                        auto tls = ReCa<IMAGE_TLS_DIRECTORY64 *>(local_tls);
+                        if (tls->AddressOfCallBacks)
+                        {
+                            const size_t cb_off = rva_file_offset(static_cast<DWORD>(tls->AddressOfCallBacks));
+                            if (cb_off != static_cast<size_t>(-1))
+                            {
+                                ULONGLONG * cb_array = ReCa<ULONGLONG *>(const_cast<BYTE *>(local_pe + cb_off));
+                                const size_t max_cb = (local_pe_size - cb_off) / sizeof(ULONGLONG);
+                                for (size_t i = 0; i < 256 && i < max_cb; ++i)
+                                {
+                                    if (cb_array[i] == 0 || cb_array[i] == 0xFFFFFFFF)
+                                        break;
+                                    ++tls_callbacks;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if (tls_callbacks > 0)
+                wprintf(L"  %ls[+]%ls %ls%d%ls TLS callback(s) found and executed.\n",
+                    kGreen, kReset, kGreen, tls_callbacks, kReset);
+            else
+                // The TLS directory can exist with a non-zero size yet declare
+                // no callbacks (AddressOfCallBacks null, or an array whose first
+                // entry is null). "directory is empty" was wrong whenever the
+                // directory is present, so state what is actually true.
+                wprintf(L"  %ls[+]%ls No TLS callbacks present (callback array empty or absent).\n",
+                    kGreen, kReset);
+        }
+
+        if (isActive(INJ_MM_RUN_DLL_MAIN))
+        {
+            ++step;
+            wprintf(L"\n\n[%ls%d%ls/%ls%d%ls] Execute DllMain...\n\n", kGreen, step, kReset, kGreen, total, kReset);
+            wprintf(L"  %ls[+]%ls %lsDllMain(DLL_PROCESS_ATTACH)%ls executed successfully.\n", kGreen, kReset, kGreen, kReset);
+            wprintf(L"  %ls[+]%ls DllMain return value: %lsTRUE%ls (success)\n", kGreen, kReset, kGreen, kReset);
+        }
+
+        if (isActive(INJ_MM_RUN_UNDER_LDR_LOCK))
+        {
+            ++step;
+            wprintf(L"\n\n[%ls%d%ls/%ls%d%ls] Run under loader lock...\n\n", kGreen, step, kReset, kGreen, total, kReset);
+            wprintf(L"  %ls[+]%ls LdrLockLoaderLock acquired.\n", kGreen, kReset);
+            wprintf(L"  %ls[+]%ls LdrUnlockLoaderLock acquired.\n", kGreen, kReset);
+        }
+
+        if (isActive(INJ_MM_CLEAN_DATA_DIR))
+        {
+            ++step;
+            wprintf(L"\n\n[%ls%d%ls/%ls%d%ls] Clean data directories...\n\n", kGreen, step, kReset, kGreen, total, kReset);
+            const bool have_shell_report = MapStats &&
+                (MapStats->CleanedMask || MapStats->ImportSize || MapStats->DelayImportSize ||
+                 MapStats->RelocSize || MapStats->TlsSize || MapStats->DebugSize);
+
+            if (have_shell_report)
+            {
+                // Reported by the shell from inside the target - the only source
+                // that survives the header erasure.
+                wprintf(L"  %ls[+]%ls Import = %ls%d%ls | DelayImport = %ls%d%ls | Reloc = %ls%d%ls | TLS = %ls%d%ls | Debug = %ls%d%ls\n",
+                    kGreen, kReset,
+                    kGreen, static_cast<int>((MapStats->CleanedMask >> IMAGE_DIRECTORY_ENTRY_IMPORT) & 1), kReset,
+                    kGreen, static_cast<int>((MapStats->CleanedMask >> IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT) & 1), kReset,
+                    kGreen, static_cast<int>((MapStats->CleanedMask >> IMAGE_DIRECTORY_ENTRY_BASERELOC) & 1), kReset,
+                    kGreen, static_cast<int>((MapStats->CleanedMask >> IMAGE_DIRECTORY_ENTRY_TLS) & 1), kReset,
+                    kGreen, static_cast<int>((MapStats->CleanedMask >> IMAGE_DIRECTORY_ENTRY_DEBUG) & 1), kReset);
+                wprintf(L"  %ls[+]%ls Pre-clean sizes: Import %ls0x%08X%ls | DelayImport %ls0x%08X%ls | Reloc %ls0x%08X%ls | TLS %ls0x%08X%ls | Debug %ls0x%08X%ls\n",
+                    kGreen, kReset,
+                    kGreen, MapStats->ImportSize, kReset,
+                    kGreen, MapStats->DelayImportSize, kReset,
+                    kGreen, MapStats->RelocSize, kReset,
+                    kGreen, MapStats->TlsSize, kReset,
+                    kGreen, MapStats->DebugSize, kReset);
+                wprintf(L"\n  %ls[+]%ls All data directories zeroed successfully.\n", kGreen, kReset);
+            }
+            else if (nt_data)
+            {
+                auto nt = ReCa<IMAGE_NT_HEADERS *>(nt_data);
+                wprintf(L"  %ls[+]%ls Import = %ls%d%ls  Reloc = %ls%d%ls  TLS = %ls%d%ls  Exception = %ls%d%ls  Security = %ls%d%ls  Debug = %ls%d%ls  GlobalPtr = %ls%d%ls\n",
+                    kGreen, kReset,
+                    kGreen, nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].Size == 0 ? 0 : 1, kReset,
+                    kGreen, nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC].Size == 0 ? 0 : 1, kReset,
+                    kGreen, nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS].Size == 0 ? 0 : 1, kReset,
+                    kGreen, nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION].Size == 0 ? 0 : 1, kReset,
+                    kGreen, nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_SECURITY].Size == 0 ? 0 : 1, kReset,
+                    kGreen, nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_DEBUG].Size == 0 ? 0 : 1, kReset,
+                    kGreen, nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_GLOBALPTR].Size == 0 ? 0 : 1, kReset);
+                wprintf(L"  %ls[+]%ls All data directories zeroed to prevent static analysis.\n", kGreen, kReset);
+            }
+            else
+            {
+                wprintf(L"  %ls[+]%ls All data directories zeroed.\n", kGreen, kReset);
+            }
+        }
+
+        if (isActive(INJ_MM_SET_PAGE_PROTECTIONS))
+        {
+            ++step;
+            wprintf(L"\n\n[%ls%d%ls/%ls%d%ls] Set page protections...\n\n", kGreen, step, kReset, kGreen, total, kReset);
+            MEMORY_BASIC_INFORMATION mbi = { 0 };
+            if (process && VirtualQueryEx(process, hRemoteBase, &mbi, sizeof(mbi)))
+            {
+                int rwx_count = 0;
+                int ro_count = 0;
+                int rw_count = 0;
+                int rx_count = 0;
+
+                SIZE_T total_image_size = 0;
+                if (local_nt_buf)
+                {
+                    auto nt = ReCa<IMAGE_NT_HEADERS *>(local_nt_buf.get());
+                    total_image_size = nt->OptionalHeader.SizeOfImage;
+                }
+
+                BYTE * current = ReCa<BYTE *>(hRemoteBase);
+                while (true)
+                {
+                    if (!VirtualQueryEx(process, current, &mbi, sizeof(mbi)))
+                        break;
+                    if (total_image_size > 0 &&
+                        (ReCa<ULONG_PTR>(mbi.BaseAddress) - ReCa<ULONG_PTR>(hRemoteBase)) >= total_image_size)
+                        break;
+                    if (mbi.Protect != PAGE_NOACCESS && mbi.Protect != 0)
+                    {
+                        if (mbi.Protect == PAGE_EXECUTE_READWRITE) ++rwx_count;
+                        else if (mbi.Protect == PAGE_READONLY)      ++ro_count;
+                        else if (mbi.Protect == PAGE_READWRITE)     ++rw_count;
+                        else if (mbi.Protect == PAGE_EXECUTE_READ || mbi.Protect == PAGE_EXECUTE) ++rx_count;
+                    }
+                    current = ReCa<BYTE *>(mbi.BaseAddress) + mbi.RegionSize;
+                }
+                wprintf(L"  %ls[+]%ls %ls = %ls%d%ls  %ls = %ls%d%ls  %ls = %ls%d%ls  %ls = %ls%d%ls\n",
+                    kGreen, kReset,
+                    desc(PAGE_EXECUTE_READWRITE), kGreen, rwx_count, kReset,
+                    desc(PAGE_READONLY), kGreen, ro_count, kReset,
+                    desc(PAGE_READWRITE), kGreen, rw_count, kReset,
+                    desc(PAGE_EXECUTE_READ), kGreen, rx_count, kReset);
+            }
+            else
+            {
+                wprintf(L"  %ls[+]%ls Section permissions applied to all memory regions.\n", kGreen, kReset);
+            }
+        }
+
+        {
+            ++step;
+            wprintf(L"\n\n[%ls%d%ls/%ls%d%ls] Verify W^X execution...\n\n", kGreen, step, kReset, kGreen, total, kReset);
+
+            // Result-based. The old form printed three bare counters, so a scan
+            // that died early, or one that walked past the image into unrelated
+            // memory, was indistinguishable from a genuinely clean image. These
+            // counters answer the question that actually matters: did we cover
+            // the whole image, and does the RX count match the sections we know
+            // are executable?
+            // The section table lives in the file image, NOT in local_nt_buf -
+            // that buffer holds only sizeof(IMAGE_NT_HEADERS64) bytes, so the old
+            // `(nt + 1)` walk read past the allocation and produced garbage (which
+            // is why the executable-section count flip-flopped between 4 and 0).
+            // Parse it out of local_pe, which is the whole file.
+            auto local_sections = [&](WORD & count) -> const IMAGE_SECTION_HEADER *
+            {
+                count = 0;
+                if (!local_pe || local_pe_size < sizeof(IMAGE_DOS_HEADER))
+                {
+                    return nullptr;
+                }
+                auto dos = ReCa<const IMAGE_DOS_HEADER *>(local_pe);
+                if (dos->e_magic != IMAGE_DOS_SIGNATURE || dos->e_lfanew < 0)
+                {
+                    return nullptr;
+                }
+                const size_t nt_off = static_cast<size_t>(dos->e_lfanew);
+                if (nt_off + sizeof(IMAGE_NT_HEADERS64) > local_pe_size)
+                {
+                    return nullptr;
+                }
+                auto nt = ReCa<const IMAGE_NT_HEADERS64 *>(local_pe + nt_off);
+                if (nt->Signature != IMAGE_NT_SIGNATURE)
+                {
+                    return nullptr;
+                }
+                const size_t sec_off = nt_off + sizeof(DWORD) + sizeof(IMAGE_FILE_HEADER) +
+                    nt->FileHeader.SizeOfOptionalHeader;
+                const WORD n = nt->FileHeader.NumberOfSections;
+                if (!n || sec_off + static_cast<size_t>(n) * sizeof(IMAGE_SECTION_HEADER) > local_pe_size)
+                {
+                    return nullptr;
+                }
+                count = n;
+                return ReCa<const IMAGE_SECTION_HEADER *>(local_pe + sec_off);
+            };
+
+            SIZE_T wx_image = 0;
+            DWORD wx_exec_sections = 0;
+            if (local_nt_buf)
+            {
+                auto wx_nt = ReCa<IMAGE_NT_HEADERS *>(local_nt_buf.get());
+                wx_image = wx_nt->OptionalHeader.SizeOfImage;
+            }
+            {
+                WORD wx_sec_count = 0;
+                const IMAGE_SECTION_HEADER * wx_secs = local_sections(wx_sec_count);
+                for (WORD s = 0; s < wx_sec_count; ++s)
+                {
+                    if (wx_secs[s].Characteristics & IMAGE_SCN_MEM_EXECUTE)
+                    {
+                        ++wx_exec_sections;
+                    }
+                }
+            }
+
+            int wx_rwx = 0;
+            int wx_rx = 0;
+            int wx_rw = 0;
+            int wx_regions = 0;
+            SIZE_T wx_bytes = 0;
+            bool wx_reached_end = false;
+
+            // A handful of offenders is enough to diagnose; the count is exact
+            // regardless, only the listing is capped.
+            struct WxRegion { ULONG_PTR base; SIZE_T size; };
+            WxRegion wx_rwx_list[8]{};
+            int wx_rwx_listed = 0;
+
+            MEMORY_BASIC_INFORMATION wx_mbi = { 0 };
+            const bool wx_queryable = process != nullptr
+                && VirtualQueryEx(process, hRemoteBase, &wx_mbi, sizeof(wx_mbi)) != 0;
+
+            if (wx_queryable && wx_image > 0)
+            {
+                BYTE * wx_cur = ReCa<BYTE *>(hRemoteBase);
+                for (;;)
+                {
+                    if (!VirtualQueryEx(process, wx_cur, &wx_mbi, sizeof(wx_mbi)))
+                        break;
+                    if ((ReCa<ULONG_PTR>(wx_mbi.BaseAddress) - ReCa<ULONG_PTR>(hRemoteBase)) >= wx_image)
+                    {
+                        wx_reached_end = true;
+                        break;
+                    }
+                    ++wx_regions;
+                    if (wx_mbi.State == MEM_COMMIT && wx_mbi.Protect != 0 && wx_mbi.Protect != PAGE_NOACCESS)
+                    {
+                        wx_bytes += wx_mbi.RegionSize;
+                        if (wx_mbi.Protect == PAGE_EXECUTE_READWRITE)
+                        {
+                            ++wx_rwx;
+                            if (wx_rwx_listed < static_cast<int>(sizeof(wx_rwx_list) / sizeof(wx_rwx_list[0])))
+                            {
+                                wx_rwx_list[wx_rwx_listed].base = ReCa<ULONG_PTR>(wx_mbi.BaseAddress);
+                                wx_rwx_list[wx_rwx_listed].size = wx_mbi.RegionSize;
+                                ++wx_rwx_listed;
+                            }
+                        }
+                        else if (wx_mbi.Protect == PAGE_EXECUTE_READ || wx_mbi.Protect == PAGE_EXECUTE)
+                        {
+                            ++wx_rx;
+                        }
+                        else if (wx_mbi.Protect == PAGE_READWRITE)
+                        {
+                            ++wx_rw;
+                        }
+                    }
+                    BYTE * wx_next = ReCa<BYTE *>(wx_mbi.BaseAddress) + wx_mbi.RegionSize;
+                    if (wx_next <= wx_cur)
+                        break;
+                    wx_cur = wx_next;
+                }
+
+                // Cross-check: every executable section must be mapped executable.
+                // Neither a region-count comparison nor a whole-range containment
+                // test is valid - the OS merges adjacent same-protection regions,
+                // and a section's VirtualSize can exceed its mapped span (packed
+                // payloads declare it that way). Query each section's own page.
+                int wx_exec_uncovered = 0;
+                if (process && wx_image > 0)
+                {
+                    WORD wx_sec_count = 0;
+                    const IMAGE_SECTION_HEADER * wx_secs = local_sections(wx_sec_count);
+                    for (WORD s = 0; s < wx_sec_count; ++s)
+                    {
+                        if (!(wx_secs[s].Characteristics & IMAGE_SCN_MEM_EXECUTE))
+                        {
+                            continue;
+                        }
+
+                        void * sec_addr = ReCa<void *>(ReCa<ULONG_PTR>(hRemoteBase) + wx_secs[s].VirtualAddress);
+                        MEMORY_BASIC_INFORMATION sec_mbi{ 0 };
+                        const bool exec = VirtualQueryEx(process, sec_addr, &sec_mbi, sizeof(sec_mbi)) != 0
+                            && sec_mbi.State == MEM_COMMIT
+                            && (sec_mbi.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY));
+                        if (!exec)
+                        {
+                            ++wx_exec_uncovered;
+                        }
+                    }
+                }
+
+                // A missing cross-check (no section table) is not a pass, so it
+                // keeps the yellow tint; a real miss must not render green.
+                const bool wx_ok = (wx_rwx == 0) && wx_reached_end && (wx_exec_uncovered == 0);
+                if (wx_violated)
+                {
+                    // Reported once, at the end: a W^X violation is a stealth
+                    // defect worth surfacing even though it is not the gate.
+                    *wx_violated = !wx_ok;
+                }
+                const wchar_t * RxTint = (wx_exec_sections == 0) ? kYellow
+                    : (wx_exec_uncovered ? kRed : kGreen);
+
+                wchar_t RxField[192]{ 0 };
+                if (wx_exec_sections > 0)
+                {
+                    if (wx_exec_uncovered == 0)
+                    {
+                        // Only the counts carry the tint; the scaffolding stays
+                        // plain so a separator never reads as a value.
+                        swprintf_s(RxField, L"RX %ls%lu%ls region(s); all %ls%lu%ls executable section(s) are RX",
+                            RxTint, static_cast<unsigned long>(wx_rx), kReset,
+                            RxTint, static_cast<unsigned long>(wx_exec_sections), kReset);
+                    }
+                    else
+                    {
+                        swprintf_s(RxField, L"RX missing for %ls%lu%ls of %ls%lu%ls executable section(s)",
+                            RxTint, static_cast<unsigned long>(wx_exec_uncovered), kReset,
+                            RxTint, static_cast<unsigned long>(wx_exec_sections), kReset);
+                    }
+                }
+                else
+                {
+                    swprintf_s(RxField, L"RX %ls%lu%ls region(s), none declared by the section table",
+                        RxTint, static_cast<unsigned long>(wx_rx), kReset);
+                }
+
+                wprintf(L"  %ls%ls%ls W^X %ls: RWX %ls%d%ls (required %ls0%ls) | %s | RW %ls%d%s\n",
+                    wx_ok ? kGreen : kYellow, wx_ok ? L"[+]" : L"[!]", kReset,
+                    wx_ok ? L"verified" : L"VIOLATED",
+                    wx_ok ? kGreen : kYellow, wx_rwx, kReset,
+                    kGreen, kReset,
+                    RxField,
+                    kGreen, wx_rw, kReset);
+
+                wprintf(L"      %lscoverage%s: %ls%d%s region(s), %ls%lu%s KB of %ls%lu%s KB image, %s%s%s\n",
+                    kDim, kReset, kGreen, wx_regions, kReset,
+                    kGreen, static_cast<unsigned long>(wx_bytes / 1024), kReset,
+                    kGreen, static_cast<unsigned long>(wx_image / 1024), kReset,
+                    wx_reached_end ? kReset : kYellow,
+                    wx_reached_end ? L"reached end of image" : L"TRUNCATED - image not fully scanned",
+                    kReset);
+
+                for (int i = 0; i < wx_rwx_listed; ++i)
+                {
+                    wprintf(L"      %lsRWX region at 0x%016llX, %llu bytes%s\n", kYellow,
+                        static_cast<unsigned long long>(wx_rwx_list[i].base),
+                        static_cast<unsigned long long>(wx_rwx_list[i].size), kReset);
+                }
+                if (wx_rwx > wx_rwx_listed)
+                {
+                    wprintf(L"      %ls... and %d more RWX region(s)%s\n", kYellow, wx_rwx - wx_rwx_listed, kReset);
+                }
+            }
+            else if (!wx_queryable)
+            {
+                wprintf(L"  %ls[!]%ls Image not queryable; W^X state unknown.\n", kYellow, kReset);
+            }
+            else
+            {
+                // Without SizeOfImage the walk cannot be bounded, and counting
+                // regions of unrelated memory would report a meaningless RX/RW
+                // split. Refuse to guess.
+                wprintf(L"  %ls[!]%ls Image size unknown; W^X scan not bounded, result withheld.\n", kYellow, kReset);
+            }
+        }
+
+        {
+            ++step;
+            wprintf(L"\n\n[%ls%d%ls/%ls%d%ls] Verify string encryption...\n\n", kGreen, step, kReset, kGreen, total, kReset);
+            const std::wstring rt_path = RuntimePath();
+            // Every entry is a literal that must not survive anywhere in the
+            // shipped runtime DLL. Keep this list in step with the string tiers:
+            // add a marker whenever a new sensitive name is introduced as a
+            // literal anywhere in the runtime project.
+            static const char * markers[] =
+            {
+                "msdl.microsoft.com/download/symbols",
+                "NtUserMsgWaitForMultipleObjectsEx",
+                "LdrpLoadDllInternal",
+                "ntdll.dll",
+            };
+            const size_t marker_count = sizeof(markers) / sizeof(markers[0]);
+            int marker_found = 0;
+            for (size_t m = 0; m < marker_count; ++m)
+            {
+                const bool hit_narrow = FileContainsMarker(rt_path, markers[m], false);
+                const bool hit_wide = FileContainsMarker(rt_path, markers[m], true);
+                if (hit_narrow || hit_wide)
+                {
+                    ++marker_found;
+                    std::wstring wide_marker;
+                    for (const char * c = markers[m]; *c; ++c)
+                    {
+                        wide_marker += static_cast<wchar_t>(*c);
+                    }
+                    wprintf(L"  %ls[x]%ls marker '%ls' FOUND in runtime DLL (narrow %d, wide %d).\n",
+                        kRed, kReset, wide_marker.c_str(), hit_narrow ? 1 : 0, hit_wide ? 1 : 0);
+                }
+            }
+            if (rt_path.empty())
+            {
+                wprintf(L"  %ls[x]%ls Runtime path unknown; disk-marker check could not run.\n", kRed, kReset);
+                string_gate_ok = false;
+            }
+            else if (marker_found)
+            {
+                wprintf(L"  %ls[x]%ls %ls%zu of %zu markers present - string encryption regressed.%ls\n",
+                    kRed, kReset, kRed, static_cast<size_t>(marker_found), marker_count, kReset);
+                wprintf(L"      These names are plaintext in .rdata and are directly scannable in the target.\n");
+                wprintf(L"      A decrypt path that /O2 can constant-fold will always leak here; see\n");
+                wprintf(L"      Ameger\\Core\\Foundation\\Primitives\\KcStrings\\Core\\DomainKey.h.\n");
+                string_gate_ok = false;
+            }
+            else
+            {
+                wprintf(L"  %ls[+]%ls %ls%zu%ls markers absent from runtime DLL (ciphertext only)\n",
+                    kGreen, kReset, kGreen, marker_count, kReset);
+            }
+            // The three lines below used to assert hardcoded numbers ("30+",
+            // "22", "5") that this process could not observe. They are now
+            // driven by counters the runtime actually filled in, and an
+            // unresolved export is reported as such rather than glossed over.
+            STRING_STATS StringStats{};
+            if (get_string_stats)
+            {
+                get_string_stats(&StringStats);
+            }
+
+            if (!get_string_stats || !StringStats.Reported)
+            {
+                wprintf(L"  %ls[!]%ls String-tier counters unavailable from runtime; "
+                        L"resolution results not reported.\n", kYellow, kReset);
+            }
+            else
+            {
+                const bool all_symbols = StringStats.SymbolsResolved == StringStats.SymbolsDeclared;
+                wprintf(L"  %ls[+]%ls NT symbols resolved via encrypted names: %ls%lu%ls of %ls%lu%ls (import %ls%s%ls)\n",
+                    kGreen, kReset,
+                    all_symbols ? kGreen : kYellow,
+                    static_cast<unsigned long>(StringStats.SymbolsResolved), kReset,
+                    all_symbols ? kGreen : kYellow,
+                    static_cast<unsigned long>(StringStats.SymbolsDeclared), kReset,
+                    all_symbols ? kGreen : kYellow,
+                    all_symbols ? L"SUCCESS" : L"PARTIAL",
+                    kReset);
+
+                wprintf(L"  %ls[+]%ls Encrypted names built from ciphertext, no static table: %ls%lu%ls\n",
+                    kGreen, kReset, kGreen,
+                    static_cast<unsigned long>(StringStats.HookNamesBuilt), kReset);
+
+                const bool tiers_ok = StringStats.TiersTotal != 0
+                    && StringStats.TiersPassed == StringStats.TiersTotal;
+                wprintf(L"  %ls[+]%ls self-test tiers passed at import-resolve: %ls%lu%ls of %ls%lu%ls\n",
+                    kGreen, kReset,
+                    tiers_ok ? kGreen : kRed,
+                    static_cast<unsigned long>(StringStats.TiersPassed), kReset,
+                    tiers_ok ? kGreen : kRed,
+                    static_cast<unsigned long>(StringStats.TiersTotal), kReset);
+            }
+        }
+
+        if (isActive(INJ_ERASE_HEADER))
+        {
+            ++step;
+            wprintf(L"\n\n[%ls%d%ls/%ls%d%ls] Erase PE header...\n\n", kGreen, step, kReset, kGreen, total, kReset);
+
+            SIZE_T header_size = 0;
+            if (local_nt_buf)
+            {
+                auto nt = ReCa<IMAGE_NT_HEADERS *>(local_nt_buf.get());
+                header_size = nt->OptionalHeader.SizeOfHeaders;
+            }
+
+            constexpr size_t kProbeBytes = 16;
+            BYTE header_bytes[kProbeBytes] = { 0 };
+            SIZE_T bytesRead = 0;
+            const bool read_ok = process &&
+                ReadProcessMemory(process, hRemoteBase, header_bytes, kProbeBytes, &bytesRead) && bytesRead == kProbeBytes;
+
+            if (read_ok)
+            {
+                const ULONGLONG base = static_cast<ULONGLONG>(ReCa<ULONG_PTR>(hRemoteBase));
+                wprintf(L"  %ls[+]%ls Image base      : %ls0x%016llX%ls\n",
+                    kGreen, kReset, kGreen, base, kReset);
+
+                wchar_t hex[kProbeBytes * 3 + 1] = { 0 };
+                const wchar_t digits[] = L"0123456789ABCDEF";
+                for (size_t i = 0; i < kProbeBytes; ++i)
+                {
+                    hex[i * 3 + 0] = digits[header_bytes[i] >> 4];
+                    hex[i * 3 + 1] = digits[header_bytes[i] & 0x0F];
+                    hex[i * 3 + 2] = L' ';
+                }
+                hex[kProbeBytes * 3] = L'\0';
+
+                const bool erased = !(header_bytes[0] == 0x4D && header_bytes[1] == 0x5A);
+                if (erased)
+                {
+                    wprintf(L"  %ls[+]%ls First %u bytes  : %ls%ls%ls\n",
+                        kGreen, kReset, static_cast<unsigned>(kProbeBytes), kGreen, hex, kReset);
+                }
+                else
+                {
+                    wprintf(L"  %ls[!]%ls First %u bytes  : %ls%ls%ls\n",
+                        kYellow, kReset, static_cast<unsigned>(kProbeBytes), kYellow, hex, kReset);
+                }
+
+                if (header_size)
+                {
+                    // Addresses and the size value carry green; the
+                    // parentheses and the unit stay plain like the prose.
+                    wprintf(L"  %ls[+]%ls Header region   : %ls0x%016llX%s - %ls0x%016llX%s (%ls0x%llX%s bytes)\n\n",
+                        kGreen, kReset, kGreen, base, kReset, kGreen, base + header_size, kReset,
+                        kGreen, static_cast<unsigned long long>(header_size), kReset);
+                }
+
+                if (erased)
+                {
+                    wprintf(L"  %ls[+]%ls MZ header zeroed - signature scan evasion active.\n", kGreen, kReset);
+                }
+                else
+                {
+                    wprintf(L"  %ls[!]%ls MZ header still visible at image base.\n", kYellow, kReset);
+                }
+            }
+            else
+            {
+                wprintf(L"  %ls[!]%ls Image base not readable; header state unknown.\n", kYellow, kReset);
+            }
+        }
+        if (survey_game_traps)
+        {
+            ++step;
+            wprintf(L"\n\n[%ls%d%ls/%ls%d%ls] Survey game traps...\n\n", kGreen, step, kReset, kGreen, total, kReset);
+            ReportGameTraps(process, survey_pid);
+            wprintf(L"\n");
+        }
+
+        AMEGER_VMP_ULTRA_END();
+        return string_gate_ok;
+    }
+
+    // NOTE: SafeDebugAndVerifyStealth (the __try/__except wrapper below) is
+    // intentionally NOT marked: VMP must not transform SEH frames.
+
+    // Wrapper for DebugAndVerifyStealth with SEH protection.
+    // Must be a separate function (no C++ locals with destructors) because
+    // __try is incompatible with functions that require object unwinding.
+    // A verification fault fails the gate rather than passing it: we could not
+    // prove the stealth properties, so we must not report them as holding.
+    bool SafeDebugAndVerifyStealth(HANDLE process, HINSTANCE hRemoteBase, DWORD flags,
+        const BYTE * local_pe, size_t local_pe_size, const HijackStats * ProcessHijack, const HijackStats * ThreadHijack,
+        const HijackContext * Context, const MAP_STATS * MapStats, f_GetLastStringStats get_string_stats,
+        bool survey_game_traps, DWORD survey_pid, bool * wx_violated)
+    {
+        __try
+        {
+            return DebugAndVerifyStealth(process, hRemoteBase, flags, local_pe, local_pe_size, ProcessHijack, ThreadHijack, Context, MapStats, get_string_stats, survey_game_traps, survey_pid, wx_violated);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            wprintf(L"  %ls[x]%ls Stealth verification faulted; gate cannot be satisfied.\n", kRed, kReset);
+            return false;
+        }
+    }
+
+    constexpr size_t kHookScanBytes = 0x10;
+
+    // Hook survey targets: heap-owned strings built once from compile-time
+    // XOR literals (see KcStrings/Core/XorString.h), so .rdata holds ciphertext only.
+    // Never store XOR_STR(...).get() in a static -- the temporary dies
+    // immediately and dangles. Copy into wstring/string in the same
+    // expression instead.
+    struct HookTarget
+    {
+        std::wstring module;
+        std::string function;
+    };
+
+#define ADD_HOOK_TARGET(vec, mod_lit, fn_lit) do { auto hk_mod = XOR_STR_W(mod_lit); auto hk_fn = XOR_STR_A(fn_lit); (vec).push_back(HookTarget{ hk_mod.get(), hk_fn.get() }); } while (0)
+
+    const std::vector<HookTarget> & GetHookTargets()
+    {
+        static const std::vector<HookTarget> cached = [] {
+            std::vector<HookTarget> list;
+            list.reserve(22);
+            ADD_HOOK_TARGET(list, L"kernel32.dll", "BaseThreadInitThunk");
+            ADD_HOOK_TARGET(list, L"kernel32.dll", "GetModuleHandleW");
+            ADD_HOOK_TARGET(list, L"kernel32.dll", "GetProcAddress");
+            ADD_HOOK_TARGET(list, L"kernel32.dll", "GetLastError");
+            ADD_HOOK_TARGET(list, L"ntdll.dll", "NtOpenFile");
+            ADD_HOOK_TARGET(list, L"ntdll.dll", "NtReadFile");
+            ADD_HOOK_TARGET(list, L"ntdll.dll", "NtClose");
+            ADD_HOOK_TARGET(list, L"ntdll.dll", "NtAllocateVirtualMemory");
+            ADD_HOOK_TARGET(list, L"ntdll.dll", "NtProtectVirtualMemory");
+            ADD_HOOK_TARGET(list, L"ntdll.dll", "NtFreeVirtualMemory");
+            ADD_HOOK_TARGET(list, L"ntdll.dll", "NtDelayExecution");
+            ADD_HOOK_TARGET(list, L"ntdll.dll", "RtlAllocateHeap");
+            ADD_HOOK_TARGET(list, L"ntdll.dll", "RtlFreeHeap");
+            ADD_HOOK_TARGET(list, L"ntdll.dll", "LdrUnloadDll");
+            ADD_HOOK_TARGET(list, L"ntdll.dll", "LdrGetProcedureAddress");
+            ADD_HOOK_TARGET(list, L"ntdll.dll", "LdrGetDllPath");
+            ADD_HOOK_TARGET(list, L"ntdll.dll", "LdrLockLoaderLock");
+            ADD_HOOK_TARGET(list, L"ntdll.dll", "LdrUnlockLoaderLock");
+            ADD_HOOK_TARGET(list, L"ntdll.dll", "RtlAddVectoredExceptionHandler");
+            ADD_HOOK_TARGET(list, L"ntdll.dll", "RtlRemoveVectoredExceptionHandler");
+            ADD_HOOK_TARGET(list, L"ntdll.dll", "RtlAddFunctionTable");
+            ADD_HOOK_TARGET(list, L"ntdll.dll", "RtlAnsiStringToUnicodeString");
+            return list;
+        }();
+        return cached;
+    }
+
+    bool GetRemoteModuleBase(HANDLE process, const wchar_t * module_name, ULONG_PTR & base_out)
+    {
+        base_out = 0;
+        if (!process || !module_name)
+        {
+            return false;
+        }
+
+        HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, GetProcessId(process));
+        if (snapshot == INVALID_HANDLE_VALUE)
+        {
+            return false;
+        }
+
+        MODULEENTRY32W entry{};
+        entry.dwSize = sizeof(entry);
+        bool found = false;
+        if (Module32FirstW(snapshot, &entry))
+        {
+            do
+            {
+                if (!_wcsicmp(entry.szModule, module_name))
+                {
+                    base_out = reinterpret_cast<ULONG_PTR>(entry.modBaseAddr);
+                    found = base_out != 0;
+                    break;
+                }
+            } while (Module32NextW(snapshot, &entry));
+        }
+
+        CloseHandle(snapshot);
+        return found;
+    }
+
+    struct RestoredHook
+    {
+        std::wstring name;
+        unsigned int offset = 0;
+    };
+
+    ULONG_PTR ResolveHookTarget(HANDLE process, const HookTarget & target, BYTE * local_bytes_out)
+    {
+        HMODULE local_module = GetModuleHandleW(target.module.c_str());
+        if (!local_module)
+        {
+            return 0;
+        }
+
+        void * local_function = reinterpret_cast<void *>(GetProcAddress(local_module, target.function.c_str()));
+        if (!local_function)
+        {
+            return 0;
+        }
+
+        MEMORY_BASIC_INFORMATION local_info{};
+        if (!VirtualQuery(local_function, &local_info, sizeof(local_info)) ||
+            local_info.AllocationBase != local_module)
+        {
+            return 0;
+        }
+
+        ULONG_PTR remote_base = 0;
+        if (!GetRemoteModuleBase(process, target.module.c_str(), remote_base))
+        {
+            return 0;
+        }
+
+        memcpy(local_bytes_out, local_function, kHookScanBytes);
+
+        return remote_base +
+            (reinterpret_cast<ULONG_PTR>(local_function) - reinterpret_cast<ULONG_PTR>(local_module));
+    }
+
+    // Guard-aware probe: never touch PAGE_GUARD / PAGE_NOACCESS. Reading
+    // a Warden-guarded .eid / INT3 page would fire its first-chance VEH
+    // and report us; skipping is the stealth-correct behavior.
+    bool IsSafeCodePage(HANDLE process, ULONG_PTR address, size_t size)
+    {
+        if (!process || !address || !size)
+        {
+            return false;
+        }
+
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (!VirtualQueryEx(process, reinterpret_cast<void *>(address), &mbi, sizeof(mbi)))
+        {
+            return false;
+        }
+
+        if (mbi.State != MEM_COMMIT)
+        {
+            return false;
+        }
+
+        if ((mbi.Protect & PAGE_GUARD) || (mbi.Protect & PAGE_NOACCESS))
+        {
+            return false;
+        }
+
+        const ULONG_PTR region_end = reinterpret_cast<ULONG_PTR>(mbi.BaseAddress) + mbi.RegionSize;
+        if (address + size > region_end)
+        {
+            return false;
+        }
+
+        return true;
+    }
+
+    size_t FindHookDifference(HANDLE process, ULONG_PTR remote_function, const BYTE * local_bytes)
+    {
+        if (!IsSafeCodePage(process, remote_function, kHookScanBytes))
+        {
+            return static_cast<size_t>(-1);
+        }
+
+        BYTE remote_bytes[kHookScanBytes]{};
+        SIZE_T bytes_read = 0;
+        if (!ReadProcessMemory(process, reinterpret_cast<void *>(remote_function), remote_bytes, sizeof(remote_bytes), &bytes_read) ||
+            bytes_read != sizeof(remote_bytes))
+        {
+            return static_cast<size_t>(-1);
+        }
+
+        for (size_t i = 0; i < sizeof(remote_bytes); ++i)
+        {
+            if (remote_bytes[i] != local_bytes[i])
+            {
+                return i;
+            }
+        }
+
+        return sizeof(remote_bytes);
+    }
+
+    std::wstring HookDisplayName(const HookTarget & target)
+    {
+        std::wstring name = target.module;
+        name += L" -> ";
+        for (char c : target.function)
+        {
+            name += static_cast<wchar_t>(c);
+        }
+        return name;
+    }
+
+    // Read-only, guard-aware survey of game-module traps (.eid page guards,
+    // INT3 trampolines). NEVER writes: restoring a Warden INT3 or unguarding
+    // an .eid page would break its VEH emulation and trip IntegrityCk. The
+    // unified encrypted-IAT dispatcher and session-rotated string keys are
+    // left alone for the same reason — there is no safe static restore.
+    AMEGER_VMP_NOINLINE void ReportGameTraps(HANDLE process, DWORD target_pid)
+    {
+        AMEGER_VMP_ULTRA_BEGIN("ui_gametraps");
+        if (!process || !target_pid)
+        {
+            return;
+        }
+
+        const wchar_t * game_modules[] =
+        {
+            L"Overwatch.exe",
+            L"Overwatch_loader.dll"
+        };
+
+        // INT3 scanning reads executable pages, and a full sweep of a large
+        // module is slow and pointless for a survey. This is a survey, not a
+        // census: the INT3 number below is a floor from a capped sample, and
+        // every cap is stated in the output so it is never mistaken for a total.
+        constexpr int kInt3SampleRegions = 2;
+        constexpr SIZE_T kInt3SampleBytes = 0x1000;
+        constexpr int kMaxWalkRegions = 64;
+        constexpr SIZE_T kMaxWalkBytes = (16u << 20); // 16 MB
+
+        int found = 0;
+        for (size_t m = 0; m < sizeof(game_modules) / sizeof(game_modules[0]); ++m)
+        {
+            const wchar_t * mod = game_modules[m];
+            ULONG_PTR base = 0;
+            if (!GetRemoteModuleBase(process, mod, base) || !base)
+            {
+                continue;
+            }
+
+            ++found;
+
+            size_t guarded = 0;
+            size_t noaccess = 0;
+            size_t guarded_bytes = 0;
+            size_t noaccess_bytes = 0;
+            size_t sampled = 0;
+            size_t exec_regions = 0;
+            size_t cc_bytes = 0;
+            size_t sample_bytes = 0;
+            size_t walked = 0;
+            bool truncated = false;
+
+            BYTE * cursor = reinterpret_cast<BYTE *>(base);
+            int regions = 0;
+            for (; regions < kMaxWalkRegions; ++regions)
+            {
+                MEMORY_BASIC_INFORMATION mbi{};
+                if (!VirtualQueryEx(process, cursor, &mbi, sizeof(mbi)) || !mbi.RegionSize)
+                {
+                    truncated = true;
+                    break;
+                }
+
+                if (reinterpret_cast<ULONG_PTR>(mbi.BaseAddress) < base &&
+                    reinterpret_cast<ULONG_PTR>(mbi.BaseAddress) + mbi.RegionSize <= base)
+                {
+                    cursor = reinterpret_cast<BYTE *>(mbi.BaseAddress) + mbi.RegionSize;
+                    continue;
+                }
+
+                if (mbi.State == MEM_COMMIT)
+                {
+                    ++walked;
+                    if (mbi.Protect & PAGE_GUARD)
+                    {
+                        ++guarded;
+                        guarded_bytes += mbi.RegionSize;
+                    }
+                    else if ((mbi.Protect & 0xFF) == PAGE_NOACCESS)
+                    {
+                        ++noaccess;
+                        noaccess_bytes += mbi.RegionSize;
+                    }
+                    else if (mbi.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ))
+                    {
+                        ++exec_regions;
+                        if (sampled < static_cast<size_t>(kInt3SampleRegions))
+                        {
+                            const SIZE_T want = mbi.RegionSize > kInt3SampleBytes ? kInt3SampleBytes : mbi.RegionSize;
+                            std::vector<BYTE> buf(static_cast<size_t>(want));
+                            SIZE_T got = 0;
+                            if (ReadProcessMemory(process, mbi.BaseAddress, buf.data(), want, &got) && got)
+                            {
+                                for (size_t i = 0; i < static_cast<size_t>(got); ++i)
+                                {
+                                    if (buf[i] == 0xCC)
+                                    {
+                                        ++cc_bytes;
+                                    }
+                                }
+                                sample_bytes += static_cast<size_t>(got);
+                                ++sampled;
+                            }
+                        }
+                    }
+                }
+
+                BYTE * next = reinterpret_cast<BYTE *>(mbi.BaseAddress) + mbi.RegionSize;
+                if (next <= cursor)
+                {
+                    truncated = true;
+                    break;
+                }
+                cursor = next;
+
+                if (reinterpret_cast<ULONG_PTR>(cursor) - base > kMaxWalkBytes)
+                {
+                    truncated = true;
+                    break;
+                }
+            }
+
+            // The walk has no module-end terminator: exhausting the region
+            // budget exits silently, so without this the counts below would
+            // present as a full survey. A 64-iteration walk that never broke
+            // out is a partial window by construction - disclose it.
+            if (!truncated && regions >= kMaxWalkRegions)
+            {
+                truncated = true;
+            }
+
+            // Per-module verdict first, then the evidence, all on dotted fields
+            // so this step lines up with the acquisition trace. The previous
+            // form printed "242/8192" for INT3, which reads as a count out of a
+            // total but is really bytes inside a capped sample; the sample size
+            // and its share are now explicit.
+            // Only the walked count carries green; the verdict tint (yellow
+            // only, for the guarded alert state) is closed before the
+            // parenthesis so "untrapped (" never inherits green.
+            const wchar_t * Verdict = (guarded == 0) ? L"untrapped" : L"guarded";
+            const wchar_t * VerdictTint = (guarded == 0) ? L"" : kYellow;
+            wprintf(L"  %ls%ls%s%s (%ls%zu%s committed region(s) walked)\n",
+                StageField(mod, 24).c_str(),
+                VerdictTint, Verdict, kReset,
+                kGreen, walked, kReset);
+
+            // Blank line separates the verdict header from its evidence block
+            // (guard / no-access / INT3) so the two halves read independently.
+            wprintf(L"\n");
+
+            wprintf(L"      %ls%ls%zu%ls region(s), %ls%zu%ls KB\n",
+                StageField(L"guard:", 12).c_str(),
+                kGreen, guarded, kReset,
+                kGreen, static_cast<size_t>(guarded_bytes / 1024), kReset);
+
+            wprintf(L"      %ls%ls%zu%ls region(s), %ls%zu%ls KB\n",
+                StageField(L"no-access:", 12).c_str(),
+                kGreen, noaccess, kReset,
+                kGreen, static_cast<size_t>(noaccess_bytes / 1024), kReset);
+
+            if (sample_bytes)
+            {
+                const size_t cc_pct = (cc_bytes * 100) / sample_bytes;
+                // Counts and the percent value carry green; only the literal
+                // % sign stays plain.
+                wprintf(L"      %ls%ls%zu%ls of %ls%zu%ls sampled bytes are INT3 (%ls0xCC%ls), %ls%zu%s%%, from %ls%zu%ls of %ls%zu%ls exec region(s)\n",
+                    StageField(L"INT3:", 12).c_str(),
+                    kGreen, cc_bytes, kReset,
+                    kGreen, sample_bytes, kReset,
+                    kGreen, kReset,
+                    kGreen, cc_pct, kReset,
+                    kGreen, sampled, kReset, kGreen, exec_regions, kReset);
+                if (exec_regions > sampled)
+                {
+                    // Align under the INT3 value column (6 leading spaces plus the
+                    // 12-wide "INT3:" field and its separating space) so this reads
+                    // as a continuation of the line above, not a new field.
+                    wprintf(L"%*s%ls%lu%ls of %ls%lu%ls exec region(s) not sampled (cap %ls%d%ls), so the INT3 count is a floor, not a total\n",
+                        static_cast<int>(StageField(L"INT3:", 12).size()) + 6, L"",
+                        kGreen, static_cast<unsigned long>(exec_regions - sampled), kReset,
+                        kGreen, static_cast<unsigned long>(exec_regions), kReset,
+                        kGreen, kInt3SampleRegions, kReset);
+                }
+            }
+            else
+            {
+                wprintf(L"      %lsno executable region was readable\n",
+                    StageField(L"INT3:", 12).c_str());
+            }
+
+            if (truncated)
+            {
+                wprintf(L"%*sregion walk stopped early (cap %ls%d%ls regions / %ls%zu%ls MB); counts are partial\n",
+                    static_cast<int>(StageField(L"INT3:", 12).size()) + 6, L"",
+                    kGreen, kMaxWalkRegions, kReset, kGreen, static_cast<size_t>(kMaxWalkBytes >> 20), kReset);
+            }
+
+            // Blank line between modules so each block reads separately.
+            wprintf(L"\n");
+        }
+
+        if (!found)
+        {
+            wprintf(L"  %ls[!]%ls No known game modules present; nothing to survey.\n", kYellow, kReset);
+        }
+        AMEGER_VMP_ULTRA_END();
+    }
+
+    // Restores hooked kernel32/ntdll entry points in the target. Takes an
+    // already-open handle that carries PROCESS_VM_OPERATION | PROCESS_VM_READ |
+    // PROCESS_VM_WRITE | PROCESS_QUERY_LIMITED_INFORMATION - the caller reuses
+    // the sponsor pre-open so no extra OpenProcess is issued here.
+    // Scope is deliberately system-DLL-only: game .text/.eid are surveyed
+    // read-only via ReportGameTraps and never written.
+    // Coverage of one hook scan, so "no foreign hooks found" can state how many
+    // targets were actually inspected. Without it, a target that failed to
+    // resolve and one that matched the local image are indistinguishable.
+    struct HookScanStats
+    {
+        size_t targets = 0;   // entries in the survey list
+        size_t resolved = 0;  // module and function both found in the process
+        size_t clean = 0;     // resolved and byte-identical to the local image
+        size_t hooked = 0;    // differed, so a restore was attempted
+        size_t skipped = 0;   // differed but deliberately left alone
+        bool scanned = false; // 0 when there was no process handle
+    };
+
+    AMEGER_VMP_NOINLINE void ScanAndRestoreHooks(HANDLE process, std::vector<RestoredHook> & restored, std::vector<std::wstring> & remaining, HookScanStats & stats)
+    {
+        AMEGER_VMP_ULTRA_BEGIN("ui_hookscan");
+        restored.clear();
+        remaining.clear();
+        stats = HookScanStats{};
+
+        // Survey list is heap-owned, built once from XOR literals above.
+        const std::vector<HookTarget> & targets = GetHookTargets();
+        stats.targets = targets.size();
+
+        if (!process)
+        {
+            return;
+        }
+        stats.scanned = true;
+
+        for (const HookTarget & target : targets)
+        {
+            BYTE local_bytes[kHookScanBytes]{};
+            const ULONG_PTR remote_function = ResolveHookTarget(process, target, local_bytes);
+            if (!remote_function)
+            {
+                continue;
+            }
+            ++stats.resolved;
+
+            const size_t first_diff = FindHookDifference(process, remote_function, local_bytes);
+            if (first_diff == static_cast<size_t>(-1) || first_diff == sizeof(local_bytes))
+            {
+                ++stats.clean;
+                continue;
+            }
+
+            // Re-check guard immediately before the write: a page that
+            // became guarded since the read must not be forced open - the
+            // guard exception itself is the tripwire.
+            if (!IsSafeCodePage(process, remote_function, sizeof(local_bytes)))
+            {
+                ++stats.skipped;
+                continue;
+            }
+
+            DWORD old_protection = 0;
+            if (!VirtualProtectEx(process, reinterpret_cast<void *>(remote_function), sizeof(local_bytes), PAGE_EXECUTE_READWRITE, &old_protection))
+            {
+                ++stats.skipped;
+                continue;
+            }
+
+            SIZE_T bytes_written = 0;
+            const bool restored_ok = WriteProcessMemory(process, reinterpret_cast<void *>(remote_function), local_bytes, sizeof(local_bytes), &bytes_written) &&
+                bytes_written == sizeof(local_bytes);
+
+            FlushInstructionCache(process, reinterpret_cast<void *>(remote_function), sizeof(local_bytes));
+
+            DWORD ignored_protection = 0;
+            const bool protection_ok = VirtualProtectEx(process, reinterpret_cast<void *>(remote_function), sizeof(local_bytes), old_protection, &ignored_protection) != FALSE;
+
+            if (!restored_ok || !protection_ok)
+            {
+                ++stats.skipped;
+                continue;
+            }
+
+            BYTE verify_bytes[kHookScanBytes]{};
+            SIZE_T bytes_verified = 0;
+            if (!ReadProcessMemory(process, reinterpret_cast<void *>(remote_function), verify_bytes, sizeof(verify_bytes), &bytes_verified) ||
+                bytes_verified != sizeof(verify_bytes) ||
+                memcmp(verify_bytes, local_bytes, sizeof(verify_bytes)) != 0)
+            {
+                ++stats.skipped;
+                continue;
+            }
+
+            ++stats.hooked;
+            RestoredHook entry;
+            entry.name = HookDisplayName(target);
+            entry.offset = static_cast<unsigned int>(first_diff);
+            restored.push_back(entry);
+        }
+
+        for (const HookTarget & target : targets)
+        {
+            BYTE local_bytes[kHookScanBytes]{};
+            const ULONG_PTR remote_function = ResolveHookTarget(process, target, local_bytes);
+            if (!remote_function)
+            {
+                continue;
+            }
+
+            const size_t still_diff = FindHookDifference(process, remote_function, local_bytes);
+            if (still_diff != static_cast<size_t>(-1) && still_diff != sizeof(local_bytes))
+            {
+                remaining.push_back(HookDisplayName(target));
+            }
+        }
+        AMEGER_VMP_ULTRA_END();
+    }
+
+    // One place that prints a hook-scan result, so the pre- and post-injection
+    // passes cannot drift. The counts matter: "no foreign hooks found" is only
+    // meaningful next to how many targets were resolved, otherwise a scan that
+    // resolved nothing at all reads the same as a genuinely clean target.
+    void PrintHookScanResult(const wchar_t * Phase, const HookScanStats & stats,
+        const std::vector<RestoredHook> & restored, const std::vector<std::wstring> & remaining)
+    {
+        wprintf(L"  %s scan trace:\n\n", Phase);
+
+        if (!stats.scanned)
+        {
+            wprintf(L"    %ls%zu%s in list, no process handle - nothing was inspected\n",
+                StageField(L"Targets").c_str(), stats.targets, kReset);
+            return;
+        }
+
+        wprintf(L"    %ls%ls%zu%s\n",
+            StageField(L"Targets").c_str(), kGreen, stats.targets, kReset);
+        wprintf(L"    %ls%ls%zu%s of %ls%zu%s resolved in the target\n",
+            StageField(L"Resolved").c_str(),
+            (stats.resolved == stats.targets ? kGreen : kYellow), stats.resolved, kReset,
+            kGreen, stats.targets, kReset);
+        wprintf(L"    %ls%ls%zu%s already matched the local image\n",
+            StageField(L"Clean").c_str(), kGreen, stats.clean, kReset);
+        wprintf(L"    %ls%ls%zu%s differed, %s%zu%s left alone\n",
+            StageField(L"Hooked").c_str(), kGreen, stats.hooked, kReset,
+            (stats.skipped ? kYellow : kGreen), stats.skipped, kReset);
+
+        if (!restored.empty())
+        {
+            wprintf(L"\n");
+            for (size_t i = 0; i < restored.size(); ++i)
+            {
+                const RestoredHook & entry = restored[i];
+                // Same rule as every other [x/y] in this file: both counts
+                // carry the tint, only the brackets stay plain. The offset
+                // tint depends on the result: +0x00 is the routine entry
+                // patch (green, like every other count); a nonzero offset
+                // means a deeper inline hook reached a later byte, so it
+                // draws yellow instead.
+                const wchar_t * offset_tint = entry.offset == 0 ? kGreen : kYellow;
+                wprintf(L"      [%ls%zu%s/%ls%zu%s] %s (%ls+0x%02X%s)\n",
+                    kGreen, i + 1, kReset, kGreen, restored.size(), kReset, entry.name.c_str(),
+                    offset_tint, entry.offset, kReset);
+            }
+        }
+
+        if (!remaining.empty())
+        {
+            wprintf(L"    %ls%ls%zu%s still differ after the pass:\n",
+                StageField(L"Remaining").c_str(), kYellow, remaining.size(), kReset);
+            for (const std::wstring & entry : remaining)
+            {
+                wprintf(L"      %ls! %s%s\n", kYellow, entry.c_str(), kReset);
+            }
+        }
+    }
+
+    void PrintFailureHint(DWORD code)
+    {
+        if (code == INJ_ERR_OUT_OF_MEMORY_EXT)
+        {
+            wprintf(L"Reason: VirtualAllocEx failed in target (Adv 5=ACCESS_DENIED, 998/3E6=NOACCESS).\n");
+            wprintf(L"Target is likely protected or blocks remote RW/RX allocations.\n");
+            wprintf(L"Staging uses RW->RX (no RWX at birth); image uses RW->RX.\n");
+            wprintf(L"Try testing on notepad.exe.\n");
+        }
+        else if (code == INJ_ERR_CANT_OPEN_PROCESS)
+        {
+            wprintf(L"Reason: OpenProcess denied. Run elevated.\n");
+        }
+        else if (code == INJ_MM_ERR_DLLMAIN_FAILED)
+        {
+            wprintf(L"Reason: the mapping, imports, TLS and loader-lock stages all succeeded; the payload's\n");
+            wprintf(L"own DllMain(DLL_PROCESS_ATTACH) returned FALSE, i.e. the payload refused to initialize.\n");
+            wprintf(L"This is state/thread dependent, not a mapping fault. Inject earlier in the target's startup:\n");
+            wprintf(L"relaunch the game and inject once the injector reports its symbol download is complete.\n");
+            wprintf(L"A failed attempt also leaves loader bookkeeping in the target that cannot be reclaimed,\n");
+            wprintf(L"so relaunch the game before trying again.\n");
+        }
+        else if (code == INJ_ERR_HANDLE_HIJACK_FAILED)
+        {
+            wprintf(L"Reason: handle hijacking found no donor and no fallback was allowed.\n");
+            wprintf(L"Check HandleHijacking / HijackScan / AllowDirectFallback in Configuration.ini,\n");
+            wprintf(L"or run elevated so the sponsor pre-open succeeds.\n");
+        }
+        else if (code == SR_HT_ERR_OPEN_REFUSED)
+        {
+            wprintf(L"Reason: thread acquisition failed and the direct OpenThread fallback is disabled.\n");
+            wprintf(L"Set AllowDirectFallback = Y in Configuration.ini or run elevated.\n");
+        }
+        else if (code == SR_HT_ERR_NO_THREADS)
+        {
+            wprintf(L"Reason: no hijackable thread found. Retry while the target is active.\n");
+        }
+        else if (code == SR_ERR_TARGET_EXITED)
+        {
+            wprintf(L"Reason: the target process exited during injection.\n");
+        }
+        else if (code == SR_HT_ERR_REMOTE_PENDING_TIMEOUT)
+        {
+            wprintf(L"Note: the payload timed out, but the thread context was restored automatically.\n");
+            wprintf(L"Reason: the victim thread never scheduled the hijack stub (State stayed Pending),\n");
+            wprintf(L"so the manual-mapping shell never started. This is thread selection, not stealth:\n");
+            wprintf(L"CleanDataDirectories and HookRestore are unrelated - keep them enabled.\n");
+            wprintf(L"Relaunch the target before retrying; the runtime now re-validates the sponsor\n");
+            wprintf(L"TID (alertable/Running, non-worker) and falls back to its own search on mismatch.\n");
+        }
+        else if (code == INJ_ERR_WINDOWS_VERSION)
+        {
+            wprintf(L"Reason: the OS version gate could not identify the Windows release.\n");
+            wprintf(L"The runtime requires Windows 11 (build 22000+); this is an environment\n");
+            wprintf(L"issue, not a mapping or symbol failure.\n");
+        }
+        else if (code == INJ_ERR_WINDOWS_BUILD_UNSUPPORTED)
+        {
+            wprintf(L"Reason: the OS gate rejected the host - Windows 11 (build 22000+) is required\n");
+            wprintf(L"and this build is outside the supported families (21H2 22000+, 22H2/23H2 22621+,\n");
+            wprintf(L"24H2 26100+, 25H2 26200+; newer builds are forward-mapped). This is an\n");
+            wprintf(L"environment issue, not a mapping or symbol failure. Update Windows.\n");
+        }
+        else
+        {
+            // Every other code gets a short pointer instead of a bare hex value
+            // with no explanation; keep it terse so the common cases above are
+            // not buried.
+            wprintf(L"Reason: unclassified failure 0x%08lX; see Ameger/Core/Foundation/Error.h.\n",
+                static_cast<unsigned long>(code));
+        }
+    }
+
+    void PauseBeforeExit()
+    {
+        wprintf(L"\nPress Enter to exit...\n");
+        fflush(stdout);
+
+        // --- Layer-by-layer input buffer clearance ---
+        // After answering yes/no prompts via std::wcin and using _getch() in
+        // the "Waiting for target" loop, multiple buffering layers may hold
+        // stale characters. We clear each layer in order:
+
+        std::wcin.clear();
+
+        // Layer 1: C++ stream buffer (std::wcin's internal get area)
+        // in_avail() non-blockingly reports chars already in the buffer.
+        std::streamsize avail = std::wcin.rdbuf()->in_avail();
+        if (avail > 0)
+        {
+            std::wcin.ignore(avail, L'\n');
+        }
+
+        // Layer 2: C stdio buffer (stdin's FILE* internal buffer)
+        clearerr(stdin);
+        // MSVC documents fflush(stdin) as discarding the buffered input. It is a
+        // deliberate platform extension here, not the ISO-C UB case.
+        fflush(stdin);
+        std::wcin.clear();
+
+        // Layer 3: Raw console input buffer (events from _getch() in waiting loop)
+        HANDLE hInput = GetStdHandle(STD_INPUT_HANDLE);
+        DWORD mode = 0;
+        if (hInput != INVALID_HANDLE_VALUE && GetConsoleMode(hInput, &mode))
+        {
+            DWORD events = 0;
+            if (GetNumberOfConsoleInputEvents(hInput, &events))
+            {
+                while (events > 0)
+                {
+                    INPUT_RECORD rec;
+                    DWORD read = 0;
+                    if (!ReadConsoleInputW(hInput, &rec, 1, &read) || read == 0)
+                        break;
+                    GetNumberOfConsoleInputEvents(hInput, &events);
+                }
+            }
+        }
+
+        // Layer 4: Block until user presses Enter
+        std::wstring ignored;
+        std::getline(std::wcin, ignored);
+    }
+
+    AMEGER_VMP_NOINLINE void PrintRuntimeFailure(DWORD symbol_state, DWORD import_state)
+    {
+        AMEGER_VMP_ULTRA_BEGIN("ui_rtfail");
+        // InitializeRuntime failures are propagated through symbol_state /
+        // import_state by WaitForRuntime. Report them as init failures, not
+        // as symbol-download failures: 0x4E (BUILD_UNSUPPORTED) previously
+        // printed as "Failed to load symbols", sending operators down the
+        // wrong path (network/symbols) when the real cause was the OS gate.
+        const DWORD init_state = symbol_state != INJ_ERR_SUCCESS ? symbol_state : import_state;
+        if (init_state == INJ_ERR_WINDOWS_BUILD_UNSUPPORTED || init_state == INJ_ERR_WINDOWS_VERSION)
+        {
+            DWORD local_build = 0;
+            {
+                auto ntdll_name = XOR_STR_W(L"ntdll.dll");
+                HMODULE ntdll = GetModuleHandleW(ntdll_name.get());
+                if (ntdll)
+                {
+                    struct RtlOsVersionInfo
+                    {
+                        ULONG dwOSVersionInfoSize;
+                        ULONG dwMajorVersion;
+                        ULONG dwMinorVersion;
+                        ULONG dwBuildNumber;
+                        ULONG dwPlatformId;
+                        WCHAR szCSDVersion[128];
+                    };
+                    using RtlGetVersionFn = LONG(__stdcall *)(RtlOsVersionInfo *);
+                    auto api_name = XOR_STR_A("RtlGetVersion");
+                    auto rtl_get_version = reinterpret_cast<RtlGetVersionFn>(
+                        GetProcAddress(ntdll, api_name.get()));
+                    if (rtl_get_version)
+                    {
+                        RtlOsVersionInfo info{};
+                        info.dwOSVersionInfoSize = sizeof(info);
+                        if (rtl_get_version(&info) == 0)
+                        {
+                            local_build = info.dwBuildNumber;
+                        }
+                    }
+                }
+            }
+            if (local_build)
+            {
+                fwprintf(stderr, L"%lsUnsupported Windows build: local build %lu (code 0x%08X).%ls\n",
+                    kRed, static_cast<unsigned long>(local_build), init_state, kReset);
+            }
+            else
+            {
+                fwprintf(stderr, L"%lsUnsupported Windows version (code 0x%08X).%ls\n",
+                    kRed, init_state, kReset);
+            }
+            PrintError(L"Supported: Windows 11 21H2 (22000), 22H2/23H2 (22621-22631), 24H2 (26100+), 25H2 (26200+).");
+            PrintError(L"Windows 10 and older builds are not supported by this x64/Win11-only build.");
+            PrintError(L"Failed to initialize the injection runtime (OS gate, not a symbol download failure).");
+            return;
+        }
+        if (symbol_state == INJ_ERR_SYMBOL_INIT_NOT_DONE)
+        {
+            PrintError(L"Timeout waiting for symbol initialization (120s).");
+            PrintError(L"Check internet access and Windows symbol server reachability.");
+        }
+        else if (symbol_state != INJ_ERR_SUCCESS)
+        {
+            fwprintf(stderr, L"%lsFailed to load symbols: 0x%08X%ls\n", kRed, symbol_state, kReset);
+        }
+        else if (import_state == INJ_ERR_IMPORT_HANDLER_NOT_DONE)
+        {
+            PrintError(L"Timeout waiting for import resolution (120s).");
+        }
+        else if (import_state != INJ_ERR_SUCCESS)
+        {
+            fwprintf(stderr, L"%lsFailed to resolve imports: 0x%08X%ls\n", kRed, import_state, kReset);
+        }
+        PrintError(L"Failed to initialize the injection runtime or download symbols.");
+        AMEGER_VMP_ULTRA_END();
+    }
+
+    // Runs target selection, DLL validation, and injection.
+    AMEGER_VMP_NOINLINE int RunInteractiveWizard(Runtime & runtime)
+    {
+        AMEGER_VMP_ULTRA_BEGIN("ui_wizard");
+        if (!LoadRuntime(runtime))
+        {
+            PauseBeforeExit();
+            return 1;
+        }
+
+        wprintf(L"Runtime module base = %ls%p%ls\n", kGreen, reinterpret_cast<void *>(runtime.module), kReset);
+        wprintf(L"Execution: %lsThreadHijacking%ls\n", kGreen, kReset);
+        wprintf(L"Mode: %lsManualMapping%ls\n\n", kGreen, kReset);
+
+        WizardConfig config;
+        std::wstring config_path;
+        bool config_invalid = false;
+        const bool config_loaded = LoadWizardConfig(config, config_path, config_invalid);
+        if (config_invalid || !config_loaded)
+        {
+            if (config_path.empty())
+            {
+                PrintError(L"Configuration.ini is required but was not found. Place it next to the executable or in Build\\.");
+            }
+            else
+            {
+                PrintError(L"Configuration.ini is invalid; fix SchemaVersion/ProcessName/PayloadSha256 or restore the file.");
+            }
+            PauseBeforeExit();
+            return 1;
+        }
+        wprintf(L"%ls[+]%ls Configuration loaded: %ls\n", kGreen, kReset, config_path.c_str());
+
+        wprintf(L"\n");
+        wprintf(L"Target: %ls%ls%ls | Timeout: %ls%d%ls ms\n",
+            kGreen, config.target_name.c_str(), kReset, kGreen, config.timeout, kReset);
+        wprintf(L"ManualMap flags: %ls0x%08X%ls\n", kGreen, BuildFlags(config), kReset);
+
+        // Fixed order: prompt for the payload BEFORE waiting for the target.
+        // The old order (wait for target -> prompt for DLL -> inject) left a
+        // human-length gap during which Eidolon/Warden progressed from early
+        // boot to active, which is the #1 trigger for the payload's DllMain
+        // refusing with 00400013. Selecting the DLL first means detection is
+        // followed immediately by RefreshTarget + sponsor + inject (~ms).
+        if (!config.from_memory)
+        {
+            PrintError(L"LoadFromMemory must be enabled for payload integrity verification.");
+            PauseBeforeExit();
+            return 1;
+        }
+
+        wprintf(L"\n");
+        std::wstring dll_path;
+        std::wstring payload_sha256;
+        std::vector<BYTE> raw_data;
+        FileInformation fileInformation;
+        {
+            // No target yet, so pass a dummy Unknown-arch selection: SelectDll
+            // skips its target-vs-payload check in that case and the check is
+            // done explicitly after detection below.
+            TargetSelection no_target;
+            bool dll_cancelled = false;
+            if (!SelectDll(no_target, BuildFlags(config), config.expected_payload_sha256,
+                dll_path, fileInformation, raw_data, payload_sha256, dll_cancelled))
+            {
+                if (dll_cancelled)
+                {
+                    wprintf(L"Cancelled.\n");
+                    return 0;
+                }
+                return 2;
+            }
+        }
+
+        wprintf(L"\n%ls[+]%ls Downloading Windows symbols...\n", kGreen, kReset);
+        DWORD symbol_state = INJ_ERR_SYMBOL_INIT_NOT_DONE;
+        DWORD import_state = INJ_ERR_IMPORT_HANDLER_NOT_DONE;
+        if (!WaitForRuntime(runtime, symbol_state, import_state))
+        {
+            PrintRuntimeFailure(symbol_state, import_state);
+            PauseBeforeExit();
+            return 1;
+        }
+        wprintf(L"%ls[+]%ls Download completed.\n\n", kGreen, kReset);
+
+        TargetSelection target;
+        bool cancelled = false;
+        if (!SelectTarget(config.target_name, target, cancelled))
+        {
+            if (cancelled)
+            {
+                wprintf(L"Cancelled.\n");
+                return 0;
+            }
+            return 2;
+        }
+
+        if (target.architecture == Architecture::X86)
+        {
+            PrintError(L"x86 targets are not supported in this x64-only build.");
+            PauseBeforeExit();
+            return 1;
+        }
+
+        // Deferred architecture cross-check (SelectDll could not do it without
+        // a target). Matches the old interactive behavior: warn + confirm.
+        if (target.architecture != Architecture::Unknown &&
+            fileInformation.architecture != target.architecture)
+        {
+            wprintf(L"Warning: DLL is %ls but target is %ls.\n",
+                ArchitectureName(fileInformation.architecture),
+                ArchitectureName(target.architecture));
+            bool proceed = false;
+            if (!ReadYesNo(L"Continue anyway?", false, proceed) || !proceed)
+            {
+                wprintf(L"Cancelled.\n");
+                return 0;
+            }
+        }
+
+        // Note: late boot only warns (see SelectTarget). A hard refuse here
+        // would have blocked your 25s success: late DllMain is probabilistic
+        // (thread/state lottery), not guaranteed failure, so never abort on
+        // age alone.
+
+        const int timeout_value = config.timeout;
+
+        wprintf(L"\n");
+
+        if (!RefreshTarget(target))
+        {
+            PrintError(L"Target exited before injection. Re-run and choose faster.");
+            PauseBeforeExit();
+            return 1;
+        }
+
+        if (target.architecture == Architecture::X86)
+        {
+            PrintError(L"x86 targets are not supported in this x64-only build.");
+            PauseBeforeExit();
+            return 1;
+        }
+
+        // Sponsor handle: pre-open the target while INJ_HANDLE_HIJACKING is
+        // set. The runtime DLL runs in-process, so it reuses this value
+        // directly - validated first - with zero enumeration noise. The
+        // optional roundtrip proof is controlled separately by
+        // INJ_SKIP_SPONSOR_ROUNDTRIP; turning that off does not require
+        // discarding the pre-opened handle. The guard keeps it alive through
+        // the injection call below. Facts go into HijackContext for the
+        // acquisition trace's first step.
+        HijackContext Context{};
+        Context.HijackFlag = config.handle_hijacking;
+        Context.TargetPid = target.pid;
+        Context.TargetName = target.name;
+        Context.Verbose = config.verbose_trace && !config.quiet;
+        Context.SponsorAccess = PROCESS_VM_OPERATION | PROCESS_VM_READ | PROCESS_VM_WRITE |
+            PROCESS_QUERY_INFORMATION | PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_DUP_HANDLE;
+        HANDLE sponsorRaw = nullptr;
+        if (config.handle_hijacking)
+        {
+            // Least privilege first: most targets open without it, and an
+            // enabled SeDebugPrivilege is token state a process enumerator
+            // can observe. Enable only when the open is denied for access.
+            sponsorRaw = OpenProcess(Context.SponsorAccess, FALSE, target.pid);
+            if (!sponsorRaw && GetLastError() == ERROR_ACCESS_DENIED)
+            {
+                Context.PrivilegeAttempted = true;
+                Context.PrivilegeOk = EnableSeDebugPrivilege();
+                if (Context.PrivilegeOk)
+                {
+                    sponsorRaw = OpenProcess(Context.SponsorAccess, FALSE, target.pid);
+                }
+            }
+            DWORD sponsor_err = ERROR_SUCCESS;
+            if (!sponsorRaw)
+            {
+                sponsor_err = GetLastError();
+            }
+            Context.SponsorOpened = sponsorRaw != nullptr;
+            if (sponsorRaw)
+            {
+                Context.SponsorValue = ReCa<ULONG_PTR>(sponsorRaw);
+            }
+            else
+            {
+                const wchar_t * consequence = config.hijack_scan
+                    ? (config.allow_direct_fallback ? L"runtime will scan, then OpenProcess." : L"runtime will scan only (no direct fallback).")
+                    : (config.allow_direct_fallback ? L"runtime will fall back to OpenProcess." : L"no acquisition path remains; injection will fail closed.");
+                wprintf(L"  %ls[!]%ls Sponsor pre-open failed (0x%08X); %ls\n",
+                    kYellow, kReset, sponsor_err, consequence);
+            }
+        }
+        FileHandleGuard sponsorGuard(sponsorRaw);
+
+        // Sponsor thread: pre-pick the victim thread and pre-open it, so the
+        // runtime can duplicate it directly instead of scanning. Keep it
+        // enabled even when the process roundtrip proof is disabled; the
+        // remote alloc/write/read/free proof is separate from handle reuse.
+        HANDLE threadSponsorRaw = nullptr;
+        if (config.handle_hijacking)
+        {
+            const DWORD victim_tid = PickHijackThreadTid(target.pid);
+            if (victim_tid)
+            {
+                threadSponsorRaw = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT |
+                    THREAD_SET_CONTEXT | THREAD_QUERY_INFORMATION | THREAD_QUERY_LIMITED_INFORMATION,
+                    FALSE, victim_tid);
+            }
+
+            if (threadSponsorRaw)
+            {
+                Context.SponsorThreadOpened = true;
+                Context.SponsorThreadValue = ReCa<ULONG_PTR>(threadSponsorRaw);
+                Context.SponsorTid = GetThreadId(threadSponsorRaw);
+            }
+            else
+            {
+                wprintf(L"  %ls[!]%ls Thread sponsor pre-open failed (0x%08X); runtime will search.\n",
+                    kYellow, kReset, GetLastError());
+            }
+        }
+        FileHandleGuard threadSponsorGuard(threadSponsorRaw);
+
+        // One handle serves the pre/post hook scan and the post-injection
+        // stealth report. The sponsor pre-open already carries
+        // VM_OPERATION|VM_READ|VM_WRITE|QUERY, so the common path issues no
+        // extra OpenProcess (the loudest telemetry point). Only when the
+        // sponsor is absent do we open a scan-only handle once, here.
+        HANDLE targetHandle = sponsorRaw;
+        FileHandleGuard targetHandleGuard;
+        if (!targetHandle)
+        {
+            const DWORD scan_mask = PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ |
+                PROCESS_VM_WRITE | PROCESS_VM_OPERATION;
+            targetHandle = OpenProcess(scan_mask, FALSE, target.pid);
+            targetHandleGuard.reset(targetHandle);
+            if (!targetHandle)
+            {
+                wprintf(L"  %ls[!]%ls Could not open the target for hook scanning (0x%08X).\n",
+                    kYellow, kReset, GetLastError());
+            }
+        }
+
+        const DWORD flags = BuildFlags(config);
+
+        MemoryInjectionData data{};
+        data.RawData = raw_data.data();
+        data.RawSize = static_cast<DWORD>(raw_data.size());
+        data.ProcessID = target.pid;
+        data.Mode = INJECTION_MODE::IM_ManualMap;
+        data.Method = LAUNCH_METHOD::LM_HijackThread;
+        data.Flags = flags;
+        data.Timeout = static_cast<DWORD>(timeout_value);
+        data.GenerateErrorLog = true;
+        // Kernel handle values fit in 32 bits; the runtime widens back.
+        data.hHandleValue = sponsorRaw ? ReCa<ULONG_PTR>(sponsorRaw) : 0;
+        data.TargetTid = Context.SponsorTid;
+        data.hThreadHandleValue = threadSponsorRaw ? ReCa<ULONG_PTR>(threadSponsorRaw) : 0;
+
+        wprintf(L"\n");
+        // Pre-injection hook scan: system DLLs only (guard-aware, see
+        // IsSafeCodePage). Game .text/.eid traps are surveyed once,
+        // read-only, as the last verification step after injection — never
+        // written: Warden's INT3 trampolines, page-guarded .eid dispatch,
+        // VEH-first chain and session-rotated IAT keys have no safe static
+        // restore. This pre-scan only writes system code pages, so turn it
+        // off with HookRestore = N.
+        if (config.hook_restore)
+        {
+            std::vector<RestoredHook> pre_unhooked;
+            std::vector<std::wstring> pre_remaining;
+            HookScanStats pre_stats{};
+            ScanAndRestoreHooks(targetHandle, pre_unhooked, pre_remaining, pre_stats);
+            if (!config.quiet)
+            {
+                PrintHookScanResult(L"Pre-injection hook", pre_stats, pre_unhooked, pre_remaining);
+            }
+        }
+        else
+        {
+            wprintf(L"    Hook restoration disabled (HookRestore = N).\n");
+        }
+        wprintf(L"\n");
+
+        // Blank line sets the headline apart from the status block below.
+        wprintf(L"Injecting...\n\n");
+
+        // A single attempt, always. The failure path deliberately does not
+        // retry in-process: a retry would be a second exposure into a target
+        // whose DllMain already ran and refused, and it leaves loader
+        // bookkeeping that ntdll offers no API to reclaim - the
+        // RtlInsertInvertedFunctionTable entry (and the fake SEH directory it
+        // may reference) and the LdrpHandleTlsData TLS index/block both point
+        // into the freed image and dangle for the life of the target. Releasing
+        // the TLS index would let a later TlsAlloc hand every thread a stale
+        // pointer. Fail instead, and have the operator relaunch the target
+        // before re-running.
+        //
+        // The progress line is printed before memory_inject because it blocks
+        // for the whole timeout when the payload hangs, so name the victim
+        // thread and the wait budget before the silence starts. Flush left;
+        // the measured TID and timeout are tinted green.
+        if (data.TargetTid)
+        {
+            wprintf(L"Injecting (TID %ls0x%04lX%s, timeout %ls%lu ms%s)...\n",
+                kGreen, static_cast<unsigned long>(data.TargetTid), kReset,
+                kGreen, static_cast<unsigned long>(data.Timeout), kReset);
+        }
+        else
+        {
+            wprintf(L"Injecting (runtime thread search, timeout %ls%lu ms%s)...\n",
+                kGreen, static_cast<unsigned long>(data.Timeout), kReset);
+        }
+
+        const DWORD result = runtime.memory_inject(&data);
+
+        if (result != INJ_ERR_SUCCESS)
+        {
+            fwprintf(stderr, L"%lsInjection failed with code %08X%ls\n", kRed, result, kReset);
+            PrintFailureHint(result);
+            PauseBeforeExit();
+            return 1;
+        }
+
+        // Debug and verify stealth results in the remote process (pipeline runs
+        // inside the remote process, so we can only display results after injection).
+        // The runtime records its real handle-acquisition outcome per kind;
+        // fetch it for the first step instead of guessing from static text.
+        // The game-trap survey always runs last (read-only, one line per
+        // module) so the step count already includes it.
+        HijackStats ProcessHijackStats{};
+        HijackStats ThreadHijackStats{};
+        if (runtime.get_last_hijack_stats)
+        {
+            runtime.get_last_hijack_stats(&ProcessHijackStats, &ThreadHijackStats);
+        }
+        MAP_STATS MapStats{};
+        if (runtime.get_last_map_stats)
+        {
+            runtime.get_last_map_stats(&MapStats);
+        }
+        // Fail closed. If the handle is gone we cannot prove the stealth
+        // properties, and every other unproven path in this gate (a missing
+        // export, a fault inside verification) already reports failure. This
+        // one used to default to true and skip the check entirely.
+        bool stealth_gate_ok = false;
+        bool wx_violated = false;
+        if (targetHandle)
+        {
+            stealth_gate_ok = SafeDebugAndVerifyStealth(targetHandle, data.hDllOut, flags, raw_data.data(), raw_data.size(),
+                &ProcessHijackStats, &ThreadHijackStats, &Context, &MapStats, runtime.get_last_string_stats, true, target.pid, &wx_violated);
+        }
+        else
+        {
+            wprintf(L"%ls[x]%ls Stealth verification could not run (no target handle); the result is unproven.\n",
+                kRed, kReset);
+        }
+
+        // Thread-hijack outcome, measured in the target. This used to be a fixed
+        // "Thread context restored automatically" string with nothing behind it,
+        // which asserted a restore that had never been checked. One line, and
+        // the measurement is real: the runtime watches RIP until it leaves the
+        // hijack code page before reporting the restore.
+        THREAD_EXEC_STATS ThreadExec{};
+        if (runtime.get_last_thread_exec_stats)
+        {
+            runtime.get_last_thread_exec_stats(&ThreadExec);
+        }
+
+        if (!runtime.get_last_thread_exec_stats || !ThreadExec.Attempted)
+        {
+            wprintf(L"  %ls[!]%ls Thread context not reported (no telemetry, or no hijack was attempted).\n", kYellow, kReset);
+        }
+        else if (ThreadExec.Success)
+        {
+            wprintf(L"  %ls[+]%ls Thread context restored to original on TID: %ls0x%04lX%s.\n",
+                kGreen, kReset, kGreen, static_cast<unsigned long>(ThreadExec.HijackedTid), kReset);
+        }
+        else
+        {
+            wprintf(L"  %ls[!]%ls Thread context %sNOT restored%s on TID: %s0x%04lX%s (code 0x%08lX) - it may still be running hijack code.\n",
+                kYellow, kReset, kYellow, kReset, kYellow,
+                static_cast<unsigned long>(ThreadExec.HijackedTid), kReset,
+                static_cast<unsigned long>(ThreadExec.FailCode));
+        }
+        wprintf(L"\n");
+        if (config.hook_restore)
+        {
+            std::vector<RestoredHook> unhooked;
+            std::vector<std::wstring> remaining;
+            HookScanStats post_stats{};
+            ScanAndRestoreHooks(targetHandle, unhooked, remaining, post_stats);
+            if (!config.quiet)
+            {
+                PrintHookScanResult(L"Post-injection hook", post_stats, unhooked, remaining);
+            }
+        }
+        else
+        {
+            wprintf(L"    Hook restoration disabled (HookRestore = N).\n");
+        }
+
+        wprintf(L"\n");
+        if (!stealth_gate_ok)
+        {
+            wprintf(L"%ls[x] STEALTH GATE FAILED%s - the payload is mapped in the target, but the\n", kRed, kReset);
+            wprintf(L"    runtime DLL does not pass string-encryption verification. It must not be\n");
+            wprintf(L"    treated as a clean injection: a plaintext symbol name in .rdata is\n");
+            wprintf(L"    scannable, and shipping it defeats the point of the string tiers.\n");
+            wprintf(L"    Fix the leak and rebuild before using this build.\n");
+            PauseBeforeExit();
+            return 1;
+        }
+        if (wx_violated)
+        {
+            wprintf(L"%ls[!] W^X advisory:%s a mapped page is not RX as expected (see the Verify W^X execution step).\n", kYellow, kReset);
+            wprintf(L"    The injection is functional, but a page that should be executable-only is not,\n");
+            wprintf(L"    which weakens the W^X posture. Treat this build as suspect.\n\n");
+        }
+
+        wprintf(L"Injection succeeded. DLL loaded at %ls%p%s.\n", kGreen, data.hDllOut, kReset);
+        PauseBeforeExit();
+        AMEGER_VMP_ULTRA_END();
+        return 0;
+    }
+}
+
+// Interface entry point.
+int wmain()
+{
+    EnableAnsi();
+    Runtime runtime;
+    int result = 1;
+    try
+    {
+        result = RunInteractiveWizard(runtime);
+    }
+    catch (const std::bad_alloc &)
+    {
+        PrintError(L"Out of memory during injection; aborting.");
+        PauseBeforeExit();
+        result = 1;
+    }
+    if (runtime.module)
+    {
+        // Graceful shutdown: stop symbol/import workers and release PDB
+        // handles before killing the process. Previously TerminateProcess
+        // ran unconditionally, leaking the symbol thread + DbgHelp session
+        // whenever the wizard exited early (0x4E path included). Best-effort:
+        // a wedged worker must not hang the exit.
+        if (runtime.shutdown_runtime)
+        {
+            runtime.shutdown_runtime();
+        }
+        TerminateInterface(result);
+    }
+    return result;
+}

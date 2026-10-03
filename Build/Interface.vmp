@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!-- Base project: the interface EXE has no exports, so this ships EntryPoint-only.
+     (Raw-VA procedures do not resolve in the 3.8.4 console; see VMPProcedures.ps1.) -->
+<Document Version="2">
+    <Protection InputFileName="Injector - x64.exe" Options="327680" VMCodeSectionName=".???" VMComplexity="100" VMInstances="10">
+        <Messages />
+        <Folders />
+        <Procedures>
+            <Procedure MapAddress="EntryPoint" Options="0" CompilationType="2" Complexity="100" />
+        </Procedures>
+        <Objects />
+    </Protection>
+    <DLLBox>
+        <Folders />
+    </DLLBox>
+    <Script />
+    <LicenseManager />
+</Document>
