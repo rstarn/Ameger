@@ -401,9 +401,9 @@ echo.
 echo Build completed successfully.
 echo.
 echo Cache:   %C_GREEN%%RELEASE_CACHE%%C_RESET%
+echo Payload:     %C_GREEN%%PAYLOAD_DEST%%C_RESET%
 echo Interface x64: %C_GREEN%%OUT64%\Injector - x64.exe%C_RESET%
 echo Runtime DLL: %C_GREEN%%DEPS_RELEASE%\Ameger Injector - x64.dll%C_RESET%
-echo Payload:     %C_GREEN%%PAYLOAD_DEST%%C_RESET%
 if "%NO_PAUSE%"=="0" pause
 exit /b 0
 
