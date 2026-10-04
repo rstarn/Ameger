@@ -1,0 +1,38 @@
+Diagnostics:
+  UnusedIncludes: None
+CompileFlags:
+  # Zed has no compile_commands.json for this MSVC project, so force
+  # clang-compatible C++20 + exceptions here.
+  # NOTE: do NOT add `Compiler: .../cl.exe`. With a cl driver, the clang-style
+  # flags below (-std=, -fexceptions, -fms-compatibility) are silently ignored
+  # and clangd falls back to MSVC defaults (C++14, no EH), which reintroduces
+  # every `inline variables` / `static_assert` / `is_nothrow_invocable_v` /
+  # `data()` / `try` diagnostic. The bundled clang driver understands them.
+  # Real build is verified with MSBuild v145 Release x64 (LanguageStandard
+  # stdcpp20, exceptions enabled).
+  Add:
+    - -std=c++20
+    - -ID:/Ameger/Injector/Ameger
+    - -ID:/Ameger/Injector
+    # NOTE: do NOT add -I .../Ameger/Core/Foundation/Primitives. Every project
+    # include is rooted at Ameger/ (matching the MSBuild
+    # AdditionalIncludeDirectories), and that extra root makes quoted paths
+    # resolve twice once Primitives/ gains subfolders (KcStrings/Core/),
+    # yielding bogus paths like KcStrings/Core/KcStrings/Core/XorString.h.
+    - -target
+    - x86_64-pc-windows-msvc
+    - -fms-compatibility
+    - -fdelayed-template-parsing
+    - -fexceptions
+    - -Wno-microsoft-cast
+    - -Wno-microsoft-enum-value
+    - -Wno-microsoft-exception-spec
+    - -Wno-msvc-include
+    - -DWIN32
+    - -D_WIN64
+    - -D_WINDOWS
+    - -DUNICODE
+    - -D_UNICODE
+    - -DNTDDI_VERSION=0x0A00000C
+    - -D_WIN32_WINNT=0x0A00
+    - -DNOMINMAX

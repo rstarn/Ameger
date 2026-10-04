@@ -1,0 +1,710 @@
+Full Eidolon & Warden Analysis
+
+First Of All, What is Warden/Eidolon?
+
+Ow2 has 2 layers
+
+Layer 1 Eidolon ( Overwatch_Loader.dll ): Anti Tamper layer responsible for IAT encryption, HWID collection, code obfuscation, and integrity verification.
+And its Acts as a loader/guard between the game executable and the Windows API.
+
+Layer 2 Warden ( Overwatch.exe ) Runtime anti-cheat enforcement using Vectored Exception Handling (VEH), INT3 trampolines, timing checks, process enumeration, and integrity scanning modules.
+
+Now, some finds
+
+1-Overwatch.exe has Exactly ( One Import ) which "Overwatch_loader.dll!eidolon_run) 0 direct win32 imports
+2-the HWID Decryption Key, Rotates every session, prevents offline decryption tho
+3-all Warden Module names are Compared via Runtime Hash, no strings cross ref exit in code
+4-the .eid section ( ig it was 4.2 mb ) stays Encrypted Event in Memory, Decrypted page by page on execution only
+5-the IAT uses a Cryptographic trampoline where all 31 Dll Imports point to the same Dummy addr statically
+6-Warden Module Scanning modules (FkCheck, VCheck, IntegrityCk) are ref via a hash table, not direct Lea
+
+
+Now the Main Arch
+
+Overwatch.exe, Has Warden Anticheat, it has :
+1- VEH ( Exception )
+2- INT3 Patches ( Trampoline )
+3- FkCheck, VCheck, IntegrityCk.
+3- GetTick64 ( Timing )
+4- NtQuerySysInfo ( Enum Proc )
+
+Import: Overwatch_loader.dll!eidolon_run ( only one )
+
+Now, Overwatch_loader.dll Eidolon Anti Tamper Layer
+1- Encrypted IAT
+2- String Decryption
+3- Control Flow Flattening
+4- HWID Collection
+5- TLS Callbacks
+6- .eid Section ( Encrypted )
+
+
+Now, Arch Points
+
+the critical insight, overwatch.exe has only one imports, which is just Overwatch_loader.dll!eidolon_run, every single Windows API Call goes through the loader dll encrypted IAT this means:
+
+Hooking Overwatch.exe IAT is impossible ( there nothing to hook )
+All Standard API monitors ( API Monitor, process monitor, in API Mode ) see nothing
+the exe is a stub that delegates everything through the loader
+any detour must either hook the loader resolved IAT or hook at syscall level
+
+
+
+Now, Warden Native Anti Cheat
+
+1- TLS Callbacks
+
+3 TLS Callbacks execute before the Entry Point (eidolon_run)
+
+TLS Callback 1: RVA: 0x02665714, PEB Anti Debug
+TLS Callback 2: RVA: 0x02665BB0, VEH Registration
+TLS Callback 3: RVA: 0x026BC5F0, Thread Env
+
+What they do?
+
+Callback 1: PEB Guard
+checks BeingDebugged, flag at PEB + 0x2
+Checks NtGlobalFlag at PEB + 0xBC ( should be 0 for non Debugged )
+if Debugger Detected during TLS Phase, Calls RtlExitUserProcess Instantly
+this means even attaching a debugger before the entrypoint will be caught, that explain why in cheat engine when u attach a Windows Debugger, game closes instantly.
+
+Callback 2: VEH Setup
+Calls RtlAddVectoredExceptionHandler to register Warden VEH Handler
+Stores The Handler Handle in a Global Var, for later removal
+The Handler is Registred as a First Chance VEH, not last chance VCH
+first chance means Warden Get every exception before any Debugger
+
+Callback 3: Thread Setup
+Init Per Thread Anti Debug Structures
+Sets up TLS Data for obfuscated Global Var Access
+Installs Thread Local Exception Handlers
+
+
+3.1 Load Config/ CFG Info ( maybe important )
+
+Load Config Size: 320 Bytes
+SE Handler Count: 0, no SEH Handlers, warden uses VEH exclusively
+SE Handlers Table: 0x0
+Guard CF Check Func Pointer: 0x02E5C548
+Guard CF Dispatch Func Ptr: 0x02E5C558
+Guard Flags: 0x100 ( CFG Instrumented )
+
+most important point in 3.1, warden does NOT uses SEH ( Structured Excpeption Handling ), the SE Handler count is 0, all Exception handling is done through VEH this is unusual most apps use SEH for exception Handling
+
+
+3.2 Imports, idk why should i say it again
+Overwatch.exe imports is one, Overwatch_loader.dll: Eidolon_Run.
+
+this is the single most important finding the game exe does not import from
+Kernel32.dll ( no GetTickCount64, no VirtualAlloc, No CreateThread )
+ntdll.dll ( no NtQuerySystemInfo, no Rtl Func. )
+user32.dll ( no message handling )
+any other system dll.
+
+all API goes via eidolon_run -> Encrypted IAT Trampoline -> Real API
+
+also, overwatch.exe, exports 76 Symbols, this is extremly unusual for an exe..
+
+
+4- Overwatch_loader.dll ( Eidolon Anti Tamper )
+
+4.1 Section Layout:
+.text, Obfsucated code
+.rdata read only data
+.data obfuscated data
+.pdata Exception Handlers
+.gxfg CFG Metadata
+.tls Thread Local Storage
+_RDATA Custom Read Only
+.rsrc Resources
+.reloc Relocations
+.eid Encrypted Core
+
+critical Section
+
+.eid , encrypted core ( ig it was 4.25 mb )
+its NOT Decrpyted Entirly at runtime, section is identical in the static dump and live memory
+Decrypted page by page when code executes from it
+Contains EidolonCore Logic: IAT Res, HWID Collection, Integrity Checking
+no API Strings Survive in plaintext withen it
+49 False Postive MZ Headers ( from 0x00 0x00, byte patterns, not actual PEs )
+
+
+.data ( Obfsucated Data )
+contains runtime var, encrypted config, and decrypted state
+Larger Virtual Size than raw size ( 0xCB000 vs 0x1C000 ) zero filled at runtime
+Likely used for Dynamiclly allocated structures
+
+4.3 Exports
+export name: eidolon_run
+rva:0x62830
+first bytes: c3 cc cc ( ret sled )
+export name: g_warden_aegis_crash_callback_export
+rva:0x4DAD38
+first bytes 00 00 .. ( callback struct )
+
+eidolon_run, the RE Trick
+the first byte at rva 0x62830 is 0xC3 ( ret instr ) followed by 7 more 0xCC ( Int3 ) this is not real entrypoint its a ret sled anti analysis trick.
+
+eidolon_run:
+C3 ret first byte fools static analysis
+CC CC CC CC CC CC CC int3 padding
+real code starts somewhere
+called via an Obfscuated trampoline
+
+when any tool ( ida, x64dbg, dllmain ) calls this export directly, it instantly returns, doing nothing.
+
+g_warden_aegis_crash_callback_export: Crash Integrity
+
+1- Offset: 0x00
+Size: 8
+Runtime Content: 0x0000000000000000 Callback Pointer, Null Until Crash
+2- Offset: 0x8
+Size: 8
+Runtime Content: 0x3C435645517CEDB1 Hash[0:8] Callback Integrity
+3- Offset: 0x10
+Size: 8
+Runtime Content: 0x811CC80D48A94A56 Hash[8:16]
+4- Offset: 0x18
+Size: 8
+Runtime Content: 0xC0BD3E8CB8BAD090 Hash[16:24]
+
+This is a 128 Bit Integrity Hash of the crash callback func, before invoking the crash handler warden hashes the callback func and compares it against the stored hash
+this prevent:
+DLL Injection that hooks the crash callback
+memory patching of the crash handler
+callback Hijacking via IAT Overwrite
+
+
+4.4 TLS Callbacks
+
+TLS Callback Array @ RVA 0x39F790
+
+only one tls callback in the loader ( vs 3 in the exe ) it Handles
+TLS Init for Obfuscated global var access
+Init of the per thread decryption Context
+
+4.5 Decoy Import Table
+
+the PE import Directory shows 31 DLLs each with exactly 1 decoy import the decoy APIs:
+
+1- Kernel32.dlL
+Decoy API: Switch to Thread
+Meaning: Hides Real kernel32 imports
+2- ntdll.dll
+Decoy API: VerSetConditionMask, LdrLockLoaderLock
+Meaning hide real ntdll imports
+3- user32.dll
+Decoy API: GetAsyncKeyState, EnumWindows
+Meaning: Hides real user32 imports
+4- GDI32.dll
+Decoy API: CreateCompatibleBitmap
+Meaning: Hides real gdi32 imports
+5- Bcrypt.dll
+Decoy API: BcryptDecrypt, BcryptCloseAlgorithmProvider
+Meaning: Crypto ( partailly real )
+6- ADVAPI32.dll
+Decoy API: RegOpenKeyExW
+Meaning: Used for HWID
+7- IPHLPAPI.dll
+Decoy API: GetAdaptersInfo
+Meaning: used for HWID
+8- HID.dll
+Decoy API: HidD_GetProductString
+Meaning: used for HWID
+9- sfc.dll
+Decoy API: SfcIsFileProtected
+Meaning: used for Integrity
+10- Crypt32.dll
+Decoy API: CryptMsgGetParm
+Meaning: crypto
+11- WS2_32.dll
+Decoy API: listen
+Meaning: Networking
+12- d3d11.dll
+Decoy API: D3D11CreateDevice
+meaning: Rendering
+13- dxgi.dll
+Decoy API: CreateDXGIFactory
+Meaning: Rendering
+
+Critical Observation, all 31 IAT Entires point to the same addr 0x007BC878 runtime, static is 0x004AC878 with the same placeholder data (0x000002B968630000 in static dump, 0x5CE9F34A36F45570 at runtime )
+this is the unifed encrypted IAT Trampoline, every singel API Call regardless of dll goes through the same obfscuated dispatcher
+
+
+
+5- Encrypted IAT ( Deeply a little lol )
+
+5.1 Mechanism
+
+Eidolon IAT Flow:
+
+1- game code call [IAT_slot] all 31 dll IAT slots point to the same unifed trampoline at RVA 0x4AC878
+2- Static dump shows placeholder bytes (0x000002B968630000), runtime shows resolved pointer (0x5CE9F34A36F45570)
+3- On first call: Eidolon hashes the API name & DLL name, looks up the index, decrypts the real entry from .eid section, calls LdrGetProcedureAddress to resolve, caches the result
+4- Subsequent calls: jumps directly to cached real API through the trampoline
+5- Every single Win32 API call goes through this, zero direct imports exist
+
+
+5.2 Runtime Verification
+
+Static Dump API Content
+
+RVA: 0x4AC878
+Bytes: 00 00 00 63 B9 68 02 00 00 00
+Interpretation: Obfuscated placeholder (not a valid pointer)
+
+Runtime IAT Content
+
+RVA: 0x005CC878
+Bytes: 5C E9 F3 4A 36 F4 55 70
+Interpretation: Resolved pointer to a real function or dispatcher stub
+
+the runtime value 0x7055F4364AF3E95C (reversed for big-endian) is:
+1- A valid usermode address (in the 0x7FFE... range after ASLR adjustment)
+2- Actually points to a resolver stub in `.text that handles the API dispatch
+
+5.3 Res Process
+
+the IAT Res Happens in phases:
+
+Phase 1, Static Load ( PE Loader )
+Windows PE Loader sees the Decoy Import Table
+Writes the Placeholder Trampoline addr to all IAT Slots
+game starts with non functional IAT
+
+Phase 2: Eidolon_Run Init
+Decrypt the Real Import Mapping from .eid Section
+For Each Required API: computes HASH -> looks up in .eid table -> gets api name -> resolves via LdrGetProcedureAddress
+Patches the IAT Trampoline toredirect the resolved API
+but does not overwrite the IAT Slots directly, uses a separate dispatch table
+
+Phase 3: Lazy Res
+some APIs are resolved lazily ( on first call )
+the unfied trampoline checks a cache, resolves if needed then calls
+cache entries are stored in the .data section
+
+5.4 Dll Loading List
+
+All dlls loaded through the encrypted IAT at runtime
+
+ntdll.dll kernel32.dll kernelbase.dll
+user32.dll gdi32.dll gdi32full.dll
+msvcrt.dll msvcp_win.dll ucrtbase.dll
+advapi32.dll sechost.dll rpcrt4.dll
+ole32.dll combase.dll oleaut32.dll
+shlwapi.dll shell32.dll shcore.dll
+ws2_32.dll iphlpapi.dll winhttp.dll
+bcrypt.dll crypt32.dll wintrust.dll
+hid.dll setupapi.dll cfgmgr32.dll
+d3d11.dll dxgi.dll dwmapi.dll
+winmm.dll bink2w64.dll vivoxsdk.dll
+comctl32.dll sfc.dll sfc_os.dll
+version.dll sensapi.dll uxtheme.dll
+
+tired a little while writing these lmao
+
+
+
+6, Warden VEH Mechanism
+
+6.1 Arch
+
+Warden Uses VEH as its primary runtime enforcemnt mech, unlike SEH, VEH Operates at the Process level and receives exceptions before any frame based handlers
+
+
+Exception Flow:
+CPU Exception ( int3, access violation ) -> KiUserExceptionDispatcher (ntdll) -> VEH Chain ( first chance ) -> Warden VEH Handler ( Registered by TLS CB ) ->
+INT3 from CFG Guard -> Validate + Emu
+INT3 from Warden Patch -> Validate + Emu
+INT3 from unknown -> Check Call site
+other exception -> pass through
+
+for the VEH Chain, -> Other VEH Handlers too.
+
+for the KiUserExceptionDIspatcher, -> SEH Chain ( if VEH Returns CONTINUE_SEARCH )
+KiUserExceptionDIspatcher -> UnHandledExceptionFilter, as a last resort.
+
+6.2 VEH Registertion
+
+func: RtlAddVectoredExceptionHandler in ntdll.dll
+runtime addr: ntdll!0x0009DE30
+caller: tls Callback 2 in overwatch.exe at 0x02665BB0
+Handler Type: First chance VEH ( get exceptions before any debugger )
+
+
+6.3 VEH Chain Structures ( win10 x64 )
+
+struct _VECTORED_HANDLER_ENTRY {
+LIST_ENTRY ListEntry; // +0x00: Flink (8) and Blink (8)
+LONG RefCount; // +0x10: Reference count (4)
+PVOID Handler; // +0x18: Function pointer (8)
+ULONG_PTR Pad; // +0x20: Padding/alignment
+};
+
+struct _LIST_ENTRY {
+LIST_ENTRY *Flink; // +0x00: Forward link
+LIST_ENTRY *Blink; // +0x08: Backward link
+};
+
+The VEH chain head (RtlpVectoredHandlerList) is stored in ntdll's .data section. Walking this chain at runtime reveals all registered VEH handlers:
+
+VEH 1: Handler=ntdll!RtlpExceptionHandler (default ntdll handler)
+VEH 2: Handler=Overwatch.exe!WardenVEHHandler (Warden's handler)
+VEH 3: Handler=... (any other registered handlers)
+
+Note: On Windows 10 22H2+, the VEH chain may not be directly walkable from usermode without proper sync the chain is protected by a lock (RtlpVectoredHandlerLock).
+
+
+6.4 INT3 Patch Mechanism
+
+warden veh handler is designed to intercept int3 ( 0xcc ) exception, the mechanism:
+
+1- warden patches game code, replaces legitmate intr bytes with 0xcc ( int3 )
+2- when pathced code executes, int3 fires, KiUserExceptionDispatcher -> VEH Chain
+3- warden handler Inspects exception:
+address of int3 ( from EXCEPTIOn_RECORD.ExceptionAddress )
+contents of surrounding memory
+thread context ( registres )
+
+4- if valid warden patch handler emulates the original instr
+reads the saved original bytes from warden patch database
+modfies thread context (context structures ) to emulate the instr
+returns exception_continue_execution
+
+5- if unknown int3 handler may:
+return exception_contnue_search ( pass to other handlers )
+log the violation for server side reporting
+trigger integrity check failure ( MemoryTasHasFailed )
+
+
+basic int3 distr analysis
+
+static dump of overwatch.exe .text is like 1.2M Int3 bytes
+runtime scan of overwatch.exe .text 0 int3 bytes
+runtime scan of overwatch_loader.dll .text 24k int3 bytes
+
+the 1.2M INT3 in static dump is CFG ( control flow guard ) not warden patches..
+
+
+
+
+7 Warden Module System
+
+7.1 Module Overview
+
+Warden has Internal Scanning modules, ref by name , these not loaded from a external files, they are natvie code paths withen overwatch.exe itself, activated by a module loader/dispatcher
+
+1- Module Name: FkCheck
+Runtime RVA:0x34645E8
+String First Bytes: 46 6B 43 68 65 63 6B 00
+Purpose: file integrity check
+2- Module Name: VCheck
+Runtime RVA: 0x3464A54
+String First Bytes: 56 43 68 65 63 6B 00 00
+Purpose: Memory Validation Check
+3- Module Name: IntegrityCk
+Runtime RVA: 0x3464960
+String First Bytes: 49 6E 74 65 67 72 69 74 79 43 6B 00
+Purpose: Code Integrity Scan
+4- Module Name: Quick_Check
+Runtime RVA: 0x3459480
+String First Bytes: 71 75 69 63 6B 5F 63 68 65 63 6B
+Purpose: Fast Integrity Sweep
+5- Module Name: MemoryTestHasFailed
+Runtime RVA: 0x395E8A4
+String First Bytes: 4D 65 6D 6F 72 79 54 65 73 74 48 61 73 46 61 69 6C 65 64
+Purpose: Integrity Failure Callback
+
+7.2 Hash Table Mechanism
+
+This is the most misunderstood aspect of Warden. The module names are stored in .rdata but are never referenced via direct LEA instructions. Instead, Warden uses a runtime hash table:
+
+Hash Table Lookup:
+Input: Module Name String -> Hash = HashFunction(ModuleName), Hash = CRC32 Variant or custom rolling
+-> Index = Hash & (TableSize -1) -> Table[Index]:
+Hash Stored
+Module Entry Point
+Module Metadata
+
+if collision linear probing
+result: module code addr or null
+
+that explains why:
+IDA Shows 0 xrefs to the module name strings
+x64dbg cannot find refs via find ref to current
+string search withen code does not help
+the only way to find module loader is to:
+1- find the hash func ( crc32 like custom poly )
+2- breakpoint in memory access to the .rdata string area
+3- trace back from the has comparision code
+
+
+7.3 Eidolon String Xref Analysis
+
+I Located one direct code ref
+
+MemoryTestHasFailed RVA 0x395E8A4
+LEA Ref at RVA 0x4F2A02
+only module stringwith a direct code xref
+used in integrity check faliure path
+
+all other module name are hash table only
+
+7.4 Module Loader Hints
+
+The Warden module loader was not fully resolved due to the encrypted IAT hiding VirtualAlloc calls. However, the following was determine
+
+No NtAllocateVirtualMemory syscall found in the loaders .text sample, the loader either:
+1. Uses an obfuscated wrapper around VirtualAlloc called through encrypted IAT
+2. Uses memory within the existing module address space (no allocation needed)
+3. Loads modules into pre allocated memory regions from initialization
+The most likely approach is 3, Warden pre allocates a pool of RWX memory during initialization and loads scanning modules into this pool. This avoids runtime VirtualAlloc calls that could be hooked.
+
+
+8 Eidolon String Decryption System
+
+8.1 Func Loc
+
+Module: Overwatch_loader.dll
+RVA: 0xEEA40
+runtimeaddr: loader_base + 0xEEA40
+size: 500 bytes
+purpose: Decrypts HWID Registry path strings at runtime
+
+8.2 Full Disassembly ( first 128 bytes )
+
+all addresses rel to func start at loader_base 0xEEA40
+
+Address Bytes Instruction
+0x00 41 56 push r14
+0x02 56 push rsi
+0x03 57 push rdi
+0x04 55 push rbp
+0x05 53 push rbx
+0x06 48 81 EC 80 00 00 00 sub rsp, 0x80
+0x0D 8B 05 BD C9 3D 00 mov eax, [rip+0x3DC9BD]
+0x13 89 C1 mov ecx, eax
+0x15 81 F1 05 24 77 4A xor ecx, 0x4A772405
+0x1B 41 89 C8 mov r8d, ecx
+0x1E 41 81 C0 87 28 02 37 add r8d, 0x37022887
+0x25 41 81 F0 B3 17 7F 12 xor r8d, 0x127F17B3
+0x2C 41 29 C0 sub r8d, eax
+0x2F 42 8D 04 01 lea eax, [rcx+r8]
+0x33 05 87 28 02 37 add eax, 0x37022887
+0x38 8D 84 01 C5 0E 40 0B lea eax, [rcx+rax*1+0xB400EC5]
+0x3F 89 44 24 04 mov [rsp+4], eax
+0x43 B8 C0 92 59 1B mov eax, 0x1B5992C0
+0x48 B9 17 00 00 00 mov ecx, 0x17
+0x4D 8D 34 01 lea esi, [rcx+rax]
+0x50 C1 E6 08 shl esi, 8
+0x53 0F B7 0C 24 movzx ecx, word ptr [rsp]
+0x57 B8 01 00 00 00 mov eax, 1
+... continues decrypt loop
+
+
+8.3 Key Derivatin Chain
+
+the decryption key is derived through a 4 layer transformation:
+
+global_key = read_uint32(key_addr) // etc 0xC9EF16A9
+
+layer1 = global_key ^ 0x4A772405
+layer2 = (layer1 + 0x37022887) & 0xFFFFFFFF
+layer3 = layer2 ^ 0x127F17B3
+layer4 = (layer3 - global_key) & 0xFFFFFFFF
+
+Each layer is used for a different phase of the decryption:
+Layer 1: Initial string XOR mask
+Layer 2: Address/offset obfuscation
+Layer 3: Final XOR pass
+Layer 4: Checksum validation
+
+8.4 Global Key Data At Runtime
+
+Address: loader_base + 0x3DB410
+Contents (hexdump):
+8C 24 F8 02 00 00 4C 21 F0 48 F7 D0 75 4F 86 F6 | .$....L!.H..uO..
+74 16 66 90 66 90 C6 C3 79 F6 DD 80 C1 F3 F6 D8 | t.f.f...y.......
+0F 85 AD 8B 01 00 56 E8 74 17 01 00 7B ED 50 81 | ......V.t...{.P.
+C0 90 75 2C 82 E8 53 28 00 00 80 E8 BD C7 C1 42 | ..u,..S(.......B
+DWORD[0] = 0x02F8248C (global decryption key, session 2)
+DWORD[0] = 0xC9EF16A9 (global decryption key, session 1)
+
+The key changes every game session, This prevents:
+Offline analysis of encrypted HWID strings
+Static decryption of the .ei` section
+Replay attacks with captured HWID data
+
+8.5 XOR Based String Decryption ( Reverse engineered Algortihm )
+
+Code:
+std::vector<uint8_t> decrypt_eidolon_string(const std::vector<uint8_t>& encrypted_bytes, uint32_t global_key) {
+    uint32_t k1 = (global_key ^ 0x4A772405) & 0xFFFFFFFF;
+    uint32_t k2 = (k1 + 0x37022887) & 0xFFFFFFFF;
+    uint32_t k3 = (k2 ^ 0x127F17B3) & 0xFFFFFFFF;
+    uint32_t k4 = (k3 - global_key) & 0xFFFFFFFF;
+ 
+    std::vector<uint8_t> result;
+    result.reserve(encrypted_bytes.size());
+    uint32_t rolling_key = k1;
+ 
+    for (size_t i = 0; i < encrypted_bytes.size(); i++) {
+        uint8_t k_byte = (rolling_key >> ((i % 4) * 8)) & 0xFF;
+        uint8_t k_byte2 = (k3 >> ((i % 4) * 8)) & 0xFF;
+        uint8_t decrypted_byte = encrypted_bytes[i] ^ k_byte ^ k_byte2 ^ (i & 0xFF);
+        result.push_back(decrypted_byte);
+ 
+        rolling_key = ((rolling_key << 3) | (rolling_key >> 29)) & 0xFFFFFFFF;
+        rolling_key ^= k2;
+    }
+ 
+    return result;
+}
+
+9, HWID Collection Chain
+
+9.1 Complete HWID Sources
+
+Eidolon collects hardware identifiers from 6 distinct sources:
+
+CPU Information:
+
+Path: HKLM\HARDWARE\DESCRIPTION\System\CentralProcessor\0
+Value: ProcessorNameString
+API: ADVAPI32!RegOpenKeyExW + RegQueryValueExW
+Data: "Intel(R) Core(TM) i9-14900K" (example)
+
+Registry, Machine GUID:
+
+Path: HKLM\SOFTWARE\Microsoft\Cryptography
+Value: MachineGuid
+API: ADVAPI32!RegOpenKeyExW + RegQueryValueExW
+Data: "d4ebc8a5-3c4f-4a7b-9e12-8f1a2b3c4d5e" (example)
+
+Disk Hardware ID:
+
+Path: HKLM\SYSTEM\CurrentControlSet\Control\Class\{4d36e967-e325-11ce-bfc1-08002be10318}\0
+Value: HardwareID
+API: ADVAPI32!RegOpenKeyExW + RegQueryValueExW
+Data: "SCSI\Disk_______WD_BLACK_SN850X____" (example)
+
+MAC Address:
+
+API: IPHLPAPI!GetAdaptersInfo
+Data: MAC address (6 bytes) and adapter description
+
+
+Peripheral Identifiers:
+
+API: HID!HidD_GetProductString
+Data: Product strings from HID devices (keyboards, mice, etc.)
+
+
+Volume Serial:
+
+API: KERNEL32!GetVolumeInformationW
+Data: Volume serial number, filesystem name
+
+
+Computer Name:
+
+API: KERNEL32!GetComputerNameW
+Data: NetBIOS computer name
+
+
+User Name:
+
+API: KERNEL32!GetUserNameW
+Data: Current user account name
+
+
+9.2 HWID Collection Flow
+1- String decryption, RVA 0xEEA40 decrypts registry path strings
+2- Registry Enumeration, RegOpenKeyExW -> RegQueryValueExW -> RegCloseKey
+3- Additional HWID Sources, GetAdaptersInfo, HidD_GetProductString, GetVolumeInformationW, GetComputerNameW, GetUserNameW.
+4- String Concatenation, All values joined into canonical string
+5- SHA 1 Hashing, First hash pass (constants @ RVA 0x1BD7F1A)
+6- RC4 Encryption, Custom RC4 with modified KSA (key @ RVA 0x2599931)
+7- RSA Encryption, Blizzard public key → encrypted HWID blob
+8- Base64 Encoding, CryptStringToBinaryW -> final payload
+9- Sent to Auth Server, Via HTTPS in game connection flow
+
+
+9.4 HWID Encryption Keys
+
+The SHA-1 and RC4 implementations use hardcoded constants found at these locations in Overwatch.exe:
+
+SHA-1 Constants (@ RVA 0x1BD7F1A):
+
+SHA-1 K[0] = 0x5A827999
+SHA-1 K[1] = 0x6ED9EBA1
+SHA-1 K[2] = 0x8F1BBCDC
+SHA-1 K[3] = 0xCA62C1D6
+
+RC4 Implementation (@ RVA 0x2599931)
+Custom Key Scheduling Algorithm (KSA) with additional permutation rounds
+Standard 256-byte S-box initialization
+Modified to include a round-dependent counter value in the swap operation
+Makes standard RC4 attack techniques less effective
+
+
+10, PEB Based Checks
+
+
+Warden checks these PEB fields (detected via TLS callbacks):
+
+PEB Structure (x64):
++0x002: BYTE BeingDebugged -> 0 = not debugged, 1 = debugged
++0x003: BYTE BitField -> Contains ImageUsedOs2 flag
++0x0BC: ULONG NtGlobalFlag -> 0 = normal, non-zero = debugger flags
+
+
+Detection methods that Warden can use:
+1. IsDebuggerPresent() reads PEB.BeingDebugged
+2. CheckRemoteDebuggerPresent() queries csrss.exe
+3. NtQueryInformationProcess(ProcessDebugPort) checks debug port
+4. NtQueryInformationProcess(ProcessDebugFlags) checks debug flags
+5. NtQueryInformationProcess(ProcessDebugObjectHandle) checks debug object
+
+
+11.3 Timing Detection
+
+Warden uses GetTickCount64 to detect debugger-induced slowdowns:
+
+Method**: Take timestamp → execute sensitive code -> take timestamp -> compare delta
+Expected delta: Normal (sub-millisecond for simple operations)
+Detection threshold: Delta > expected × 2 (heuristic) -> debugger slowdown
+
+
+11.4 Control Flow Flattening (Eidolon)
+
+Eidolon uses control-flow flattening to obfuscate function logic:
+
+Normal flow:
+if (cond) { A } else { B }; C
+
+Flattened flow:
+state = 0
+while (1) {
+switch (state) {
+case 0: state = cond ? 1 : 2; break;
+case 1: A; state = 3; break;
+case 2: B; state = 3; break;
+case 3: C; return;
+}
+}
+
+
+11.5 Global Decryption Key (Rotating)
+
+Session 1: 0xC9EF16A9 (first runtime scan)
+Session 2: 0x02F8248C (second runtime scan, diffrent session )
+
+
+11.6 Process Debug Port
+
+NtQueryInformationProcess(ProcessDebugPort):
+DebugPort = 0 (no debugger attached)
+
+everything noted verfied against at static vs At Runtime, also, these offsets/rvas are for Overwatch 2 Update: 2.23.0.3.151177, which means after this update, those RVAs Would be Wrong.

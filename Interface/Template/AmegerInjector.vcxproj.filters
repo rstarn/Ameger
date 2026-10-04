@@ -1,0 +1,131 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <Filter Include="Core">
+      <UniqueIdentifier>{4FC737F1-C7A5-4376-A066-2A32D752A2FF}</UniqueIdentifier>
+      <Extensions>h;hh;hpp;hxx;hm;inl;inc;ipp;xsd;cpp;c;cc;cxx</Extensions>
+    </Filter>
+    <Filter Include="Core\Foundation">
+      <UniqueIdentifier>{A3F1B2C4-D5E6-4789-AB12-CD34EF56AB78}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Core\Foundation\Primitives">
+      <UniqueIdentifier>{E1A2B3C4-D5E6-4789-AB12-CD34EF56AB79}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Core\Foundation\Primitives\KcStrings">
+      <UniqueIdentifier>{5C6D7E8F-9012-4345-6B7C-8D9E0F1A2B34}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Core\Foundation\Primitives\KcStrings\Core">
+      <UniqueIdentifier>{6D7E8F90-1234-4567-8C9D-0E1F2A3B4C56}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Core\Utility">
+      <UniqueIdentifier>{B4C2D3E5-0718-49AB-CD34-EF56A078C291}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Core\Utility\Header">
+      <UniqueIdentifier>{C6E4F507-1829-4ABC-EF56-07189A3B4C2D}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Core\Utility\PE">
+      <UniqueIdentifier>{D8F5A619-293B-4CDE-9F57-182A4B5C6D7E}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Core\Utility\Tools">
+      <UniqueIdentifier>{D7F50818-293A-4BCD-AB34-EF56A078C291}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="NT">
+      <UniqueIdentifier>{93995380-89BD-4b04-88EB-625FBE52EBFB}</UniqueIdentifier>
+      <Extensions>h;hh;hpp;hxx;hm;inl;inc;ipp;xsd</Extensions>
+    </Filter>
+    <Filter Include="System">
+      <UniqueIdentifier>{67DA6AB6-F800-4c08-8B7A-83BB121AAD01}</UniqueIdentifier>
+      <Extensions>h;hh;hpp;hxx;hm;inl;inc;ipp;xsd;cpp;c;cc;cxx</Extensions>
+    </Filter>
+    <Filter Include="System\Download">
+      <UniqueIdentifier>{B4C2D3E5-F607-489A-BC23-DE45F607B189}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="System\Handle">
+      <UniqueIdentifier>{C9D3E4F6-1829-49AB-CD34-EF56A078C292}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="System\Import">
+      <UniqueIdentifier>{C5D3E4F6-0718-49AB-CD34-EF56A078C290}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="System\Information">
+      <UniqueIdentifier>{D6E4F507-1829-4ABC-DE45-F607189D3A1}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="System\Symbol">
+      <UniqueIdentifier>{E7F50818-293A-4BCD-EF56-07189A3B4C2}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="System\Symbol\Loader">
+      <UniqueIdentifier>{18293A4B-5C6D-4E0F-1829-3A4B5C6D7E8F}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="System\Symbol\Parser">
+      <UniqueIdentifier>{293A4B5C-6D7E-4F10-293A-4B5C6D7E8F90}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="System\Symbol\Offsets">
+      <UniqueIdentifier>{3A4B5C6D-7E8F-4123-8F90-4B5C6D7E8F91}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Injection">
+      <UniqueIdentifier>{5ff20698-973e-477d-8c08-22f6451b3cee}</UniqueIdentifier>
+      <Extensions>h;hh;hpp;hxx;hm;inl;inc;ipp;xsd;cpp;c;cc;cxx</Extensions>
+    </Filter>
+    <Filter Include="Injection\ManualMapping">
+      <UniqueIdentifier>{F8051929-3A4B-4CDE-F607-189A3B4C5D6}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Execution">
+      <UniqueIdentifier>{d5fa2704-bd0a-49aa-935a-dd175543f290}</UniqueIdentifier>
+      <Extensions>h;hh;hpp;hxx;hm;inl;inc;ipp;xsd;cpp;c;cc;cxx</Extensions>
+    </Filter>
+    <Filter Include="Execution\Routine">
+      <UniqueIdentifier>{3A4B5C6D-7E8F-4012-3A4B-5C6D7E8F90A1}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Execution\Stub">
+      <UniqueIdentifier>{4B5C6D7E-8F90-4123-4A5B-6C7D8E9F0A12}</UniqueIdentifier>
+    </Filter>
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="..\..\Ameger\Core\Foundation\Error.h"><Filter>Core\Foundation</Filter></ClInclude>
+    <ClInclude Include="..\..\Ameger\Core\Foundation\Primitives\InjectionTypes.h"><Filter>Core\Foundation\Primitives</Filter></ClInclude>
+    <ClInclude Include="..\..\Ameger\Core\Foundation\Primitives\ResourceGuard.h"><Filter>Core\Foundation\Primitives</Filter></ClInclude>
+    <ClInclude Include="..\..\Ameger\Core\Foundation\Primitives\KcStrings\Core\DomainKey.h"><Filter>Core\Foundation\Primitives\KcStrings\Core</Filter></ClInclude>
+    <ClInclude Include="..\..\Ameger\Core\Foundation\Primitives\KcStrings\Core\XorString.h"><Filter>Core\Foundation\Primitives\KcStrings\Core</Filter></ClInclude>
+    <ClInclude Include="..\..\Ameger\Core\Foundation\Primitives\KcStrings\Core\KcStrSuite.h"><Filter>Core\Foundation\Primitives\KcStrings\Core</Filter></ClInclude>
+    <ClInclude Include="..\..\Ameger\Core\Foundation\Primitives\KcStrings\KcNarrow.h"><Filter>Core\Foundation\Primitives\KcStrings</Filter></ClInclude>
+    <ClInclude Include="..\..\Ameger\Core\Foundation\Primitives\KcStrings\KcWide.h"><Filter>Core\Foundation\Primitives\KcStrings</Filter></ClInclude>
+    <ClInclude Include="..\..\Ameger\Core\Foundation\Primitives\KcStrings\KcStack.h"><Filter>Core\Foundation\Primitives\KcStrings</Filter></ClInclude>
+    <ClInclude Include="..\..\Ameger\Core\Foundation\Primitives\KcStrings\KcLayered.h"><Filter>Core\Foundation\Primitives\KcStrings</Filter></ClInclude>
+    <ClInclude Include="..\..\Ameger\Core\Utility\PE\PEImage.h"><Filter>Core\Utility\PE</Filter></ClInclude>
+    <ClInclude Include="..\..\Ameger\Core\Utility\Tools\Tools.h"><Filter>Core\Utility\Tools</Filter></ClInclude>
+    <ClInclude Include="..\..\Ameger\Injection\Injection.h"><Filter>Injection</Filter></ClInclude>
+    <ClInclude Include="..\..\Ameger\NT\Windows11.h"><Filter>NT</Filter></ClInclude>
+    <ClInclude Include="..\..\Ameger\NT\NTFunctions.h"><Filter>NT</Filter></ClInclude>
+    <ClInclude Include="..\..\Ameger\Execution\Routine\StartRoutine.h"><Filter>Execution\Routine</Filter></ClInclude>
+    <ClInclude Include="..\..\Ameger\Execution\Stub\RemoteShell.inc"><Filter>Execution\Stub</Filter></ClInclude>
+    <ClInclude Include="..\..\Ameger\System\Symbol\Loader\SymbolLoader.h"><Filter>System\Symbol\Loader</Filter></ClInclude>
+    <ClInclude Include="..\..\Ameger\System\Symbol\Parser\SymbolParser.h"><Filter>System\Symbol\Parser</Filter></ClInclude>
+    <ClInclude Include="..\..\Ameger\System\Symbol\Offsets\DynamicOffsets.h"><Filter>System\Symbol\Offsets</Filter></ClInclude>
+    <ClInclude Include="..\..\Ameger\System\Import\ImportHandler.h"><Filter>System\Import</Filter></ClInclude>
+    <ClInclude Include="..\..\Ameger\NT\NTDefinitions.h"><Filter>NT</Filter></ClInclude>
+    <ClInclude Include="..\..\Ameger\System\Download\DownloadManager.h"><Filter>System\Download</Filter></ClInclude>
+    <ClInclude Include="..\..\Ameger\System\Handle\HandleHijack.h"><Filter>System\Handle</Filter></ClInclude>
+    <ClInclude Include="..\..\Ameger\Core\Utility\Header\PrecompiledHeader.h"><Filter>Core\Utility\Header</Filter></ClInclude>
+    <ClInclude Include="..\..\Ameger\Injection\ManualMapping\ManualMappingCore.h"><Filter>Injection\ManualMapping</Filter></ClInclude>
+    <ClInclude Include="..\..\Ameger\System\Information\ProcessInformation.h"><Filter>System\Information</Filter></ClInclude>
+    <ClInclude Include="..\..\Ameger\Injection\ManualMapping\ManualMappingInternal.h"><Filter>Injection\ManualMapping</Filter></ClInclude>
+  </ItemGroup>
+  <ItemGroup>
+    <MASM Include="..\..\Ameger\Execution\Stub\RemoteThreadHijack.asm"><Filter>Execution\Stub</Filter></MASM>
+  </ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="..\..\Ameger\Core\Utility\Header\PrecompiledHeader.cpp"><Filter>Core\Utility\Header</Filter></ClCompile>
+    <ClCompile Include="..\..\Ameger\Core\Foundation\Main.cpp"><Filter>Core\Foundation</Filter></ClCompile>
+    <ClCompile Include="..\..\Ameger\Core\Utility\Tools\Tools.cpp"><Filter>Core\Utility\Tools</Filter></ClCompile>
+    <ClCompile Include="..\..\Ameger\Injection\Injection.cpp"><Filter>Injection</Filter></ClCompile>
+    <ClCompile Include="..\..\Ameger\System\Import\ImportHandler.cpp"><Filter>System\Import</Filter></ClCompile>
+    <ClCompile Include="..\..\Ameger\Execution\Routine\StartRoutine.cpp"><Filter>Execution\Routine</Filter></ClCompile>
+    <ClCompile Include="..\..\Ameger\System\Symbol\Loader\SymbolLoader.cpp"><Filter>System\Symbol\Loader</Filter></ClCompile>
+    <ClCompile Include="..\..\Ameger\System\Symbol\Parser\SymbolParser.cpp"><Filter>System\Symbol\Parser</Filter></ClCompile>
+    <ClCompile Include="..\..\Ameger\System\Symbol\Offsets\DynamicOffsets.cpp"><Filter>System\Symbol\Offsets</Filter></ClCompile>
+    <ClCompile Include="..\..\Ameger\System\Download\DownloadManager.cpp"><Filter>System\Download</Filter></ClCompile>
+    <ClCompile Include="..\..\Ameger\System\Handle\HandleHijack.cpp"><Filter>System\Handle</Filter></ClCompile>
+    <ClCompile Include="..\..\Ameger\Injection\ManualMapping\ManualMapping.cpp"><Filter>Injection\ManualMapping</Filter></ClCompile>
+    <ClCompile Include="..\..\Ameger\Execution\ThreadHijacking.cpp"><Filter>Execution</Filter></ClCompile>
+    <ClCompile Include="..\..\Ameger\System\Information\ProcessInformation.cpp"><Filter>System\Information</Filter></ClCompile>
+  </ItemGroup>
+</Project>

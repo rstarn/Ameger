@@ -1,0 +1,68 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Release|x64">
+      <Configuration>Release</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+  <PropertyGroup Label="Globals">
+    <ProjectGuid>{B7B2D6C1-7D8E-4F90-9A0B-1C2D3E4F5061}</ProjectGuid>
+    <RootNamespace>AmegerInjectorInterface</RootNamespace>
+    <ProjectName>Interface</ProjectName>
+    <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'" Label="Configuration">
+    <ConfigurationType>Application</ConfigurationType>
+    <UseDebugLibraries>false</UseDebugLibraries>
+    <PlatformToolset>v143</PlatformToolset>
+    <WholeProgramOptimization>true</WholeProgramOptimization>
+    <CharacterSet>Unicode</CharacterSet>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <ImportGroup Label="ExtensionSettings" />
+  <ImportGroup Label="Shared" />
+  <ImportGroup Label="PropertySheets" />
+  <PropertyGroup Label="UserMacros" />
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <OutDir>$(ProjectDir)..\..\Build\$(Configuration)\</OutDir>
+    <IntDir>$(ProjectDir)..\..\Build\obj\Interface\$(Configuration)\$(PlatformShortName)\</IntDir>
+    <TargetName>Injector - $(PlatformShortName)</TargetName>
+    <AmegerRuntimeHash0>0</AmegerRuntimeHash0>
+    <AmegerRuntimeHash1>0</AmegerRuntimeHash1>
+    <AmegerRuntimeHash2>0</AmegerRuntimeHash2>
+    <AmegerRuntimeHash3>0</AmegerRuntimeHash3>
+    <AmegerRuntimeHash4>0</AmegerRuntimeHash4>
+    <AmegerRuntimeHash5>0</AmegerRuntimeHash5>
+    <AmegerRuntimeHash6>0</AmegerRuntimeHash6>
+    <AmegerRuntimeHash7>0</AmegerRuntimeHash7>
+  </PropertyGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <ClCompile>
+      <WarningLevel>Level4</WarningLevel>
+      <TreatWarningAsError>true</TreatWarningAsError>
+      <ConformanceMode>true</ConformanceMode>
+      <LanguageStandard>stdcpp20</LanguageStandard>
+      <Optimization>MaxSpeed</Optimization>
+      <FunctionLevelLinking>true</FunctionLevelLinking>
+      <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
+      <DebugInformationFormat>None</DebugInformationFormat>
+      <PreprocessorDefinitions>AMEGER_RUNTIME_DLL_HASH0=$(AmegerRuntimeHash0);AMEGER_RUNTIME_DLL_HASH1=$(AmegerRuntimeHash1);AMEGER_RUNTIME_DLL_HASH2=$(AmegerRuntimeHash2);AMEGER_RUNTIME_DLL_HASH3=$(AmegerRuntimeHash3);AMEGER_RUNTIME_DLL_HASH4=$(AmegerRuntimeHash4);AMEGER_RUNTIME_DLL_HASH5=$(AmegerRuntimeHash5);AMEGER_RUNTIME_DLL_HASH6=$(AmegerRuntimeHash6);AMEGER_RUNTIME_DLL_HASH7=$(AmegerRuntimeHash7);%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <AdditionalIncludeDirectories>$(ProjectDir)..\..;$(ProjectDir)..\..\Ameger;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <Link>
+      <SubSystem>Console</SubSystem>
+      <UACExecutionLevel>RequireAdministrator</UACExecutionLevel>
+      <EnableCOMDATFolding>true</EnableCOMDATFolding>
+      <OptimizeReferences>true</OptimizeReferences>
+      <GenerateDebugInformation>false</GenerateDebugInformation>
+    </Link>
+  </ItemDefinitionGroup>
+  <ItemGroup>
+    <ClCompile Include="..\Source\Main.cpp" />
+  </ItemGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+  <ImportGroup Label="ExtensionTargets" />
+</Project>

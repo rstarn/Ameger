@@ -1,0 +1,11 @@
+tools:
+    shell:
+        allow:
+            - ls *
+            - find *
+            - head *
+            - Get-ChildItem *
+            - Select-Object Name, Mode, *
+            - Where-Object { *
+            - Select-Object FullName
+            - Get-Content *

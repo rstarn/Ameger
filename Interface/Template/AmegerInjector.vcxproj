@@ -1,0 +1,120 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" ToolsVersion="15.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Release|x64">
+      <Configuration>Release</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+  <PropertyGroup Label="Globals">
+    <VCProjectVersion>15.0</VCProjectVersion>
+    <ProjectGuid>{AC732425-E265-40FF-842F-C59CECE9A96C}</ProjectGuid>
+    <RootNamespace>AmegerInjector</RootNamespace>
+    <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\BuildCustomizations\masm.props" />
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'" Label="Configuration">
+    <ConfigurationType>DynamicLibrary</ConfigurationType>
+    <UseDebugLibraries>false</UseDebugLibraries>
+    <PlatformToolset>v143</PlatformToolset>
+    <WholeProgramOptimization>true</WholeProgramOptimization>
+    <CharacterSet>Unicode</CharacterSet>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <ImportGroup Label="ExtensionSettings">
+  </ImportGroup>
+  <ImportGroup Label="Shared">
+  </ImportGroup>
+  <ImportGroup Label="PropertySheets" Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
+  </ImportGroup>
+  <PropertyGroup Label="UserMacros" />
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <OutDir>$(ProjectDir)..\..\Build\$(Configuration)\</OutDir>
+    <TargetName>Ameger Injector - $(PlatformShortName)</TargetName>
+    <IntDir>$(ProjectDir)..\..\Build\obj\Ameger\$(Configuration)\$(PlatformShortName)\</IntDir>
+    <LinkIncremental>false</LinkIncremental>
+    <AmegerMmapSentinel>1337</AmegerMmapSentinel>
+  </PropertyGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <ClCompile>
+      <PreprocessorDefinitions>AMEGER_MMAP_SENTINEL=$(AmegerMmapSentinel);%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <WarningLevel>Level4</WarningLevel>
+      <ConformanceMode>true</ConformanceMode>
+      <DebugInformationFormat>None</DebugInformationFormat>
+      <TreatWarningAsError>true</TreatWarningAsError>
+      <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
+      <PrecompiledHeader>Use</PrecompiledHeader>
+      <PrecompiledHeaderFile>Core/Utility/Header/PrecompiledHeader.h</PrecompiledHeaderFile>
+      <AdditionalIncludeDirectories>$(ProjectDir)..\..\Ameger\;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <LanguageStandard>stdcpp20</LanguageStandard>
+      <BufferSecurityCheck>false</BufferSecurityCheck>
+      <ControlFlowGuard>false</ControlFlowGuard>
+      <Optimization>MaxSpeed</Optimization>
+    </ClCompile>
+    <MASM>
+      <AdditionalIncludeDirectories>$(ProjectDir)..\..\Ameger\Execution\Stub\;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+    </MASM>
+    <Link>
+      <GenerateDebugInformation>false</GenerateDebugInformation>
+      <SubSystem>Windows</SubSystem>
+    </Link>
+  </ItemDefinitionGroup>
+  <ItemGroup>
+    <ClInclude Include="..\..\Ameger\Core\Foundation\Error.h" />
+    <ClInclude Include="..\..\Ameger\Core\Foundation\Primitives\InjectionTypes.h" />
+    <ClInclude Include="..\..\Ameger\Core\Foundation\Primitives\ResourceGuard.h" />
+    <ClInclude Include="..\..\Ameger\Core\Foundation\Primitives\KcStrings\Core\DomainKey.h" />
+    <ClInclude Include="..\..\Ameger\Core\Foundation\Primitives\KcStrings\Core\XorString.h" />
+    <ClInclude Include="..\..\Ameger\Core\Foundation\Primitives\KcStrings\Core\KcStrSuite.h" />
+    <ClInclude Include="..\..\Ameger\Core\Foundation\Primitives\KcStrings\KcNarrow.h" />
+    <ClInclude Include="..\..\Ameger\Core\Foundation\Primitives\KcStrings\KcWide.h" />
+    <ClInclude Include="..\..\Ameger\Core\Foundation\Primitives\KcStrings\KcStack.h" />
+    <ClInclude Include="..\..\Ameger\Core\Foundation\Primitives\KcStrings\KcLayered.h" />
+    <ClInclude Include="..\..\Ameger\Core\Utility\PE\PEImage.h" />
+    <ClInclude Include="..\..\Ameger\Core\Utility\Tools\Tools.h" />
+    <ClInclude Include="..\..\Ameger\Injection\Injection.h" />
+    <ClInclude Include="..\..\Ameger\NT\Windows11.h" />
+    <ClInclude Include="..\..\Ameger\NT\NTFunctions.h" />
+    <ClInclude Include="..\..\Ameger\Execution\Routine\StartRoutine.h" />
+    <ClInclude Include="..\..\Ameger\Execution\Stub\RemoteShell.inc" />
+    <ClInclude Include="..\..\Ameger\System\Symbol\Loader\SymbolLoader.h" />
+    <ClInclude Include="..\..\Ameger\System\Symbol\Parser\SymbolParser.h" />
+    <ClInclude Include="..\..\Ameger\System\Symbol\Offsets\DynamicOffsets.h" />
+    <ClInclude Include="..\..\Ameger\System\Import\ImportHandler.h" />
+    <ClInclude Include="..\..\Ameger\NT\NTDefinitions.h" />
+    <ClInclude Include="..\..\Ameger\System\Download\DownloadManager.h" />
+    <ClInclude Include="..\..\Ameger\System\Handle\HandleHijack.h" />
+    <ClInclude Include="..\..\Ameger\Core\Utility\Header\PrecompiledHeader.h" />
+    <ClInclude Include="..\..\Ameger\Injection\ManualMapping\ManualMappingCore.h" />
+    <ClInclude Include="..\..\Ameger\System\Information\ProcessInformation.h" />
+    <ClInclude Include="..\..\Ameger\Injection\ManualMapping\ManualMappingInternal.h" />
+  </ItemGroup>
+  <ItemGroup>
+    <MASM Include="$(MSBuildProjectDirectory)\..\..\Ameger\Execution\Stub\RemoteThreadHijack.asm" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="..\..\Ameger\Core\Utility\Header\PrecompiledHeader.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">Create</PrecompiledHeader>
+      <PrecompiledHeaderFile Condition="'$(Configuration)|$(Platform)'=='Release|x64'">Core/Utility/Header/PrecompiledHeader.h</PrecompiledHeaderFile>
+    </ClCompile>
+    <ClCompile Include="..\..\Ameger\Core\Foundation\Main.cpp" />
+    <ClCompile Include="..\..\Ameger\Core\Utility\Tools\Tools.cpp" />
+    <ClCompile Include="..\..\Ameger\Injection\Injection.cpp" />
+    <ClCompile Include="..\..\Ameger\System\Import\ImportHandler.cpp" />
+    <ClCompile Include="..\..\Ameger\Execution\Routine\StartRoutine.cpp" />
+    <ClCompile Include="..\..\Ameger\System\Symbol\Loader\SymbolLoader.cpp" />
+    <ClCompile Include="..\..\Ameger\System\Symbol\Parser\SymbolParser.cpp" />
+    <ClCompile Include="..\..\Ameger\System\Symbol\Offsets\DynamicOffsets.cpp" />
+    <ClCompile Include="..\..\Ameger\System\Download\DownloadManager.cpp" />
+    <ClCompile Include="..\..\Ameger\System\Handle\HandleHijack.cpp" />
+    <ClCompile Include="..\..\Ameger\Injection\ManualMapping\ManualMapping.cpp" />
+    <ClCompile Include="..\..\Ameger\Execution\ThreadHijacking.cpp" />
+    <ClCompile Include="..\..\Ameger\System\Information\ProcessInformation.cpp" />
+  </ItemGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+  <ImportGroup Label="ExtensionTargets">
+    <Import Project="$(VCTargetsPath)\BuildCustomizations\masm.targets" />
+  </ImportGroup>
+</Project>
