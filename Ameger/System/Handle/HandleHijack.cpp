@@ -451,23 +451,28 @@ namespace
 			// Our own table: duplicate directly, no owner open needed.
 			if (OwnerPid == SelfPid)
 			{
-				HANDLE Direct = nullptr;
+				HANDLE DirectRaw = nullptr;
 				if (!DuplicateHandle(GetCurrentProcess(), SourceValue, GetCurrentProcess(),
-					&Direct, DesiredAccess, FALSE, 0) || !Direct)
+					&DirectRaw, DesiredAccess, FALSE, 0) || !DirectRaw)
 				{
 					++DupDenied;
-					if (Direct)
+					if (DirectRaw)
 					{
-						CloseHandle(Direct);
+						CloseHandle(DirectRaw);
 					}
 
 					return false;
 				}
 
+				// RAII from the moment of acquisition: every later exit -
+				// including an exception thrown while recording the rejected
+				// object - closes the duplicate instead of leaking it.
+				UniqueHandle Direct(DirectRaw);
+
 				++Duplicated;
 				const bool Ok = ThreadScan
-					? VerifyThreadDonor(Direct, TargetPid, TargetTid)
-					: VerifyProcessDonor(Direct, TargetPid);
+					? VerifyThreadDonor(Direct.get(), TargetPid, TargetTid)
+					: VerifyProcessDonor(Direct.get(), TargetPid);
 				if (!Ok)
 				{
 					++VerifyRejected;
@@ -475,15 +480,14 @@ namespace
 					{
 						WrongObjects.insert(ReCa<ULONG_PTR>(Object));
 					}
-					CloseHandle(Direct);
 					return false;
 				}
 
 				FoundDonorPid = OwnerPid;
 				FoundGranted = DesiredAccess;
 				FoundDonorHandle = static_cast<DWORD>(HandleValue);
-				FoundNewHandle = PtrToUlong(Direct);
-				Out = Direct;
+				FoundNewHandle = PtrToUlong(Direct.get());
+				Out = Direct.release();
 				return true;
 			}
 
@@ -533,23 +537,28 @@ namespace
 
 			// Explicit-mask duplication is itself the rights proof: the kernel
 			// refuses unless the donor carried at least the requested mask.
-			HANDLE DuplicatedHandle = nullptr;
+			HANDLE DuplicatedRaw = nullptr;
 			if (!NtOk(Ntdll.NtDuplicateObject(Owner, SourceValue, GetCurrentProcess(),
-				&DuplicatedHandle, DesiredAccess, 0, 0)) || !DuplicatedHandle)
+				&DuplicatedRaw, DesiredAccess, 0, 0)) || !DuplicatedRaw)
 			{
 				++DupDenied;
-				if (DuplicatedHandle)
+				if (DuplicatedRaw)
 				{
-					CloseHandle(DuplicatedHandle);
+					CloseHandle(DuplicatedRaw);
 				}
 
 				return false;
 			}
 
+			// RAII from the moment of acquisition: every later exit - including
+			// an exception thrown while recording the rejected object - closes
+			// the duplicate instead of leaking it.
+			UniqueHandle DuplicatedHandle(DuplicatedRaw);
+
 			++Duplicated;
 			const bool Ok = ThreadScan
-				? VerifyThreadDonor(DuplicatedHandle, TargetPid, TargetTid)
-				: VerifyProcessDonor(DuplicatedHandle, TargetPid);
+				? VerifyThreadDonor(DuplicatedHandle.get(), TargetPid, TargetTid)
+				: VerifyProcessDonor(DuplicatedHandle.get(), TargetPid);
 			if (!Ok)
 			{
 				++VerifyRejected;
@@ -558,15 +567,14 @@ namespace
 					// Same object = same underlying target; never re-dup it.
 					WrongObjects.insert(ReCa<ULONG_PTR>(Object));
 				}
-				CloseHandle(DuplicatedHandle);
 				return false;
 			}
 
 			FoundDonorPid = OwnerPid;
 			FoundGranted = DesiredAccess;
 			FoundDonorHandle = static_cast<DWORD>(HandleValue);
-			FoundNewHandle = PtrToUlong(DuplicatedHandle);
-			Out = DuplicatedHandle;
+			FoundNewHandle = PtrToUlong(DuplicatedHandle.get());
+			Out = DuplicatedHandle.release();
 			return true;
 		};
 
@@ -745,14 +753,32 @@ namespace
 			return Finish(INJ_ERR_HANDLE_HIJACK_FAILED);
 		}
 
+		// Object-type indices are boot-stable: calibrate once per process
+		// lifetime and reuse from the cache afterwards. The cache is read
+		// first so the self-calibration handles below are opened only when a
+		// calibration is actually needed.
+		USHORT WantedType = (ThreadScan ? g_CachedThreadType : g_CachedProcessType).load(std::memory_order_acquire);
+		bool HaveType = WantedType != 0;
+
 		// Calibrators are opened BEFORE the single enumeration so they are
 		// guaranteed to exist in it (a fresh Open* value cannot be found in
 		// an older snapshot): one enumeration instead of two. SeDebugPrivilege
 		// is intentionally NOT enabled here - the owner cache enables it
 		// lazily on the first open failure, so the common path never touches
 		// the token at all.
-		UniqueHandle SelfProc(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, SelfPid));
-		UniqueHandle SelfThread(OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, GetCurrentThreadId()));
+		UniqueHandle SelfProc;
+		UniqueHandle SelfThread;
+		if (!HaveType)
+		{
+			if (ThreadScan)
+			{
+				SelfThread.reset(OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, GetCurrentThreadId()));
+			}
+			else
+			{
+				SelfProc.reset(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, SelfPid));
+			}
+		}
 
 		EnumSnapshot Snap{ };
 		NTSTATUS SnapStatus = 0;
@@ -764,11 +790,6 @@ namespace
 		}
 
 		Local.SnapStatus = static_cast<DWORD>(SnapStatus);
-
-		// Object-type indices are boot-stable: calibrate once per process
-		// lifetime and reuse from the cache afterwards.
-		USHORT WantedType = (ThreadScan ? g_CachedThreadType : g_CachedProcessType).load(std::memory_order_acquire);
-		bool HaveType = WantedType != 0;
 
 		if (!HaveType && !ThreadScan && SelfProc)
 		{

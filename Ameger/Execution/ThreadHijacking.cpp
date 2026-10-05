@@ -13,6 +13,78 @@ static THREAD_EXEC_STATS g_ThreadExecStats{};
 
 namespace
 {
+	// g_ThreadExecStats is written by the injection thread (field by field,
+	// plus ResetThreadExecStats) and read by the export/UI thread through
+	// GetLastThreadExecStats with no other synchronization, exactly like the
+	// g_LastMapStats slots in ManualMapping.cpp. A plain 40-byte struct copy is
+	// not atomic, so every whole-struct store/load goes through
+	// InterlockedExchange / InterlockedCompareExchange, and each field store is
+	// an InterlockedExchange - a compiler intrinsic on x64, no new import.
+	// THREAD_EXEC_STATS is ten DWORDs (static_assert in InjectionTypes.h), so a
+	// LONG-stride walk covers it exactly.
+	void StoreThreadExecStat(DWORD & Field, DWORD Value)
+	{
+		InterlockedExchange(ReCa<volatile LONG *>(&Field), static_cast<LONG>(Value));
+	}
+
+	void StoreThreadExecStats(const THREAD_EXEC_STATS & Src)
+	{
+		static_assert(sizeof(THREAD_EXEC_STATS) % sizeof(LONG) == 0, "THREAD_EXEC_STATS must be a whole number of LONGs");
+
+		volatile LONG * dst = ReCa<volatile LONG *>(&g_ThreadExecStats);
+		const LONG * src = ReCa<const LONG *>(&Src);
+		for (size_t i = 0; i < sizeof(THREAD_EXEC_STATS) / sizeof(LONG); ++i)
+		{
+			InterlockedExchange(&dst[i], src[i]);
+		}
+	}
+
+	void LoadThreadExecStats(THREAD_EXEC_STATS & Dst)
+	{
+		volatile LONG * src = ReCa<volatile LONG *>(&g_ThreadExecStats);
+		LONG * dst = ReCa<LONG *>(&Dst);
+		for (size_t i = 0; i < sizeof(THREAD_EXEC_STATS) / sizeof(LONG); ++i)
+		{
+			dst[i] = InterlockedCompareExchange(&src[i], 0, 0);
+		}
+	}
+
+	// Secure-wipe the W^X hijack stub before its RemoteAllocation guard
+	// releases it. The block holds the staged shellcode and the SR_REMOTE_DATA
+	// state (pArg/pRoutine), and its code page is RX, so it is promoted to RW
+	// first (never RWX; the block is released immediately after, so the
+	// temporary protection is not restored). The write is bounded and
+	// non-throwing: a failed protect or write leaves the block for the guard to
+	// free exactly as before.
+	void ScrubRemoteRegion(HANDLE hTargetProc, void * base, SIZE_T size)
+	{
+		if (!hTargetProc || hTargetProc == INVALID_HANDLE_VALUE || !base || !size)
+		{
+			return;
+		}
+
+		DWORD old_protect = 0;
+		if (!VirtualProtectEx(hTargetProc, base, size, PAGE_READWRITE, &old_protect))
+		{
+			return;
+		}
+
+		BYTE zeros[0x2000] = { 0 };
+		BYTE * cursor = ReCa<BYTE *>(base);
+		SIZE_T remaining = size;
+		while (remaining)
+		{
+			const SIZE_T chunk = remaining < sizeof(zeros) ? remaining : sizeof(zeros);
+			if (!WriteProcessMemory(hTargetProc, cursor, zeros, chunk, nullptr))
+			{
+				return;
+			}
+
+			cursor += chunk;
+			remaining -= chunk;
+		}
+	}
+
 	// Handle-needing probes per search pass. GetTEB (worker check) and the
 	// alertable check each OpenThread on a target thread, so an unbounded walk
 	// opened a game-thread handle for every candidate in the process - a
@@ -427,6 +499,17 @@ DWORD SR_HijackThread(HANDLE hTargetProc, f_Routine pRoutine, void * pArg, DWORD
 	// the target exits).
 	RemoteAllocation allocation_guard(hTargetProc, pMem);
 
+	// Wipe the stub before the guard releases it, but only when the guard will
+	// actually free it: on the recovery paths below the guard is release()d
+	// (the stub may still be executing from the block, or the thread is parked
+	// inside it) and the wipe is skipped, preserving the documented leak.
+	auto scrub_guard = MakeScopeExit([&]() noexcept {
+		if (allocation_guard.get())
+		{
+			ScrubRemoteRegion(hTargetProc, pMem, kWxAllocSize);
+		}
+	});
+
 	const ULONG_PTR shellcode_begin = reinterpret_cast<ULONG_PTR>(RemoteThreadHijackBegin);
 	const ULONG_PTR shellcode_end = reinterpret_cast<ULONG_PTR>(RemoteThreadHijackEnd);
 	const size_t shellcode_size = static_cast<size_t>(shellcode_end - shellcode_begin);
@@ -568,8 +651,8 @@ DWORD SR_HijackThread(HANDLE hTargetProc, f_Routine pRoutine, void * pArg, DWORD
 	CONTEXT OldContext{ 0 };
 	OldContext.ContextFlags = CONTEXT_ALL;
 
-	g_ThreadExecStats.Attempted = 1;
-	g_ThreadExecStats.HijackedTid = ThreadID;
+	StoreThreadExecStat(g_ThreadExecStats.Attempted, 1);
+	StoreThreadExecStat(g_ThreadExecStats.HijackedTid, ThreadID);
 
 	if (!GetThreadContext(hThread, &OldContext))
 	{
@@ -586,9 +669,7 @@ DWORD SR_HijackThread(HANDLE hTargetProc, f_Routine pRoutine, void * pArg, DWORD
 	// Recorded only after the capture actually succeeded, so the host reports
 	// whether the original context was captured rather than asserting a
 	// restore happened.
-	g_ThreadExecStats.ContextSaved = 1;
-
-	g_ThreadExecStats.ContextSaved = 1;
+	StoreThreadExecStat(g_ThreadExecStats.ContextSaved, 1);
 
 	// The stub body (alloc, patch) is already staged above while the victim
 	// ran free; only the ReturnTarget slot needs the captured RIP, so it is
@@ -706,8 +787,8 @@ DWORD SR_HijackThread(HANDLE hTargetProc, f_Routine pRoutine, void * pArg, DWORD
 
 	// 0 means the thread had actually been suspended, so the hijack is complete
 	// from the loader's point of view. The RIP is restored by the remote shell.
-	g_ThreadExecStats.Resumed = 1;
-	g_ThreadExecStats.SuspendCount = sr_resume;
+	StoreThreadExecStat(g_ThreadExecStats.Resumed, 1);
+	StoreThreadExecStat(g_ThreadExecStats.SuspendCount, sr_resume);
 
 	(void)PostThreadMessageW(ThreadID, WM_NULL, 0, 0);
 
@@ -720,42 +801,75 @@ DWORD SR_HijackThread(HANDLE hTargetProc, f_Routine pRoutine, void * pArg, DWORD
 
 	LOG(2, "Entering wait state\n");
 
-	// Forced recovery for the error paths below. Only reinstate the saved RIP
-	// when the thread is actually parked inside the stub code page: writing it
-	// blindly (the old behaviour) could relocate a thread that had already left
-	// the stub and was executing elsewhere. Mirrors the post-hoc check.
+	// Forced recovery for the error paths below. The saved RIP is only written
+	// back when the stub's own frame is provably unwound - either the thread
+	// already left the code page, or its RSP is back at the captured baseline,
+	// which the stub reaches only before its first push or after popping every
+	// register (immediately before the final jmp [ReturnTarget]). Mid-call the
+	// RSP sits in the stub's aligned scratch frame and the victim's registers
+	// are clobbered, so relocating RIP there would resume the victim with a
+	// corrupt stack (the "ghost thread" crash). The state read that selected
+	// this path may be stale, so a bounded re-poll first gives the stub a few
+	// chances to finish on its own. When the frame is not unwound the thread is
+	// resumed untouched and reported not-restored, which escalates to the
+	// existing recovery-required path instead of a blind forced restore. Every
+	// iteration balances exactly one SuspendThread with one ResumeThread.
+	constexpr int kForceRestorePolls = 3;
 	auto ForceRestoreContext = [&](bool & restored, bool & resumed) -> void
 	{
 		restored = false;
 		resumed = false;
 
-		if (SuspendThread(hThread) == (DWORD)-1)
-		{
-			return;
-		}
+		const ULONG_PTR code_base = ReCa<ULONG_PTR>(pCode);
+		const ULONG_PTR code_end = code_base + kWxCodePage;
 
-		CONTEXT ctx{ 0 };
-		ctx.ContextFlags = CONTEXT_CONTROL;
-		if (GetThreadContext(hThread, &ctx))
+		for (int poll = 0; poll < kForceRestorePolls; ++poll)
 		{
-			const ULONG_PTR code_base = ReCa<ULONG_PTR>(pCode);
-			const ULONG_PTR code_end = code_base + kWxCodePage;
-			if (ctx.Rip < code_base || ctx.Rip >= code_end)
+			if (poll > 0)
 			{
-				// Already outside the stub: the shell restored the context itself.
-				restored = true;
+				Sleep(2);
 			}
-			else
-			{
-				ctx.Rip = OldRIP;
-				restored = SetThreadContext(hThread, &ctx) != FALSE;
-			}
-		}
 
-		resumed = ResumeThread(hThread) != (DWORD)-1;
-		if (!resumed)
-		{
-			restored = false;
+			if (SuspendThread(hThread) == (DWORD)-1)
+			{
+				// Thread is gone: it can no longer be running our code.
+				return;
+			}
+
+			CONTEXT ctx{ 0 };
+			ctx.ContextFlags = CONTEXT_CONTROL;
+			bool settled = false;
+			if (GetThreadContext(hThread, &ctx))
+			{
+				if (ctx.Rip < code_base || ctx.Rip >= code_end)
+				{
+					// Already outside the stub: the shell restored the context itself.
+					restored = true;
+					settled = true;
+				}
+				else if (ctx.Rsp == OldContext.Rsp)
+				{
+					// Frame unwound (or never pushed): the only in-code-page
+					// state where relocating RIP is safe.
+					ctx.Rip = OldRIP;
+					restored = SetThreadContext(hThread, &ctx) != FALSE;
+					settled = true;
+				}
+				// else: still inside the stub with an inconsistent stack; leave
+				// RIP alone and re-poll.
+			}
+
+			resumed = ResumeThread(hThread) != (DWORD)-1;
+			if (!resumed)
+			{
+				restored = false;
+				return;
+			}
+
+			if (settled)
+			{
+				return;
+			}
 		}
 	};
 
@@ -798,16 +912,19 @@ DWORD SR_HijackThread(HANDLE hTargetProc, f_Routine pRoutine, void * pArg, DWORD
 			}
 
 			// The interrupt path reinstates the saved context from here, unlike
-			// the normal path where the remote shell does it. Also unverified.
-			g_ThreadExecStats.ContextRestored = context_restored ? 1 : 0;
-			g_ThreadExecStats.Resumed = resumed ? 1 : 0;
-			g_ThreadExecStats.Success = (context_restored && resumed) ? 1 : 0;
-			g_ThreadExecStats.RestoreMode = 2;
-			g_ThreadExecStats.FailCode = error_data.AdvErrorCode;
+			// the normal path where the remote shell does it. Only a restore
+			// that observed the stub frame unwound counts; a thread still inside
+			// the stub means the shell may still be live, so escalate to
+			// recovery-required instead of claiming a clean abort.
+			StoreThreadExecStat(g_ThreadExecStats.ContextRestored, context_restored ? 1 : 0);
+			StoreThreadExecStat(g_ThreadExecStats.Resumed, resumed ? 1 : 0);
+			StoreThreadExecStat(g_ThreadExecStats.Success, (context_restored && resumed) ? 1 : 0);
+			StoreThreadExecStat(g_ThreadExecStats.RestoreMode, 2);
+			StoreThreadExecStat(g_ThreadExecStats.FailCode, context_restored ? error_data.AdvErrorCode : SR_HT_ERR_RECOVERY_REQUIRED);
 
 			SetEvent(g_hInterruptedEvent);
 
-			return resumed ? SR_ERR_INTERRUPT : SR_HT_ERR_RECOVERY_REQUIRED;
+			return context_restored ? SR_ERR_INTERRUPT : SR_HT_ERR_RECOVERY_REQUIRED;
 		}
 
 		if (!bRet)
@@ -846,15 +963,18 @@ DWORD SR_HijackThread(HANDLE hTargetProc, f_Routine pRoutine, void * pArg, DWORD
 			allocation_guard.release();
 		}
 
-		// Forced recovery: OldRIP is written back without confirming where the
-		// thread actually ended up, so the mode is recorded as unverified.
-		g_ThreadExecStats.ContextRestored = context_restored ? 1 : 0;
-		g_ThreadExecStats.Resumed = resumed ? 1 : 0;
-		g_ThreadExecStats.Success = (context_restored && resumed) ? 1 : 0;
-		g_ThreadExecStats.RestoreMode = 2;
-		g_ThreadExecStats.FailCode = SR_HT_ERR_RPM_FAIL;
+		// Forced recovery is only performed when the stub frame was observed
+		// unwound (see ForceRestoreContext). A thread still inside the stub is
+		// left running, so the mode stays unverified and the outcome escalates
+		// to recovery-required rather than reporting a restore that did not
+		// happen.
+		StoreThreadExecStat(g_ThreadExecStats.ContextRestored, context_restored ? 1 : 0);
+		StoreThreadExecStat(g_ThreadExecStats.Resumed, resumed ? 1 : 0);
+		StoreThreadExecStat(g_ThreadExecStats.Success, (context_restored && resumed) ? 1 : 0);
+		StoreThreadExecStat(g_ThreadExecStats.RestoreMode, 2);
+		StoreThreadExecStat(g_ThreadExecStats.FailCode, context_restored ? SR_HT_ERR_RPM_FAIL : SR_HT_ERR_RECOVERY_REQUIRED);
 
-		return resumed ? SR_HT_ERR_RPM_FAIL : SR_HT_ERR_RECOVERY_REQUIRED;
+		return context_restored ? SR_HT_ERR_RPM_FAIL : SR_HT_ERR_RECOVERY_REQUIRED;
 		}
 
 	}
@@ -877,14 +997,17 @@ DWORD SR_HijackThread(HANDLE hTargetProc, f_Routine pRoutine, void * pArg, DWORD
 			allocation_guard.release();
 		}
 
-		// Forced recovery, same as the RPM-failure path: not verified.
-		g_ThreadExecStats.ContextRestored = context_restored ? 1 : 0;
-		g_ThreadExecStats.Resumed = resumed ? 1 : 0;
-		g_ThreadExecStats.Success = (context_restored && resumed) ? 1 : 0;
-		g_ThreadExecStats.RestoreMode = 2;
-		g_ThreadExecStats.FailCode = resumed ? SR_HT_ERR_REMOTE_PENDING_TIMEOUT : SR_HT_ERR_RECOVERY_REQUIRED;
+		// Forced recovery, same as the RPM-failure path: only a restore that
+		// observed the stub frame unwound is reported as pending-timeout; a
+		// thread still inside the stub escalates to recovery-required because
+		// the shell may still be live in the target.
+		StoreThreadExecStat(g_ThreadExecStats.ContextRestored, context_restored ? 1 : 0);
+		StoreThreadExecStat(g_ThreadExecStats.Resumed, resumed ? 1 : 0);
+		StoreThreadExecStat(g_ThreadExecStats.Success, (context_restored && resumed) ? 1 : 0);
+		StoreThreadExecStat(g_ThreadExecStats.RestoreMode, 2);
+		StoreThreadExecStat(g_ThreadExecStats.FailCode, context_restored ? SR_HT_ERR_REMOTE_PENDING_TIMEOUT : SR_HT_ERR_RECOVERY_REQUIRED);
 
-		if (resumed)
+		if (context_restored)
 		{
 			return SR_HT_ERR_REMOTE_PENDING_TIMEOUT;
 		}
@@ -929,8 +1052,11 @@ DWORD SR_HijackThread(HANDLE hTargetProc, f_Routine pRoutine, void * pArg, DWORD
 			{
 				context_restored = true;
 			}
-			else
+			else if (check_context.Rsp == OldContext.Rsp)
 			{
+				// Frame unwound (all registers popped, or none pushed yet): the
+				// only in-code-page state where relocating RIP is safe. A thread
+				// mid-frame is left for the next retry, then escalates.
 				check_context.Rip = OldRIP;
 				context_restored = SetThreadContext(hThread, &check_context) != FALSE;
 			}
@@ -959,20 +1085,23 @@ DWORD SR_HijackThread(HANDLE hTargetProc, f_Routine pRoutine, void * pArg, DWORD
 	}
 
 	// The RIP was observed back outside the hijack code page (or the thread was
-	// already gone, which also means it is no longer running our code). Recorded
-	// here rather than at the call site so the host reports this measured
-	// outcome instead of a hardcoded "restored automatically".
-	g_ThreadExecStats.ContextRestored = context_restored ? 1 : 0;
-	g_ThreadExecStats.Success = context_restored ? 1 : 0;
-	g_ThreadExecStats.RestoreMode = 1; // RIP was observed outside the code page
-	g_ThreadExecStats.FailCode = context_restored ? ERROR_SUCCESS : SR_HT_ERR_RECOVERY_REQUIRED;
+	// already gone, which also means it is no longer running our code), or an
+	// in-page RIP was relocated only after the RSP baseline proved the stub
+	// frame unwound. Recorded here rather than at the call site so the host
+	// reports this measured outcome instead of a hardcoded "restored
+	// automatically".
+	StoreThreadExecStat(g_ThreadExecStats.ContextRestored, context_restored ? 1 : 0);
+	StoreThreadExecStat(g_ThreadExecStats.Success, context_restored ? 1 : 0);
+	StoreThreadExecStat(g_ThreadExecStats.RestoreMode, 1); // verified: RIP outside, or frame-validated in-page restore
+	StoreThreadExecStat(g_ThreadExecStats.FailCode, context_restored ? ERROR_SUCCESS : SR_HT_ERR_RECOVERY_REQUIRED);
 
 	return context_restored ? SR_ERR_SUCCESS : SR_HT_ERR_RECOVERY_REQUIRED;
 }
 
 void ResetThreadExecStats()
 {
-	g_ThreadExecStats = {};
+	const THREAD_EXEC_STATS Empty{};
+	StoreThreadExecStats(Empty);
 }
 
 void __stdcall GetLastThreadExecStats(THREAD_EXEC_STATS * Out)
@@ -981,6 +1110,6 @@ void __stdcall GetLastThreadExecStats(THREAD_EXEC_STATS * Out)
 
 	if (Out)
 	{
-		*Out = g_ThreadExecStats;
+		LoadThreadExecStats(*Out);
 	}
 }

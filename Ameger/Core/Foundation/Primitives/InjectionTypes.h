@@ -92,10 +92,12 @@ struct THREAD_EXEC_STATS
 	DWORD SuspendCount = 0;     // ResumeThread return at the end: 0 = was suspended
 	DWORD FailCode = 0;         // injector error code when Success == 0
 	// How the RIP was put back. The normal path watches the thread until RIP
-	// lands outside the hijack code page; the abort/timeout paths just write
-	// OldRIP back and do not confirm where the thread actually went. Reporting
-	// both as "restored" without this distinction would be an unverified claim.
-	DWORD RestoreMode = 0;      // 1 = verified, 2 = forced (not verified)
+	// lands outside the hijack code page; the abort/timeout paths relocate the
+	// saved RIP only after observing the stub frame unwound (RSP back at the
+	// captured baseline) or the thread already left the code page. Reporting
+	// both as "restored" without this distinction would blur a direct
+	// observation with a frame-validated forced restore.
+	DWORD RestoreMode = 0;      // 1 = verified (RIP observed outside), 2 = forced (frame-validated)
 	DWORD Reserved = 0;
 };
 

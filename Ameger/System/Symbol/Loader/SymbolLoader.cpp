@@ -636,15 +636,40 @@ DWORD SYMBOL_LOADER::Initialize(const std::wstring & szModulePath, const std::ws
 
 		LOG(1, "SYMBOL_LOADER: downloading PDB\n");
 
+		// URLDownloadToCacheFileW has no timeout of its own, so a stalled symbol
+		// server would block runtime initialization forever. Bound the download
+		// with an inactivity deadline enforced by the bind callback's watchdog;
+		// if it cannot be armed, fail closed rather than download unbounded.
+		// 60s matches the connection check above.
+		constexpr DWORD kDownloadInactivityTimeoutMs = 60000;
+		if (!m_DlMgr.SetTimeout(kDownloadInactivityTimeoutMs))
+		{
+			VirtualFree(pLocalImageBase, 0, MEM_RELEASE);
+
+			delete[] pRawData;
+
+			LOG(1, "SYMBOL_LOADER: failed to arm download timeout\n");
+
+			return SYMBOL_ERR_DOWNLOAD_FAILED;
+		}
+
 		// Transient network / CDN failures are common on msdl; a single
 		// URLDownloadToCacheFileW attempt turned every blip into a fatal
 		// SYMBOL_ERR_DOWNLOAD_FAILED. Retry 3x with 1s spacing, honoring
-		// the interrupt event between attempts. E_ABORT stays sticky.
+		// the interrupt event between attempts. E_ABORT stays sticky, and a
+		// timeout stops the retry loop so a stalled server cannot burn the
+		// remaining attempts.
 		HRESULT dl_hr = E_FAIL;
 		wchar_t szCacheFile[MAX_PATH]{ 0 };
 		bool dl_aborted = false;
 		for (int attempt = 1; attempt <= 3; ++attempt)
 		{
+			if (m_DlMgr.TimedOut())
+			{
+				dl_aborted = true;
+				break;
+			}
+
 			szCacheFile[0] = L'\0';
 			dl_hr = URLDownloadToCacheFileW(nullptr, url.c_str(), szCacheFile, sizeof(szCacheFile) / sizeof(szCacheFile[0]), NULL, &m_DlMgr);
 			if (SUCCEEDED(dl_hr))
@@ -652,7 +677,7 @@ DWORD SYMBOL_LOADER::Initialize(const std::wstring & szModulePath, const std::ws
 				break;
 			}
 			LOG(1, "SYMBOL_LOADER: download attempt %d/3 failed: 0x%08X\n", attempt, dl_hr);
-			if (dl_hr == E_ABORT || m_bInterruptEvent)
+			if (dl_hr == E_ABORT || m_bInterruptEvent || m_DlMgr.TimedOut())
 			{
 				dl_aborted = true;
 				break;
@@ -661,7 +686,7 @@ DWORD SYMBOL_LOADER::Initialize(const std::wstring & szModulePath, const std::ws
 			{
 				for (int waited = 0; waited < 100; ++waited)
 				{
-					if (m_bInterruptEvent)
+					if (m_bInterruptEvent || m_DlMgr.TimedOut())
 					{
 						dl_aborted = true;
 						break;
@@ -674,14 +699,33 @@ DWORD SYMBOL_LOADER::Initialize(const std::wstring & szModulePath, const std::ws
 				}
 			}
 		}
+
+		const bool dl_timed_out = m_DlMgr.TimedOut();
+
+		m_DlMgr.StopTimeout();
+
 		auto hr = dl_hr;
 		if (FAILED(hr))
 		{
+			// A timed-out or aborted URLDownloadToCacheFileW can leave a partial
+			// cache file behind; drop it so failures do not accumulate artifacts.
+			if (szCacheFile[0])
+			{
+				DeleteFileW(szCacheFile);
+			}
+
 			VirtualFree(pLocalImageBase, 0, MEM_RELEASE);
 
 			delete[] pRawData;
 
 			LOG(1, "SYMBOL_LOADER: failed to download file: 0x%08X\n", hr);
+
+			if (dl_timed_out)
+			{
+				LOG(1, "SYMBOL_LOADER: PDB download timed out\n");
+
+				return SYMBOL_ERR_DOWNLOAD_FAILED;
+			}
 
 			return (hr == E_ABORT || dl_aborted) ? SYMBOL_ERR_INTERRUPT : SYMBOL_ERR_DOWNLOAD_FAILED;
 		}
@@ -697,6 +741,10 @@ DWORD SYMBOL_LOADER::Initialize(const std::wstring & szModulePath, const std::ws
 			LOG(1, "SYMBOL_LOADER: failed to copy file into working directory: 0x%08X\n", GetLastError());
 
 			DeleteFileW(szCacheFile);
+
+			// CopyFileW is not atomic: a partial destination is ours (any
+			// pre-existing PDB was removed above), so remove it too.
+			DeleteFileW(m_szPdbPath.c_str());
 
 			return SYMBOL_ERR_COPYFILE_FAILED;
 		}
@@ -733,6 +781,10 @@ DWORD SYMBOL_LOADER::Initialize(const std::wstring & szModulePath, const std::ws
 		{
 			LOG(1, "SYMBOL_LOADER: can't access PDB file: 0x%08X\n", GetLastError());
 
+			// This path is only reachable with Redownload set, so the file was
+			// downloaded this run: delete it rather than leave it on disk.
+			DeleteFileW(m_szPdbPath.c_str());
+
 			return SYMBOL_ERR_CANT_ACCESS_PDB_FILE;
 		}
 
@@ -745,6 +797,9 @@ DWORD SYMBOL_LOADER::Initialize(const std::wstring & szModulePath, const std::ws
 		m_hPdbFile = nullptr;
 
 		LOG(1, "SYMBOL_LOADER: can't open PDB file: 0x%08X\n", GetLastError());
+
+		// Downloaded this run and unusable: remove it so it is not left behind.
+		DeleteFileW(m_szPdbPath.c_str());
 
 		return SYMBOL_ERR_CANT_OPEN_PDB_FILE;
 	}

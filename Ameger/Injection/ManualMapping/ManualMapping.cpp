@@ -13,6 +13,35 @@ namespace
 	// GetLastMapStats (see Injection.h).
 	MAP_STATS g_LastMapStats{};
 
+	// g_LastMapStats is written by the injection thread (and ResetMapStats) and
+	// read by the export/UI thread through GetLastMapStats with no other
+	// synchronization, exactly like the HijackStats slots. A plain 28-byte
+	// struct assignment is not atomic, so copy field-by-field through
+	// InterlockedExchange - a compiler intrinsic on x64, no new import - and
+	// load through InterlockedCompareExchange so no read/write pair is a data
+	// race.
+	void StoreMapStats(const MAP_STATS & Src)
+	{
+		static_assert(sizeof(MAP_STATS) % sizeof(LONG) == 0, "MAP_STATS must be a whole number of LONGs");
+
+		LONG * dst = ReCa<LONG *>(&g_LastMapStats);
+		const LONG * src = ReCa<const LONG *>(&Src);
+		for (size_t i = 0; i < sizeof(MAP_STATS) / sizeof(LONG); ++i)
+		{
+			InterlockedExchange(&dst[i], src[i]);
+		}
+	}
+
+	void LoadMapStats(MAP_STATS & Dst)
+	{
+		volatile LONG * src = ReCa<volatile LONG *>(&g_LastMapStats);
+		LONG * dst = ReCa<LONG *>(&Dst);
+		for (size_t i = 0; i < sizeof(MAP_STATS) / sizeof(LONG); ++i)
+		{
+			dst[i] = InterlockedCompareExchange(&src[i], 0, 0);
+		}
+	}
+
 	PE_IMAGE::OPTIONS GetMappingOptions(DWORD flags)
 	{
 		PE_IMAGE::OPTIONS options;
@@ -47,6 +76,60 @@ namespace
 		file.seekg(0, std::ios::beg);
 		file.read(reinterpret_cast<char *>(data.data()), file_size);
 		return static_cast<bool>(file) && file.gcount() == file_size;
+	}
+
+	// Secure-wipe a remote staging region before its RemoteAllocation guard
+	// releases it. The host staging block is the only place the operator's
+	// on-disk DLL path lives (the mapped image never carries it), so the whole
+	// block - argument copy, shell code, dispatch table and raw image - is
+	// overwritten here. The block mixes RW data pages with the RX code page,
+	// so it is promoted to RW first (never RWX; the block is released
+	// immediately after, so the temporary protection is not restored). The
+	// write is bounded and non-throwing: a failed protect or write leaves the
+	// block for the guard to free exactly as before.
+	void ScrubRemoteRegion(HANDLE hTargetProc, void * base, SIZE_T size)
+	{
+		if (!hTargetProc || hTargetProc == INVALID_HANDLE_VALUE || !base || !size)
+		{
+			return;
+		}
+
+		DWORD old_protect = 0;
+		if (!VirtualProtectEx(hTargetProc, base, size, PAGE_READWRITE, &old_protect))
+		{
+			return;
+		}
+
+		// Wipe in large strides from one OS-zeroed scratch block: MEM_COMMIT
+		// pages are zero-filled, so a single allocation replaces the old 32 KB
+		// stack buffer and cuts the cross-process write count from one per
+		// 32 KB (hundreds for a multi-MB image) to a dozen or so - the
+		// teardown no longer reads as a write storm. Best-effort and
+		// non-throwing: a failed allocation or write just leaves the block for
+		// the guard to free, exactly as a failed protect already did.
+		constexpr SIZE_T kScrubChunk = 0x100000;
+		const SIZE_T chunk = size < kScrubChunk ? size : kScrubChunk;
+		BYTE * zeros = ReCa<BYTE *>(VirtualAlloc(nullptr, chunk, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+		if (!zeros)
+		{
+			return;
+		}
+
+		BYTE * cursor = ReCa<BYTE *>(base);
+		SIZE_T remaining = size;
+		while (remaining)
+		{
+			const SIZE_T this_chunk = remaining < chunk ? remaining : chunk;
+			if (!WriteProcessMemory(hTargetProc, cursor, zeros, this_chunk, nullptr))
+			{
+				break;
+			}
+
+			cursor += this_chunk;
+			remaining -= this_chunk;
+		}
+
+		VirtualFree(zeros, 0, MEM_RELEASE);
 	}
 }
 
@@ -199,6 +282,17 @@ DWORD MMAP_NATIVE::ManualMap(const INJECTION_SOURCE & Source, HANDLE hTargetProc
 	}
 
 	RemoteAllocation allocation_guard(hTargetProc, pAllocBase);
+
+	// Wipe the staging block before the guard releases it, but only when the
+	// guard is actually going to free it: on SR_HT_ERR_RECOVERY_REQUIRED the
+	// guard is release()d (the shell may still be executing from the block) and
+	// the wipe is skipped, preserving the documented recovery leak.
+	auto scrub_guard = MakeScopeExit([&]() noexcept {
+		if (allocation_guard.get())
+		{
+			ScrubRemoteRegion(hTargetProc, pAllocBase, AllocationSize);
+		}
+	});
 
 	BYTE * pArg				= pAllocBase;
 	BYTE * pShells			= ReCa<BYTE *>(ALIGN_UP(ReCa<ULONG_PTR>(pArg)			+ sizeof(MANUAL_MAPPING_DATA),				kStagePage));
@@ -399,7 +493,7 @@ DWORD MMAP_NATIVE::ManualMap(const INJECTION_SOURCE & Source, HANDLE hTargetProc
 		return INJ_ERR_VERIFY_RESULT_FAIL;
 	}
 
-	g_LastMapStats = data.MapStats;
+	StoreMapStats(data.MapStats);
 
 	
 
@@ -947,17 +1041,21 @@ DWORD __declspec(code_seg(".mmap_sec$02")) __stdcall MMI_MapSections(MANUAL_MAPP
 	//
 	// An earlier revision walked every page of the fresh reservation to
 	// "concentrate" the demand-zero soft faults into one burst. Measuring the
-	// real payload showed that is a net loss. SizeOfImage is 18,876 KB =
+	// real payload showed that is a net loss: SizeOfImage is 18,876 KB =
 	// 4,732 pages, while the section copy only writes the raw data - about
-	// 4 MB, or 1,038 pages. Pre-faulting therefore ADDED roughly 3,700
-	// exceptions that would otherwise never have occurred, and every one of
-	// them is delivered to Warden's vectored handler with a faulting address
-	// inside an allocation it has never seen. The remaining ~1,038 faults are
-	// unavoidable: they are the section writes themselves.
+	// 4 MB, or 1,038 pages - so pre-faulting would add roughly 3,700 more
+	// page faults for no benefit.
 	//
-	// So the minimum achievable exception count is simply "the pages we
-	// actually write", which is what the code already did. Reducing it further
-	// requires committing pages from the kernel, not user mode.
+	// Those faults are demand-zero faults on pages allocated MEM_COMMIT, not
+	// CPU exceptions. The kernel's demand-zero handler resolves them entirely
+	// in kernel mode, so they are never delivered to user mode and never reach
+	// Warden's vectored handler, which only ever receives real CPU exceptions
+	// (INT3 and access violations); the same is true of any later page-in
+	// fault. The section copy therefore contributes zero VEH-visible
+	// exceptions, and a pre-fault pass would not have added any either. The
+	// only cost of pre-faulting is the extra kernel page-fault work, which is
+	// why it is skipped; the demand-zero fault count is a kernel-side concern,
+	// not a user-mode one.
 
 	f->memmove(pData->pImageBase, pData->pRawData, pData->pOptionalHeader->SizeOfHeaders);
 
@@ -2425,7 +2523,8 @@ MANUAL_MAPPING_FUNCTION_TABLE::MANUAL_MAPPING_FUNCTION_TABLE()
 
 void ResetMapStats()
 {
-	g_LastMapStats = {};
+	const MAP_STATS Empty{};
+	StoreMapStats(Empty);
 }
 
 void __stdcall GetLastMapStats(MAP_STATS * Out)
@@ -2434,6 +2533,6 @@ void __stdcall GetLastMapStats(MAP_STATS * Out)
 
 	if (Out)
 	{
-		*Out = g_LastMapStats;
+		LoadMapStats(*Out);
 	}
 }

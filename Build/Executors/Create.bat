@@ -100,7 +100,16 @@ set "AmegerStringSeed="
 for /f "usebackq tokens=1,2 delims==" %%A in (`powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%SEED_SCRIPT%"`) do set "%%A=%%B"
 if not defined AmegerMmapSentinel goto :seeds_missing
 if not defined AmegerStringSeed goto :seeds_missing
-set "MUTATE_ARGS=/p:AmegerMmapSentinel=%AmegerMmapSentinel% /p:AmegerStringSeed=%AmegerStringSeed%"
+rem Per-build stub byte-shape seed (RemoteThreadHijack.asm). Reuse the
+rem sentinel draw, but MASM has no 0x prefix (unlike the C++ ClCompile
+rem consumers), so convert it to a decimal literal here. Mask to 31 bits so
+rem set /a never yields a negative value; the draw is forced odd, so the
+rem result is never 0. Fail closed instead of letting the stub silently
+rem lose its per-build variance.
+set /a "AmegerStubSeed=(%AmegerMmapSentinel%) & 0x7FFFFFFF"
+if not defined AmegerStubSeed goto :seeds_missing
+if "%AmegerStubSeed%"=="0" goto :seeds_missing
+set "MUTATE_ARGS=/p:AmegerMmapSentinel=%AmegerMmapSentinel% /p:AmegerStringSeed=%AmegerStringSeed% /p:AmegerStubSeed=%AmegerStubSeed%"
 echo.
 echo   %C_GREEN%[+]%C_RESET% Per-build sentinel: %C_GREEN%%AmegerMmapSentinel%%C_RESET%
 echo   %C_GREEN%[+]%C_RESET% Per-build string seed: %C_GREEN%%AmegerStringSeed%%C_RESET%
@@ -233,6 +242,8 @@ echo Interface x64: %C_GREEN%%OUT64%\Host - x64.exe%C_RESET%
 echo Runtime DLL: %C_GREEN%%RUNTIME_DLL%%C_RESET%
 
 echo.
+call :scrub_build_cache
+if errorlevel 1 goto :scrub_error
 if "%NO_PAUSE%"=="0" pause
 exit /b 0
 
@@ -451,8 +462,59 @@ if errorlevel 1 exit /b 1
 if not exist "%MANIFEST%" exit /b 1
 exit /b 0
 
+:scrub_build_cache
+rem Post-success residue scrub. Runs only after the build, deployment and every
+rem verification gate have passed (it is called from the success tail, after
+rem :write_section_manifest). The MSBuild tlog directories record the exact
+rem CL/link command lines -- including the per-build /p:AmegerMmapSentinel,
+rem /p:AmegerStringSeed, /p:AmegerStubSeed and /p:AmegerRuntimeHash* values --
+rem and the .recipe/.obj/.pch/.iobj/.ipdb files and any build PDB leak source
+rem paths and symbols. No later stage reads any of it, and Create.bat wipes the
+rem whole Cache at the start of the next run, so it is pure residue on the
+rem build machine.
+rem
+rem Everything directly under Cache is removed except the artifacts the
+rem protection stages consume: pe-sections.txt (the ProtectDLL/ProtectEXE
+rem section baseline) and the Protect.*.state idempotency records. Default is
+rem scrub; set AMEGER_KEEP_BUILD_CACHE=1 to retain the residue for debugging.
+if /i "%AMEGER_KEEP_BUILD_CACHE%"=="1" (
+  echo   %C_YELLOW%[!]%C_RESET% Build-cache scrub skipped ^(AMEGER_KEEP_BUILD_CACHE=1^); residue retained.
+  exit /b 0
+)
+if not exist "%RELEASE_CACHE%" exit /b 0
+set "SCRUB_FAILED="
+for /f "delims=" %%F in ('dir /b /a "%RELEASE_CACHE%" 2^>nul') do call :scrub_entry "%%F"
+if defined SCRUB_FAILED exit /b 1
+echo   %C_GREEN%[+]%C_RESET% Build cache scrubbed; kept pe-sections.txt and Protect state.
+echo.
+exit /b 0
+
+:scrub_entry
+rem %~1 = a name directly under Cache. Preserve consumed artifacts, delete the
+rem rest, and fail closed if a delete does not stick (locked/held file).
+call :scrub_preserved "%~1"
+if not errorlevel 1 exit /b 0
+rmdir /s /q "%RELEASE_CACHE%\%~1" 2>nul
+del /f /q "%RELEASE_CACHE%\%~1" 2>nul
+if exist "%RELEASE_CACHE%\%~1" (
+  echo   %C_RED%ERROR: unable to remove build residue: %RELEASE_CACHE%\%~1%C_RESET%
+  set "SCRUB_FAILED=1"
+)
+exit /b 0
+
+:scrub_preserved
+rem Consumed by later stages and kept across runs. Exit 0 to preserve, 1 to scrub.
+if /i "%~1"=="pe-sections.txt" exit /b 0
+if /i "%~1"=="Protect.payload.state" exit /b 0
+if /i "%~1"=="Protect.exe.state" exit /b 0
+exit /b 1
+
 :manifest_error
 echo   %C_RED%ERROR: unable to record the PE section baseline manifest.%C_RESET%
+goto :failure
+
+:scrub_error
+echo   %C_RED%ERROR: post-success build-cache scrub failed; residue may remain in %RELEASE_CACHE%.%C_RESET%
 goto :failure
 
 :msbuild_error
@@ -497,6 +559,10 @@ goto :failure
 
 :payload_error
 echo %C_RED%ERROR: unable to deploy the target payload.%C_RESET%
+goto :failure
+
+:payload_pin_error
+echo %C_RED%ERROR: unable to re-pin PayloadSha256 for the prepared payload.%C_RESET%
 goto :failure
 
 :timestamp_missing

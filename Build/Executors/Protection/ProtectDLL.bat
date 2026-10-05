@@ -69,6 +69,7 @@ set "VMP_CON="
 echo [%C_GREEN%1%C_RESET%/%C_GREEN%6%C_RESET%] Locating VMProtect console...
 echo.
 call :find_vmp_con
+if errorlevel 2 goto :vmp_wrapper
 if errorlevel 1 goto :vmp_missing
 echo   %C_GREEN%[+]%C_RESET% Console: %C_GREEN%%VMP_CON%%C_RESET%
 echo.
@@ -108,6 +109,7 @@ call :vmp_settings
 echo.
 call :read_state
 echo.
+rem Deliberately not gated on AMEGER_FORCE_VMP: STATE_MATCH=output is an exact-hash match against our recorded protected output, so re-protecting would only double-virtualize. FORCE_VMP overrides the heuristic VMP_PRESENT check above instead.
 if /i "%STATE_MATCH%"=="output" (
   echo   %C_GREEN%[+]%C_RESET% Already protected; nothing to do.
   goto :already_done
@@ -145,6 +147,7 @@ if errorlevel 1 (
   goto :failure
 )
 call :validate_output
+if errorlevel 2 goto :fc_error
 if errorlevel 1 goto :output_invalid
 echo.
 echo   %C_GREEN%OK%C_RESET% Protected output validated.
@@ -313,8 +316,12 @@ set "VMP_CON=%VMP_CON:"=%"
 if not exist "%VMP_CON%" exit /b 1
 rem Reject batch/cmd wrappers. Invoking a .bat without CALL transfers control
 rem and never returns, so a wrapper's "exit /b 0" would end this script right
-rem after the call site and report success having protected nothing.
-echo "%VMP_CON%" | findstr /i /r "\.bat$ \.cmd$" > nul && exit /b 2
+rem after the call site and report success having protected nothing. Compare
+rem the extension exactly: the old findstr matched the echoed, quoted path,
+rem whose trailing quote defeated the "$" end-of-line anchor, so the guard
+rem never fired and the caller's :vmp_wrapper branch was unreachable.
+for %%X in ("%VMP_CON%") do if /i "%%~xX"==".bat" exit /b 2
+for %%X in ("%VMP_CON%") do if /i "%%~xX"==".cmd" exit /b 2
 exit /b 0
 
 :scan_vmp_dirs
@@ -406,7 +413,10 @@ powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -Command "$b=[IO.File]
 if errorlevel 1 exit /b 1
 rem A byte-identical output means VMProtect silently passed the file through,
 rem which would leave the pin rewritten for a hash nothing changed.
+rem fc returns 0 = identical, 1 = differ, 2 = open/compare error. Only 1 proves
+rem the protector rewrote the bytes; a 2 is inconclusive and must fail closed.
 fc /b "%WORK_DIR%\out.dll" "%TARGET%" > nul
+if errorlevel 2 exit /b 2
 if not errorlevel 1 exit /b 1
 exit /b 0
 
@@ -446,6 +456,11 @@ for %%F in ("%DLL_DIR%\*.vmp" "%DLL_DIR%\*.log" "%DLL_DIR%\*.bak" "%DLL_DIR%\*.t
 )
 exit /b 0
 
+:vmp_wrapper
+echo   %C_RED%ERROR: AMEGER_VMP_CON points at a batch/cmd wrapper: %VMP_CON%%C_RESET%
+echo   %C_RED%       A wrapper transfers control and never returns; use the real console.%C_RESET%
+goto :failure
+
 :vmp_missing
 echo   %C_RED%ERROR: VMProtect console not found.%C_RESET%
 echo   %C_YELLOW%       Searched:%%C_RESET%
@@ -483,6 +498,11 @@ goto :failure
 
 :output_invalid
 echo   %C_RED%ERROR: VMProtect output failed validation; release left untouched.%C_RESET%
+goto :failure
+
+:fc_error
+echo   %C_RED%ERROR: unable to compare the protected output against the source.%C_RESET%
+echo   %C_RED%       fc failed; the output is unverified and will not ship.%C_RESET%
 goto :failure
 
 :project_error

