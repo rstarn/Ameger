@@ -36,10 +36,11 @@
     <IntDir>$(ProjectDir)..\..\Build\obj\Ameger\$(Configuration)\$(PlatformShortName)\</IntDir>
     <LinkIncremental>false</LinkIncremental>
     <AmegerMmapSentinel>1337</AmegerMmapSentinel>
+    <AmegerStringSeed>0x1B873593</AmegerStringSeed>
   </PropertyGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
     <ClCompile>
-      <PreprocessorDefinitions>AMEGER_MMAP_SENTINEL=$(AmegerMmapSentinel);%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>AMEGER_MMAP_SENTINEL=$(AmegerMmapSentinel);AMEGER_STRING_SEED=$(AmegerStringSeed);%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <WarningLevel>Level4</WarningLevel>
       <ConformanceMode>true</ConformanceMode>
       <DebugInformationFormat>None</DebugInformationFormat>

@@ -3,6 +3,8 @@
 #include <cstddef>
 #include <cstdint>
 
+#include "Core/DomainKey.h"
+
 // Char-by-char stack strings: KernelCloak stack_string.h replica.
 // No literal of any kind reaches the binary: each character is a template
 // parameter, XORed at compile time, decoded through a volatile so the
@@ -30,7 +32,7 @@ struct KcObfuscatedChar
 };
 } // namespace kc_strings
 
-#define KC_STACK_KEY_ (static_cast<std::uint32_t>((__COUNTER__ + 1) * 0x45D9F3Bu ^ __LINE__ * 0x1B873593u ^ 0xDEADBEEFu))
+#define KC_STACK_KEY_ (static_cast<std::uint32_t>((__COUNTER__ + 1) * 0x45D9F3Bu ^ __LINE__ * 0x1B873593u ^ 0xDEADBEEFu ^ ::kc_strings::detail::kStringSeed))
 
 #define KC_SC_(name, key, idx, c) name[idx] = ::kc_strings::KcObfuscatedChar<char, c, key, idx>::Decode()
 #define KC_SWC_(name, key, idx, c) name[idx] = ::kc_strings::KcObfuscatedChar<wchar_t, c, key, idx>::Decode()

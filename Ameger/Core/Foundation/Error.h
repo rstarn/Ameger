@@ -73,6 +73,7 @@
 #define INJ_MM_ERR_INVALID_PE_IMAGE				0x00400011	
 #define INJ_MM_ERR_LOADER_LOCK_FAILED			0x00400012
 #define INJ_MM_ERR_DLLMAIN_FAILED				0x00400013
+#define INJ_MM_ERR_TLS_CALLBACK_RANGE			0x00400014	// TLS callback pointer/array outside the mapped image: only a prefix ran, fail closed instead of reporting SUCCESS with callbacks skipped
 
 #define SR_ERR_SUCCESS					0x00000000
 													

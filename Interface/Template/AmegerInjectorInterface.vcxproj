@@ -37,6 +37,7 @@
     <AmegerRuntimeHash5>0</AmegerRuntimeHash5>
     <AmegerRuntimeHash6>0</AmegerRuntimeHash6>
     <AmegerRuntimeHash7>0</AmegerRuntimeHash7>
+    <AmegerStringSeed>0x1B873593</AmegerStringSeed>
   </PropertyGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
     <ClCompile>
@@ -48,7 +49,7 @@
       <FunctionLevelLinking>true</FunctionLevelLinking>
       <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
       <DebugInformationFormat>None</DebugInformationFormat>
-      <PreprocessorDefinitions>AMEGER_RUNTIME_DLL_HASH0=$(AmegerRuntimeHash0);AMEGER_RUNTIME_DLL_HASH1=$(AmegerRuntimeHash1);AMEGER_RUNTIME_DLL_HASH2=$(AmegerRuntimeHash2);AMEGER_RUNTIME_DLL_HASH3=$(AmegerRuntimeHash3);AMEGER_RUNTIME_DLL_HASH4=$(AmegerRuntimeHash4);AMEGER_RUNTIME_DLL_HASH5=$(AmegerRuntimeHash5);AMEGER_RUNTIME_DLL_HASH6=$(AmegerRuntimeHash6);AMEGER_RUNTIME_DLL_HASH7=$(AmegerRuntimeHash7);%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>AMEGER_RUNTIME_DLL_HASH0=$(AmegerRuntimeHash0);AMEGER_RUNTIME_DLL_HASH1=$(AmegerRuntimeHash1);AMEGER_RUNTIME_DLL_HASH2=$(AmegerRuntimeHash2);AMEGER_RUNTIME_DLL_HASH3=$(AmegerRuntimeHash3);AMEGER_RUNTIME_DLL_HASH4=$(AmegerRuntimeHash4);AMEGER_RUNTIME_DLL_HASH5=$(AmegerRuntimeHash5);AMEGER_RUNTIME_DLL_HASH6=$(AmegerRuntimeHash6);AMEGER_RUNTIME_DLL_HASH7=$(AmegerRuntimeHash7);AMEGER_STRING_SEED=$(AmegerStringSeed);%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <AdditionalIncludeDirectories>$(ProjectDir)..\..;$(ProjectDir)..\..\Ameger;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <PrecompiledHeader>NotUsing</PrecompiledHeader>
     </ClCompile>

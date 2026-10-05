@@ -5,12 +5,14 @@
 # link produces a different instruction encoding without touching any source
 # file on disk.
 #
-# Output is one MSBuild global property, one per line:
+# Output is two MSBuild global properties, one per line:
 #   AmegerMmapSentinel=0xXXXXXXXX   MMAP_SEC_END() return value
+#   AmegerStringSeed=0xXXXXXXXX     per-build rotation for every string-tier
+#   key (XOR/KC/layered ciphertext in .rdata changes on every link, so no
+#   cross-build byte signature survives even with identical sources)
 #
-# The sentinel is only an address/range anchor inside its own code section,
-# so any value is valid; it is forced odd to avoid looking like a plausible
-# "0" or a small loop counter in a disassembly diff.
+# Both values are forced odd to avoid looking like a plausible "0" or a small
+# loop counter in a disassembly diff.
 #
 # Strict Windows PowerShell 5.1. Exit code 0 = seeds produced,
 # 1 = failure (fatal: the caller refuses to build with a fixed sentinel).
@@ -36,5 +38,9 @@ if ($buf.Length -ne 4) {
 
 $mmap = ([BitConverter]::ToUInt32($buf, 0) -bor 1) -band 0xFFFFFFFF
 
+$rng.GetBytes($buf)
+$str = ([BitConverter]::ToUInt32($buf, 0) -bor 1) -band 0xFFFFFFFF
+
 Write-Output ("AmegerMmapSentinel=0x{0:X8}" -f $mmap)
+Write-Output ("AmegerStringSeed=0x{0:X8}" -f $str)
 exit 0

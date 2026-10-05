@@ -1152,7 +1152,10 @@ DWORD __declspec(code_seg(".mmap_sec$06")) __stdcall MMI_LoadImports(MANUAL_MAPP
 		{
 			DeleteObject(f, ModNameW.szBuffer);
 
-			if (ntRet == STATUS_APISET_NOT_HOSTED)
+			// Benign solely for virtual apiset names (no host to bind); any
+			// real dependency failing this way fails closed below instead of
+			// leaving an unbound IAT under SUCCESS.
+			if (ntRet == STATUS_APISET_NOT_HOSTED && MMI_IsApisetName(pData, szModule))
 			{
 				++pImportDescr;
 
@@ -1176,7 +1179,7 @@ DWORD __declspec(code_seg(".mmap_sec$06")) __stdcall MMI_LoadImports(MANUAL_MAPP
 		{
 			DeleteObject(f, ModNameW.szBuffer);
 
-			if (pData->ntRet == STATUS_APISET_NOT_HOSTED)
+			if (pData->ntRet == STATUS_APISET_NOT_HOSTED && MMI_IsApisetName(pData, szModule))
 			{
 				++pImportDescr;
 
@@ -1346,7 +1349,7 @@ DWORD __declspec(code_seg(".mmap_sec$07")) __stdcall MMI_LoadDelayImports(MANUAL
 		{
 			DeleteObject(f, ModNameW.szBuffer);
 
-			if (ntRet == STATUS_APISET_NOT_HOSTED)
+			if (ntRet == STATUS_APISET_NOT_HOSTED && MMI_IsApisetName(pData, szModule))
 			{
 				++pDelayImportDescr;
 
@@ -1370,7 +1373,7 @@ DWORD __declspec(code_seg(".mmap_sec$07")) __stdcall MMI_LoadDelayImports(MANUAL
 		{
 			DeleteObject(f, ModNameW.szBuffer);
 
-			if (pData->ntRet == STATUS_APISET_NOT_HOSTED)
+			if (pData->ntRet == STATUS_APISET_NOT_HOSTED && MMI_IsApisetName(pData, szModule))
 			{
 				++pDelayImportDescr;
 
@@ -1794,7 +1797,11 @@ DWORD __declspec(code_seg(".mmap_sec$0A")) __stdcall MMI_HandleTLS(MANUAL_MAPPIN
 		auto Callback = *pCallback;
 		if (!MMI_InImage(pData, ReCa<void *>(Callback), sizeof(BYTE)))
 		{
-			break;
+			// A prefix of the callback array ran; silently dropping the rest
+			// would report SUCCESS for a half-initialized image (whose later
+			// callbacks never ran), so fail closed with a payload-specific
+			// code instead of break-to-SUCCESS.
+			return INJ_MM_ERR_TLS_CALLBACK_RANGE;
 		}
 
 		Callback(pData->pImageBase, DLL_PROCESS_ATTACH, nullptr);
@@ -2095,7 +2102,10 @@ DWORD __declspec(code_seg(".mmap_sec$0C")) __stdcall MMI_CleanDataDirectories(MA
 			if (pRelocData->SizeOfBlock < sizeof(IMAGE_BASE_RELOCATION) ||
 				pRelocData->SizeOfBlock > static_cast<DWORD>(pRelocEnd - ReCa<BYTE *>(pRelocData)))
 			{
-				break;
+				// A corrupt block previously broke out and still reported
+				// SUCCESS with relocations partly unzeroed. Fail closed: a
+				// half-cleaned image is an anomalous executable page set.
+				return INJ_MM_ERR_INVALID_PE_IMAGE;
 			}
 
 			WORD * pRelativeInfo = ReCa<WORD *>(pRelocData + 1);

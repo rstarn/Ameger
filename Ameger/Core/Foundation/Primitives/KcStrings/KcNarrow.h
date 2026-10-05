@@ -94,9 +94,9 @@ __forceinline KcDecryptedString<N, Key> KcMakeDecrypted(const KcEncryptedString<
 }
 } // namespace kc_strings
 
-#define KC_STR(s) ::kc_strings::KcMakeDecrypted([]() -> const auto & { constexpr std::uint32_t kc_k = static_cast<std::uint32_t>((__COUNTER__ + 1) * 0x45D9F3Bu ^ __LINE__ * 0x1B873593u ^ sizeof(s) * 0xCC9E2D51u); static constexpr ::kc_strings::KcEncryptedString<sizeof(s), kc_k> kc_e(s, std::make_index_sequence<sizeof(s)>{}); return kc_e; }())
+#define KC_STR(s) ::kc_strings::KcMakeDecrypted([]() -> const auto & { constexpr std::uint32_t kc_k = static_cast<std::uint32_t>((__COUNTER__ + 1) * 0x45D9F3Bu ^ __LINE__ * 0x1B873593u ^ sizeof(s) * 0xCC9E2D51u ^ ::kc_strings::detail::kStringSeed); static constexpr ::kc_strings::KcEncryptedString<sizeof(s), kc_k> kc_e(s, std::make_index_sequence<sizeof(s)>{}); return kc_e; }())
 
 #define KC_STR_DECL_IMPL_(name, s, key) static constexpr ::kc_strings::KcEncryptedString<sizeof(s), key> kc_enc_##name(s, std::make_index_sequence<sizeof(s)>{}); auto name = ::kc_strings::KcMakeDecrypted(kc_enc_##name)
-#define KC_STR_DECL(name, s) KC_STR_DECL_IMPL_(name, s, static_cast<std::uint32_t>((__COUNTER__ + 1) * 0x45D9F3Bu ^ __LINE__ * 0x1B873593u ^ sizeof(s) * 0xCC9E2D51u))
+#define KC_STR_DECL(name, s) KC_STR_DECL_IMPL_(name, s, static_cast<std::uint32_t>((__COUNTER__ + 1) * 0x45D9F3Bu ^ __LINE__ * 0x1B873593u ^ sizeof(s) * 0xCC9E2D51u ^ ::kc_strings::detail::kStringSeed))
 
 #define KC_STR_N(s) KC_STR(s)

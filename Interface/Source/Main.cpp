@@ -2370,9 +2370,11 @@ namespace
 
         auto isActive = [flags](DWORD flag) -> bool { return (flags & flag) != 0; };
 
-        // Gate verdict. Only the string-encryption step can flip it; every
-        // other step in here is diagnostic and stays non-fatal by design.
+        // Gate verdict. The string-encryption and forensic-posture steps can
+        // flip it; every other step in here is diagnostic and stays non-fatal
+        // by design.
         bool string_gate_ok = true;
+        bool posture_ok = true;
 
         int total = 0;
         if (isActive(INJ_HANDLE_HIJACKING)) ++total;
@@ -2392,6 +2394,10 @@ namespace
         ++total;
         // String encryption is unconditional: markers must be absent from
         // the runtime DLL; loader resolution is the functional proof.
+        ++total;
+        // Forensic posture is unconditional: export neutrality, mutated
+        // section names and a zeroed debug directory, all measured from the
+        // shipped runtime file.
         ++total;
         if (isActive(INJ_ERASE_HEADER)) ++total;
         if (survey_game_traps) ++total;
@@ -3395,6 +3401,165 @@ namespace
             }
         }
 
+        {
+            ++step;
+            wprintf(L"\n\n[%ls%d%ls/%ls%d%ls] Verify forensic posture...\n\n", kGreen, step, kReset, kGreen, total, kReset);
+            // Every value below is measured from the shipped runtime file,
+            // never asserted from build scripts: neutral export names only,
+            // zero standard section names, zeroed debug directory.
+            const std::wstring posture_path = RuntimePath();
+            std::vector<BYTE> posture_bytes;
+            const bool posture_read = !posture_path.empty() && ReadFileBytes(posture_path, posture_bytes);
+            size_t export_neutral = 0;
+            size_t export_foreign = 0;
+            size_t standard_sections = 0;
+            DWORD debug_size = 0;
+            bool posture_parsed = false;
+            if (posture_read && posture_bytes.size() >= sizeof(IMAGE_DOS_HEADER))
+            {
+                const auto * dos = ReCa<const IMAGE_DOS_HEADER *>(posture_bytes.data());
+                if (dos->e_magic == IMAGE_DOS_SIGNATURE && dos->e_lfanew > 0 &&
+                    static_cast<size_t>(dos->e_lfanew) + sizeof(IMAGE_NT_HEADERS64) <= posture_bytes.size())
+                {
+                    const auto * nt = ReCa<const IMAGE_NT_HEADERS64 *>(posture_bytes.data() + dos->e_lfanew);
+                    if (nt->Signature == IMAGE_NT_SIGNATURE &&
+                        nt->OptionalHeader.Magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC &&
+                        nt->FileHeader.NumberOfSections <= 96)
+                    {
+                        const auto * sections = ReCa<const IMAGE_SECTION_HEADER *>(
+                            ReCa<const BYTE *>(&nt->OptionalHeader) + nt->FileHeader.SizeOfOptionalHeader);
+                        const size_t table_end = static_cast<size_t>(dos->e_lfanew) + sizeof(DWORD) +
+                            sizeof(IMAGE_FILE_HEADER) + nt->FileHeader.SizeOfOptionalHeader +
+                            static_cast<size_t>(nt->FileHeader.NumberOfSections) * sizeof(IMAGE_SECTION_HEADER);
+                        if (table_end <= posture_bytes.size())
+                        {
+                            static const char kStandard[][8] =
+                            {
+                                ".text", ".rdata", ".data", ".pdata",
+                                ".rsrc", ".reloc", ".edata", ".idata",
+                            };
+                            for (WORD s = 0; s < nt->FileHeader.NumberOfSections; ++s)
+                            {
+                                char name[9] = { 0 };
+                                memcpy(name, sections[s].Name, 8);
+                                for (size_t k = 0; k < sizeof(kStandard) / sizeof(kStandard[0]); ++k)
+                                {
+                                    if (strcmp(name, kStandard[k]) == 0)
+                                    {
+                                        ++standard_sections;
+                                        break;
+                                    }
+                                }
+                            }
+                            debug_size = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_DEBUG].Size;
+                            const DWORD export_rva = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress;
+                            const DWORD export_size = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].Size;
+                            posture_parsed = true;
+                            if (export_rva && export_size)
+                            {
+                                auto rva_to_offset = [&](DWORD rva) -> size_t
+                                {
+                                    for (WORD s = 0; s < nt->FileHeader.NumberOfSections; ++s)
+                                    {
+                                        const DWORD va = sections[s].VirtualAddress;
+                                        const DWORD raw = sections[s].SizeOfRawData;
+                                        if (raw && rva >= va && rva - va < raw)
+                                        {
+                                            const size_t off = static_cast<size_t>(sections[s].PointerToRawData) + (rva - va);
+                                            if (off < posture_bytes.size())
+                                            {
+                                                return off;
+                                            }
+                                        }
+                                    }
+                                    return static_cast<size_t>(-1);
+                                };
+                                const size_t exp_off = rva_to_offset(export_rva);
+                                if (exp_off == static_cast<size_t>(-1) || exp_off + 40 > posture_bytes.size())
+                                {
+                                    posture_parsed = false;
+                                }
+                                else
+                                {
+                                    const DWORD num_names = *ReCa<const DWORD *>(posture_bytes.data() + exp_off + 24);
+                                    const DWORD addr_names = *ReCa<const DWORD *>(posture_bytes.data() + exp_off + 32);
+                                    if (num_names > 256)
+                                    {
+                                        posture_parsed = false;
+                                    }
+                                    else
+                                    {
+                                        for (DWORD i = 0; i < num_names; ++i)
+                                        {
+                                            const size_t slot = rva_to_offset(addr_names);
+                                            if (slot == static_cast<size_t>(-1) ||
+                                                slot + static_cast<size_t>(i) * 4 + 4 > posture_bytes.size())
+                                            {
+                                                posture_parsed = false;
+                                                break;
+                                            }
+                                            const DWORD name_rva = *ReCa<const DWORD *>(
+                                                posture_bytes.data() + slot + static_cast<size_t>(i) * 4);
+                                            const size_t name_off = rva_to_offset(name_rva);
+                                            if (name_off == static_cast<size_t>(-1))
+                                            {
+                                                posture_parsed = false;
+                                                break;
+                                            }
+                                            size_t len = 0;
+                                            while (name_off + len < posture_bytes.size() &&
+                                                posture_bytes[name_off + len] && len < 128)
+                                            {
+                                                ++len;
+                                            }
+                                            if (name_off + len >= posture_bytes.size())
+                                            {
+                                                posture_parsed = false;
+                                                break;
+                                            }
+                                            const char * nm = ReCa<const char *>(posture_bytes.data() + name_off);
+                                            if (strncmp(nm, "Core", 4) == 0 || strcmp(nm, "g_LibraryState") == 0)
+                                            {
+                                                ++export_neutral;
+                                            }
+                                            else
+                                            {
+                                                ++export_foreign;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if (!posture_read)
+            {
+                wprintf(L"  %ls[x]%ls Runtime DLL unreadable; posture unverified.\n", kRed, kReset);
+                posture_ok = false;
+            }
+            else if (!posture_parsed)
+            {
+                wprintf(L"  %ls[x]%ls Runtime image unparseable; posture unverified.\n", kRed, kReset);
+                posture_ok = false;
+            }
+            else
+            {
+                wprintf(L"  %ls[+]%ls Export names: %ls%zu%ls neutral, %ls%zu%ls foreign\n",
+                    kGreen, kReset, kGreen, export_neutral, kReset, kGreen, export_foreign, kReset);
+                wprintf(L"  %ls[+]%ls Standard section names remaining: %ls%zu%ls\n",
+                    kGreen, kReset, kGreen, standard_sections, kReset);
+                wprintf(L"  %ls[+]%ls Debug directory size: %ls0x%lX%ls\n",
+                    kGreen, kReset, kGreen, static_cast<unsigned long>(debug_size), kReset);
+                if (export_foreign || standard_sections || debug_size)
+                {
+                    wprintf(L"  %ls[x]%ls Forensic posture regressed; rebuild with mutation enabled.\n", kRed, kReset);
+                    posture_ok = false;
+                }
+            }
+        }
+
         if (isActive(INJ_ERASE_HEADER))
         {
             ++step;
@@ -3472,7 +3637,7 @@ namespace
             wprintf(L"\n");
         }
 
-        return string_gate_ok;
+        return string_gate_ok && posture_ok;
     }
 
     // Wrapper for DebugAndVerifyStealth with SEH protection.
@@ -4229,8 +4394,15 @@ namespace
             wprintf(L"own DllMain(DLL_PROCESS_ATTACH) returned FALSE, i.e. the payload refused to initialize.\n");
             wprintf(L"This is state/thread dependent, not a mapping fault. Load earlier in the target's startup:\n");
             wprintf(L"relaunch the game and load once the launcher reports its symbol download is complete.\n");
-            wprintf(L"A failed attempt also leaves loader bookkeeping in the target that cannot be reclaimed,\n");
-            wprintf(L"so relaunch the game before trying again.\n");
+            wprintf(L"A failed attempt also leaves loader bookkeeping in the target that cannot be reclaimed\n");
+            wprintf(L"(inverted-table entry, TLS index/block have no removal API and point into the freed\n");
+            wprintf(L"image), so relaunch the game before trying again.\n");
+        }
+        else if (code == INJ_MM_ERR_TLS_CALLBACK_RANGE)
+        {
+            wprintf(L"Reason: a payload TLS callback pointer/array fell outside the mapped image,\n");
+            wprintf(L"so only a prefix of its callbacks ran. This is payload-specific, not a mapping\n");
+            wprintf(L"fault. Relaunch the target before trying another payload.\n");
         }
         else if (code == INJ_ERR_HANDLE_HIJACK_FAILED)
         {
@@ -4856,8 +5028,8 @@ namespace
             else
             {
                 wprintf(L"%ls[x] VERIFICATION GATE FAILED%s - the payload is mapped in the target, but the\n", kRed, kReset);
-                wprintf(L"    runtime DLL does not pass string-encryption verification. It must not be\n");
-                wprintf(L"    treated as a clean load: a plaintext symbol name in .rdata is\n");
+                wprintf(L"    runtime DLL does not pass verification (string-encryption or forensic posture).\n");
+                wprintf(L"    It must not be treated as a clean load: a plaintext symbol name in .rdata is\n");
                 wprintf(L"    scannable, and shipping it defeats the point of the string tiers.\n");
                 wprintf(L"    Fix the leak and rebuild before using this build.\n");
             }

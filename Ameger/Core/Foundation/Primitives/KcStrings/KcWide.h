@@ -97,9 +97,9 @@ __forceinline KcDecryptedWString<N, Key> KcMakeDecryptedW(const KcEncryptedWStri
 }
 } // namespace kc_strings
 
-#define KC_WSTR(s) ::kc_strings::KcMakeDecryptedW([]() -> const auto & { constexpr std::size_t kc_n = sizeof(s) / sizeof(wchar_t); constexpr std::uint32_t kc_k = static_cast<std::uint32_t>((__COUNTER__ + 1) * 0x45D9F3Bu ^ __LINE__ * 0x1B873593u ^ kc_n * 0xCC9E2D51u); static constexpr ::kc_strings::KcEncryptedWString<kc_n, kc_k> kc_e(s, std::make_index_sequence<kc_n>{}); return kc_e; }())
+#define KC_WSTR(s) ::kc_strings::KcMakeDecryptedW([]() -> const auto & { constexpr std::size_t kc_n = sizeof(s) / sizeof(wchar_t); constexpr std::uint32_t kc_k = static_cast<std::uint32_t>((__COUNTER__ + 1) * 0x45D9F3Bu ^ __LINE__ * 0x1B873593u ^ kc_n * 0xCC9E2D51u ^ ::kc_strings::detail::kStringSeed); static constexpr ::kc_strings::KcEncryptedWString<kc_n, kc_k> kc_e(s, std::make_index_sequence<kc_n>{}); return kc_e; }())
 
 #define KC_WSTR_DECL_IMPL_(name, s, wlen, key) static constexpr ::kc_strings::KcEncryptedWString<wlen, key> kc_wenc_##name(s, std::make_index_sequence<wlen>{}); auto name = ::kc_strings::KcMakeDecryptedW(kc_wenc_##name)
-#define KC_WSTR_DECL(name, s) KC_WSTR_DECL_IMPL_(name, s, sizeof(s) / sizeof(wchar_t), static_cast<std::uint32_t>((__COUNTER__ + 1) * 0x45D9F3Bu ^ __LINE__ * 0x1B873593u ^ (sizeof(s) / sizeof(wchar_t)) * 0xCC9E2D51u))
+#define KC_WSTR_DECL(name, s) KC_WSTR_DECL_IMPL_(name, s, sizeof(s) / sizeof(wchar_t), static_cast<std::uint32_t>((__COUNTER__ + 1) * 0x45D9F3Bu ^ __LINE__ * 0x1B873593u ^ (sizeof(s) / sizeof(wchar_t)) * 0xCC9E2D51u ^ ::kc_strings::detail::kStringSeed))
 
 #define KC_WSTR_N(s) KC_WSTR(s)

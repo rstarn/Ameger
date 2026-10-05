@@ -89,16 +89,19 @@ where powershell.exe >nul 2>&1
 if errorlevel 1 goto :seeds_missing
 if not exist "%SEED_SCRIPT%" goto :seeds_missing
 set "AmegerMmapSentinel="
+set "AmegerStringSeed="
 for /f "usebackq tokens=1,2 delims==" %%A in (`powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%SEED_SCRIPT%"`) do set "%%A=%%B"
 if not defined AmegerMmapSentinel goto :seeds_missing
-set "MUTATE_ARGS=/p:AmegerMmapSentinel=%AmegerMmapSentinel%"
+if not defined AmegerStringSeed goto :seeds_missing
+set "MUTATE_ARGS=/p:AmegerMmapSentinel=%AmegerMmapSentinel% /p:AmegerStringSeed=%AmegerStringSeed%"
 echo.
 echo   %C_GREEN%[+]%C_RESET% Per-build sentinel: %C_GREEN%%AmegerMmapSentinel%%C_RESET%
+echo   %C_GREEN%[+]%C_RESET% Per-build string seed: %C_GREEN%%AmegerStringSeed%%C_RESET%
 goto :seeds_ready
 
 :seeds_missing
 echo.
-echo   %C_RED%ERROR: per-build sentinel generation failed; refusing to build with a fixed sentinel.%C_RESET%
+echo   %C_RED%ERROR: per-build seed generation failed; refusing to build with fixed seeds.%C_RESET%
 goto :failure
 
 :seeds_ready
@@ -142,7 +145,7 @@ if not defined H4 goto :hash_error
 if not defined H5 goto :hash_error
 if not defined H6 goto :hash_error
 if not defined H7 goto :hash_error
-set "RUNTIME_HASH_ARGS=/p:AmegerRuntimeHash0=%H0% /p:AmegerRuntimeHash1=%H1% /p:AmegerRuntimeHash2=%H2% /p:AmegerRuntimeHash3=%H3% /p:AmegerRuntimeHash4=%H4% /p:AmegerRuntimeHash5=%H5% /p:AmegerRuntimeHash6=%H6% /p:AmegerRuntimeHash7=%H7%"
+set "RUNTIME_HASH_ARGS=/p:AmegerRuntimeHash0=%H0% /p:AmegerRuntimeHash1=%H1% /p:AmegerRuntimeHash2=%H2% /p:AmegerRuntimeHash3=%H3% /p:AmegerRuntimeHash4=%H4% /p:AmegerRuntimeHash5=%H5% /p:AmegerRuntimeHash6=%H6% /p:AmegerRuntimeHash7=%H7% /p:AmegerStringSeed=%AmegerStringSeed%"
 rem Rename the runtime DLL to the hash-derived name the Interface computes
 rem (RuntimePath() in Main.cpp: DLLs\rtdll_<first 8 hex of H0>.dll). The hash
 rem above was taken from the stock path, and AddPE/BuildPE already ran on it, so

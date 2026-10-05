@@ -39,7 +39,9 @@
 namespace xor_string
 {
 	constexpr unsigned kGolden = 0x9E3779B1u;
-	constexpr unsigned kBaseKey = 0xA53A5A5Du;
+	// Rotated per build via kStringSeed (see DomainKey.h); every XOR-tier
+	// ciphertext byte in .rdata changes on every link.
+	constexpr unsigned kBaseKey = 0xA53A5A5Du ^ static_cast<unsigned>(::kc_strings::detail::kStringSeed);
 
 	template <typename CharT, size_t N, unsigned Key>
 	struct XorEncrypted

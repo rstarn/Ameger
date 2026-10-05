@@ -109,7 +109,15 @@ DWORD __stdcall InitializeRuntime()
 
 	try
 	{
-		sym_ntdll_native_ret = std::async(std::launch::async, &SYMBOL_LOADER::Initialize, &sym_ntdll_native, native_ntdll_path, symbol_cache_root, nullptr, false, true, false);
+		// Lambda, not &SYMBOL_LOADER::Initialize: a member-pointer async
+		// instantiation bakes the class name into mangled template symbols
+		// (Fake_no_copy_callable_adapter@P8SYMBOL_LOADER@@...) that persist
+		// in .rdata. The lambda's mangled name carries only this free
+		// function's scope, which is ungated noise. Globals need no capture.
+		sym_ntdll_native_ret = std::async(std::launch::async,
+			[native_ntdll_path, symbol_cache_root]() {
+				return sym_ntdll_native.Initialize(native_ntdll_path, symbol_cache_root, nullptr, false, true, false);
+			});
 		import_handler_ret = std::async(std::launch::async, &ResolveImports, std::ref(import_handler_error_data));
 	}
 	catch (...)

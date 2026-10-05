@@ -30,6 +30,15 @@ namespace kc_strings
 {
 namespace detail
 {
+// Per-build rotation for every string-tier key. CreateSeeds.ps1 emits a fresh
+// AmegerStringSeed on every build (passed as /p: to both projects); mixing it
+// into each tier's key schedule makes all .rdata ciphertext change on every
+// link, so no cross-build byte signature survives even with identical sources.
+// A stock build without the seed define falls back to a fixed nonzero sugar.
+#ifndef AMEGER_STRING_SEED
+#define AMEGER_STRING_SEED 0x1B873593u
+#endif
+inline constexpr std::uint32_t kStringSeed = static_cast<std::uint32_t>(AMEGER_STRING_SEED);
 __forceinline std::uint8_t DomainByte(std::uint32_t key, std::size_t idx) noexcept
 {
     // Index-dependent so the mask is not one uniform dword, which would make

@@ -350,6 +350,144 @@ DWORD SR_HijackThread(HANDLE hTargetProc, f_Routine pRoutine, void * pArg, DWORD
 	std::vector<BYTE> shellcode(pre_shellcode_size);
 	std::vector<BYTE> staged(kWxCodePage + pre_data_size, 0xCC);
 
+	// Timing: the remote staging allocation plus all host-side stub
+	// preparation complete BEFORE the victim is suspended, so the frozen
+	// window holds only GetThreadContext, one WPM, one RX promotion and
+	// SetThreadContext (four syscalls). A GetTickCount64 delta heuristic
+	// keys on frozen-thread time, so every remote round-trip moved out of
+	// the window directly shrinks the observable stall. QueueUserAPC was
+	// evaluated and rejected for this stub: it terminates with jmp to the
+	// saved ReturnTarget instead of ret, which would abandon the kernel APC
+	// dispatch (RtlDispatchAPC expects the routine to return) and corrupt
+	// the thread. Suspend-then-minimal-window is the stealth-maximum for
+	// this stub contract. No C++ allocation happens below that could throw
+	// past a live suspend: VirtualAllocEx/WPM/memcpy cannot throw.
+	void * pMem = VirtualAllocEx(hTargetProc, nullptr, kWxAllocSize, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+	if (!pMem)
+	{
+		INIT_ERROR_DATA(error_data, GetLastError());
+
+		return SR_HT_ERR_CANT_ALLOC_MEM;
+	}
+
+	// pMem is only the W^X hijack stub: a code page plus an SR_REMOTE_DATA
+	// state page whose pArg/pRoutine fields merely point at the caller's
+	// argument block (allocated and owned by ManualMapping's own guard). The
+	// operator's DLL path lives in that argument block, not here, so freeing
+	// pMem would not scrub the path. The guard is released on the recovery
+	// paths below whenever the remote stub may still be executing from pMem,
+	// or when the thread is parked with RIP inside it; in both cases the
+	// memory must stay mapped and is deliberately leaked (reclaimed only when
+	// the target exits).
+	RemoteAllocation allocation_guard(hTargetProc, pMem);
+
+	const ULONG_PTR shellcode_begin = reinterpret_cast<ULONG_PTR>(RemoteThreadHijackBegin);
+	const ULONG_PTR shellcode_end = reinterpret_cast<ULONG_PTR>(RemoteThreadHijackEnd);
+	const size_t shellcode_size = static_cast<size_t>(shellcode_end - shellcode_begin);
+	if (!shellcode_size || shellcode_size > 0x1000)
+	{
+		INIT_ERROR_DATA(error_data, INJ_ERR_ADVANCED_NOT_DEFINED);
+
+		return SR_HT_ERR_CANT_ALLOC_MEM;
+	}
+
+	memcpy(shellcode.data(), RemoteThreadHijackBegin, shellcode_size);
+
+	const size_t return_target_offset = static_cast<size_t>(reinterpret_cast<ULONG_PTR>(RemoteThreadReturnTarget) - shellcode_begin);
+	const size_t state_offset = static_cast<size_t>(reinterpret_cast<ULONG_PTR>(RemoteThreadState) - shellcode_begin);
+	if (return_target_offset + sizeof(ULONG_PTR) > shellcode_size || state_offset + sizeof(SR_REMOTE_DATA) > shellcode_size)
+	{
+		INIT_ERROR_DATA(error_data, INJ_ERR_ADVANCED_NOT_DEFINED);
+
+		return SR_HT_ERR_CANT_ALLOC_MEM;
+	}
+
+	// Split: code_size = bytes before state, data_size = state..end.
+	const size_t code_size = state_offset;
+	const size_t data_size = shellcode_size - state_offset;
+	const size_t pad = kWxCodePage - code_size;
+	if (code_size >= kWxCodePage || data_size > kWxCodePage)
+	{
+		INIT_ERROR_DATA(error_data, INJ_ERR_ADVANCED_NOT_DEFINED);
+
+		return SR_HT_ERR_CANT_ALLOC_MEM;
+	}
+
+	memcpy(staged.data(), shellcode.data(), code_size);
+	memcpy(staged.data() + kWxCodePage, shellcode.data() + state_offset, data_size);
+
+	// Patch lea rbx,[State] (48 8D 1D disp32) and
+	// jmp qword ptr [ReturnTarget] (FF 25 disp32) by +pad.
+	// Note: one template cast per line to keep line debuggers clean.
+	{
+		bool lea_patched = false;
+		bool jmp_patched = false;
+		const int pad32 = static_cast<int>(pad);
+		for (size_t i = 0; i + 7 <= code_size; ++i)
+		{
+			const bool is_lea = staged[i] == 0x48 && staged[i + 1] == 0x8D && staged[i + 2] == 0x1D;
+			if (!lea_patched && is_lea)
+			{
+				int disp = 0;
+				memcpy(&disp, staged.data() + i + 3, sizeof(disp));
+				disp += pad32;
+				memcpy(staged.data() + i + 3, &disp, sizeof(disp));
+				lea_patched = true;
+			}
+		}
+		for (size_t i = 0; i + 6 <= code_size; ++i)
+		{
+			const bool is_jmp = staged[i] == 0xFF && staged[i + 1] == 0x25;
+			if (is_jmp)
+			{
+				int disp = 0;
+				memcpy(&disp, staged.data() + i + 2, sizeof(disp));
+				disp += pad32;
+				memcpy(staged.data() + i + 2, &disp, sizeof(disp));
+				jmp_patched = true;
+				break;
+			}
+		}
+		if (!lea_patched || !jmp_patched)
+		{
+			INIT_ERROR_DATA(error_data, INJ_ERR_ADVANCED_NOT_DEFINED);
+
+			return SR_HT_ERR_STUB_PATCH_FAIL;
+		}
+	}
+
+	// Patch the gs:[LastError] disp32 in the copied stub
+	// (mov r11d, gs:[TEB_LAST_ERROR] = 65 44 8B 1C 25 disp32) with the
+	// PDB-resolved TEB::LastErrorValue. Unlike the two RIP-relative sites
+	// above this is an absolute segment offset, so the disp32 is overwritten
+	// (not adjusted by +pad). Fail-closed: never let the assembled 68H
+	// placeholder reach the target when the offset was not resolved.
+	{
+		const DWORD teb_last_error = g_DynamicOffsets.TebLastErrorValue;
+		bool last_error_patched = false;
+		if (g_DynamicOffsets.Ready && teb_last_error)
+		{
+			for (size_t i = 0; i + 9 <= code_size; ++i)
+			{
+				const bool is_last_error =
+					staged[i] == 0x65 && staged[i + 1] == 0x44 && staged[i + 2] == 0x8B &&
+					staged[i + 3] == 0x1C && staged[i + 4] == 0x25;
+				if (is_last_error)
+				{
+					memcpy(staged.data() + i + 5, &teb_last_error, sizeof(teb_last_error));
+					last_error_patched = true;
+					break;
+				}
+			}
+		}
+		if (!last_error_patched)
+		{
+			INIT_ERROR_DATA(error_data, INJ_ERR_ADVANCED_NOT_DEFINED);
+
+			return SR_HT_ERR_STUB_PATCH_FAIL;
+		}
+	}
+
 	const DWORD sr_suspend = SuspendThread(hThread);
 	if (sr_suspend == (DWORD)-1)
 	{
@@ -404,157 +542,11 @@ DWORD SR_HijackThread(HANDLE hTargetProc, f_Routine pRoutine, void * pArg, DWORD
 	// restore happened.
 	g_ThreadExecStats.ContextSaved = 1;
 
-	void * pMem = VirtualAllocEx(hTargetProc, nullptr, kWxAllocSize, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-	if (!pMem)
-	{
-		INIT_ERROR_DATA(error_data, GetLastError());
+	g_ThreadExecStats.ContextSaved = 1;
 
-		LOG(2, "VirtualAllocEx failed: %08X\n", error_data.AdvErrorCode);
-
-		ResumeThread(hThread);
-		
-
-		return SR_HT_ERR_CANT_ALLOC_MEM;
-	}
-
-	// pMem is only the W^X hijack stub: a code page plus an SR_REMOTE_DATA
-	// state page whose pArg/pRoutine fields merely point at the caller's
-	// argument block (allocated and owned by ManualMapping's own guard). The
-	// operator's DLL path lives in that argument block, not here, so freeing
-	// pMem would not scrub the path. The guard is released on the recovery
-	// paths below whenever the remote stub may still be executing from pMem,
-	// or when the thread is parked with RIP inside it; in both cases the
-	// memory must stay mapped and is deliberately leaked (reclaimed only when
-	// the target exits).
-	RemoteAllocation allocation_guard(hTargetProc, pMem);
-
-	
-
-	
-	const ULONG_PTR shellcode_begin = reinterpret_cast<ULONG_PTR>(RemoteThreadHijackBegin);
-	const ULONG_PTR shellcode_end = reinterpret_cast<ULONG_PTR>(RemoteThreadHijackEnd);
-	const size_t shellcode_size = static_cast<size_t>(shellcode_end - shellcode_begin);
-	if (!shellcode_size || shellcode_size > 0x1000)
-	{
-		INIT_ERROR_DATA(error_data, INJ_ERR_ADVANCED_NOT_DEFINED);
-
-		ResumeThread(hThread);
-
-		return SR_HT_ERR_CANT_ALLOC_MEM;
-	}
-
-	memcpy(shellcode.data(), RemoteThreadHijackBegin, shellcode_size);
-
-	const size_t return_target_offset = static_cast<size_t>(reinterpret_cast<ULONG_PTR>(RemoteThreadReturnTarget) - shellcode_begin);
-	const size_t state_offset = static_cast<size_t>(reinterpret_cast<ULONG_PTR>(RemoteThreadState) - shellcode_begin);
-	if (return_target_offset + sizeof(ULONG_PTR) > shellcode_size || state_offset + sizeof(SR_REMOTE_DATA) > shellcode_size)
-	{
-		INIT_ERROR_DATA(error_data, INJ_ERR_ADVANCED_NOT_DEFINED);
-
-		ResumeThread(hThread);
-
-		return SR_HT_ERR_CANT_ALLOC_MEM;
-	}
-
-	// Split: code_size = bytes before state, data_size = state..end.
-	// Pad code up to 0x1000 with INT3 so state lands page-aligned and
-	// original RIP-relative disps need only += pad.
-	const size_t code_size = state_offset;
-	const size_t data_size = shellcode_size - state_offset;
-	const size_t pad = kWxCodePage - code_size;
-	if (code_size >= kWxCodePage || data_size > kWxCodePage)
-	{
-		INIT_ERROR_DATA(error_data, INJ_ERR_ADVANCED_NOT_DEFINED);
-
-		ResumeThread(hThread);
-
-		return SR_HT_ERR_CANT_ALLOC_MEM;
-	}
-
-	memcpy(staged.data(), shellcode.data(), code_size);
-	memcpy(staged.data() + kWxCodePage, shellcode.data() + state_offset, data_size);
-
-	// Patch lea rbx,[State] (48 8D 1D disp32) and
-	// jmp qword ptr [ReturnTarget] (FF 25 disp32) by +pad.
-	// Note: one template cast per line to keep line debuggers clean.
-	{
-		bool lea_patched = false;
-		bool jmp_patched = false;
-		const int pad32 = static_cast<int>(pad);
-		for (size_t i = 0; i + 7 <= code_size; ++i)
-		{
-			const bool is_lea = staged[i] == 0x48 && staged[i + 1] == 0x8D && staged[i + 2] == 0x1D;
-			if (!lea_patched && is_lea)
-			{
-				int disp = 0;
-				memcpy(&disp, staged.data() + i + 3, sizeof(disp));
-				disp += pad32;
-				memcpy(staged.data() + i + 3, &disp, sizeof(disp));
-				lea_patched = true;
-			}
-		}
-		for (size_t i = 0; i + 6 <= code_size; ++i)
-		{
-			const bool is_jmp = staged[i] == 0xFF && staged[i + 1] == 0x25;
-			if (is_jmp)
-			{
-				int disp = 0;
-				memcpy(&disp, staged.data() + i + 2, sizeof(disp));
-				disp += pad32;
-				memcpy(staged.data() + i + 2, &disp, sizeof(disp));
-				jmp_patched = true;
-				break;
-			}
-		}
-		if (!lea_patched || !jmp_patched)
-		{
-			INIT_ERROR_DATA(error_data, INJ_ERR_ADVANCED_NOT_DEFINED);
-
-			LOG(2, "W^X lea/jmp patch failed (lea=%d jmp=%d)\n", lea_patched ? 1 : 0, jmp_patched ? 1 : 0);
-
-			ResumeThread(hThread);
-
-			return SR_HT_ERR_STUB_PATCH_FAIL;
-		}
-	}
-
-	// Patch the gs:[LastError] disp32 in the copied stub
-	// (mov r11d, gs:[TEB_LAST_ERROR] = 65 44 8B 1C 25 disp32) with the
-	// PDB-resolved TEB::LastErrorValue. Unlike the two RIP-relative sites
-	// above this is an absolute segment offset, so the disp32 is overwritten
-	// (not adjusted by +pad). Fail-closed: never let the assembled 68H
-	// placeholder reach the target when the offset was not resolved.
-	{
-		const DWORD teb_last_error = g_DynamicOffsets.TebLastErrorValue;
-		bool last_error_patched = false;
-		if (g_DynamicOffsets.Ready && teb_last_error)
-		{
-			for (size_t i = 0; i + 9 <= code_size; ++i)
-			{
-				const bool is_last_error =
-					staged[i] == 0x65 && staged[i + 1] == 0x44 && staged[i + 2] == 0x8B &&
-					staged[i + 3] == 0x1C && staged[i + 4] == 0x25;
-				if (is_last_error)
-				{
-					memcpy(staged.data() + i + 5, &teb_last_error, sizeof(teb_last_error));
-					last_error_patched = true;
-					break;
-				}
-			}
-		}
-		if (!last_error_patched)
-		{
-			INIT_ERROR_DATA(error_data, INJ_ERR_ADVANCED_NOT_DEFINED);
-
-			LOG(2, "W^X gs patch failed (ready=%d value=0x%X)\n",
-				g_DynamicOffsets.Ready ? 1 : 0, teb_last_error);
-
-			ResumeThread(hThread);
-
-			return SR_HT_ERR_STUB_PATCH_FAIL;
-		}
-	}
-
+	// The stub body (alloc, patch) is already staged above while the victim
+	// ran free; only the ReturnTarget slot needs the captured RIP, so it is
+	// patched below inside the frozen window.
 	const size_t staged_return_offset = kWxCodePage + (return_target_offset - state_offset);
 	const size_t staged_state_offset = kWxCodePage;
 

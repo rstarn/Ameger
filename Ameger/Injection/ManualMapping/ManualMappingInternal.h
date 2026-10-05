@@ -280,6 +280,42 @@ __forceinline size_t MMI_ImageStringLength(const MMAP_NATIVE::MANUAL_MAPPING_DAT
 	return length == maximum ? 0 : length;
 }
 
+// True only for virtual apiset names ("api-ms-" / "ext-ms-", case-insensitive).
+// STATUS_APISET_NOT_HOSTED is benign solely for these: the apiset schema has
+// no host, so there is nothing to bind. A real dependency failing with this
+// status must fail closed instead of leaving an unbound IAT under SUCCESS.
+// Each byte is read only after proving it in-image; short/unterminated input
+// returns false.
+__forceinline bool MMI_IsApisetName(const MMAP_NATIVE::MANUAL_MAPPING_DATA * pData, const char * text)
+{
+	static const char kApi[] = { 'a', 'p', 'i', '-', 'm', 's', '-' };
+	static const char kExt[] = { 'e', 'x', 't', '-', 'm', 's', '-' };
+
+	bool api = true;
+	bool ext = true;
+
+	for (size_t i = 0; i < 7; ++i)
+	{
+		if (!MMI_InImage(pData, text + i, sizeof(char)))
+		{
+			return false;
+		}
+		char c = text[i];
+		if (c >= 'A' && c <= 'Z')
+		{
+			c = static_cast<char>(c + ('a' - 'A'));
+		}
+		api = api && (c == kApi[i]);
+		ext = ext && (c == kExt[i]);
+		if (!api && !ext)
+		{
+			return false;
+		}
+	}
+
+	return api || ext;
+}
+
 template <class T>
 __forceinline void DeleteObject(MMAP_NATIVE::MANUAL_MAPPING_FUNCTION_TABLE * f, T * Object)
 {
