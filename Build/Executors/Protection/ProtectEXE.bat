@@ -227,6 +227,7 @@ echo.
 echo Launcher already protected; release unchanged.
 echo.
 echo Interface x64: %C_GREEN%%TARGET%%C_RESET%
+echo.
 if "%NO_PAUSE%"=="0" pause
 exit /b 0
 

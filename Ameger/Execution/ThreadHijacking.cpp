@@ -228,6 +228,15 @@ DWORD SR_HijackThread(HANDLE hTargetProc, f_Routine pRoutine, void * pArg, DWORD
 			// worker thread never wakes on PostThreadMessage, so hijacking
 			// it guarantees Pending. Reject it here and let the 3-tier
 			// search pick an alertable candidate instead.
+			//
+			// The Running value is the SAME dynamically-resolved enum the
+			// search uses (FindHijackThread). Using the hardcoded
+			// KTHREAD_STATE::Running here would let the two acceptance rules
+			// drift: a sponsor the search would accept could be rejected by
+			// this check (or vice versa) if the PDB ever resolved Running to
+			// a different value. Fail-closed either way - a sponsor still
+			// must be alertable or Running.
+			const KTHREAD_STATE running_state = static_cast<KTHREAD_STATE>(g_DynamicOffsets.ThreadStateRunning);
 			sponsor_usable = false;
 			if (processInformation.SetProcess(hTargetProc))
 			{
@@ -254,7 +263,7 @@ DWORD SR_HijackThread(HANDLE hTargetProc, f_Routine pRoutine, void * pArg, DWORD
 						KWAIT_REASON wr{};
 						const bool have_state = processInformation.GetThreadState(st, wr);
 						const bool alertable = processInformation.IsThreadInAlertableState();
-						if (alertable || (have_state && st == KTHREAD_STATE::Running))
+						if (alertable || (have_state && st == running_state))
 						{
 							sponsor_usable = true;
 						}

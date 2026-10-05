@@ -852,6 +852,11 @@ namespace
         bool SponsorThreadOpened = false;
         ULONG_PTR SponsorThreadValue = 0;
         DWORD SponsorTid = 0;
+        // The TID the runtime actually hijacked, reported by the thread-exec
+        // telemetry. Populated before the acquisition trace is printed so the
+        // trace can name a sponsor-vs-used mismatch explicitly instead of
+        // leaving the reader to cross-reference two distant lines.
+        DWORD UsedTid = 0;
         bool Verbose = true;
     };
 
@@ -2311,6 +2316,27 @@ namespace
         {
             wprintf(L"    %ls %ls %lsFAILED%ls (code %ls0x%08X%ls)\n", StageTag(++Stage).c_str(),
                 StageLabel(L"Result").c_str(), kRed, kReset, kRed, Stats->FailCode, kReset);
+        }
+
+        // Thread-only: a pre-opened sponsor TID is a HINT, not a guarantee. The
+        // runtime only reuses it when it can prove the thread is hijackable
+        // (not a loader worker, and alertable or Running); a parked
+        // non-alertable waiter - the Interface picker's preferred category -
+        // cannot be woken by PostThreadMessage and is correctly rejected, after
+        // which the donor scan selects a different, actually-hijackable thread.
+        // Without this stage the trace showed the requested TID and the result
+        // source but never the TID that was actually used, so a legitimate
+        // fallback read as a mismatch/failure. Data-driven: it prints only when
+        // the sponsor was requested, the scan won, and the used TID differs.
+        if (IsThread && Context && Context->SponsorTid && Context->UsedTid
+            && Context->UsedTid != Context->SponsorTid && Stats->Success
+            && Stats->Source != static_cast<DWORD>(HijackSource::Sponsor))
+        {
+            wprintf(L"    %ls %ls sponsor TID %ls0x%04lX%ls %lsnot usable%ls; hijacked TID %ls0x%04lX%ls\n",
+                StageTag(++Stage).c_str(), StageLabel(L"Fallback").c_str(),
+                kGreen, static_cast<unsigned long>(Context->SponsorTid), kReset,
+                kYellow, kReset,
+                kGreen, static_cast<unsigned long>(Context->UsedTid), kReset);
         }
     }
 
@@ -3948,11 +3974,14 @@ namespace
     // Returns the target's own main module (the executable) from a module
     // snapshot. The trap survey derives its module set from the process instead
     // of a hardcoded allowlist: a fixed set of names is itself an identifying
-    // artifact.
-    bool GetRemoteMainModule(HANDLE process, std::wstring & name_out, ULONG_PTR & base_out)
+    // artifact. modBaseSize is the image's mapped extent, which the survey uses
+    // as its walk terminator so full coverage stops at the module end instead
+    // of running into unrelated allocations after it.
+    bool GetRemoteMainModule(HANDLE process, std::wstring & name_out, ULONG_PTR & base_out, SIZE_T & size_out)
     {
         name_out.clear();
         base_out = 0;
+        size_out = 0;
         if (!process)
         {
             return false;
@@ -3972,6 +4001,7 @@ namespace
             // The first module in a snapshot is the process's main executable.
             name_out = entry.szModule;
             base_out = reinterpret_cast<ULONG_PTR>(entry.modBaseAddr);
+            size_out = static_cast<SIZE_T>(entry.modBaseSize);
             found = !name_out.empty() && base_out != 0;
         }
 
@@ -4168,6 +4198,28 @@ namespace
         return false;
     }
 
+    // Reads an unsigned survey bound from the environment. Unset, unparsable
+    // or zero means "no bound" (full coverage). Kept fail-loud: a bound that is
+    // actually hit is disclosed in the survey output, never applied silently.
+    SIZE_T ReadSurveyBound(const wchar_t * name)
+    {
+        wchar_t buffer[32] = {};
+        const DWORD got = GetEnvironmentVariableW(name, buffer, static_cast<DWORD>(sizeof(buffer) / sizeof(buffer[0])));
+        if (got == 0 || got >= sizeof(buffer) / sizeof(buffer[0]))
+        {
+            return 0;
+        }
+
+        wchar_t * end = nullptr;
+        const unsigned long long value = wcstoull(buffer, &end, 10);
+        if (!end || *end != L'\0')
+        {
+            return 0;
+        }
+
+        return static_cast<SIZE_T>(value);
+    }
+
     void ReportGameTraps(HANDLE process, DWORD target_pid)
     {
         if (!process || !target_pid)
@@ -4178,31 +4230,45 @@ namespace
         // The survey set is generic: only the target's own main module. A fixed
         // list of game-specific names is itself an identifying artifact, so the
         // module is resolved from the process rather than hardcoded.
-        std::vector<std::wstring> survey_modules;
+        struct SurveyModule
+        {
+            std::wstring name;
+            ULONG_PTR base;
+            SIZE_T size;
+        };
+        std::vector<SurveyModule> survey_modules;
         {
             std::wstring main_name;
             ULONG_PTR main_base = 0;
-            if (GetRemoteMainModule(process, main_name, main_base))
+            SIZE_T main_size = 0;
+            if (GetRemoteMainModule(process, main_name, main_base, main_size))
             {
-                survey_modules.push_back(main_name);
+                survey_modules.push_back(SurveyModule{ main_name, main_base, main_size });
             }
         }
 
-        // INT3 scanning reads executable pages, and a full sweep of a large
-        // module is slow and pointless for a survey. This is a survey, not a
-        // census: the INT3 number below is a floor from a capped sample, and
-        // every cap is stated in the output so it is never mistaken for a total.
-        constexpr int kInt3SampleRegions = 2;
-        constexpr SIZE_T kInt3SampleBytes = 0x1000;
-        constexpr int kMaxWalkRegions = 64;
-        constexpr SIZE_T kMaxWalkBytes = (16u << 20); // 16 MB
+        // Survey bounds. 0 means "no bound": the walk then covers the whole
+        // module image - every committed region and every executable region -
+        // so the counts below are totals, not floors. A normal target's image
+        // is bounded, so the default (unbounded) is the correct, complete
+        // survey; the bounds exist only to cap a pathological address space and
+        // are opt-in via the environment. A bound that is actually hit is
+        // disclosed loudly below, so it can never masquerade as a total.
+        const SIZE_T max_walk_regions = ReadSurveyBound(L"AMEGER_SURVEY_MAX_REGIONS");
+        const SIZE_T max_walk_bytes = ReadSurveyBound(L"AMEGER_SURVEY_MAX_MB") * (1u << 20);
+        const SIZE_T max_sample_regions = ReadSurveyBound(L"AMEGER_SURVEY_MAX_SAMPLE_REGIONS");
+        // Bounded read window: a region is read in chunks of at most this many
+        // bytes and counted incrementally, so memory stays flat regardless of
+        // how large an executable region is.
+        constexpr SIZE_T kSurveyChunkBytes = 0x10000; // 64 KB
 
         int found = 0;
         for (size_t m = 0; m < survey_modules.size(); ++m)
         {
-            const wchar_t * mod = survey_modules[m].c_str();
-            ULONG_PTR base = 0;
-            if (!GetRemoteModuleBase(process, mod, base) || !base)
+            const std::wstring & mod = survey_modules[m].name;
+            const ULONG_PTR base = survey_modules[m].base;
+            const SIZE_T image_size = survey_modules[m].size;
+            if (!base)
             {
                 continue;
             }
@@ -4219,40 +4285,82 @@ namespace
             size_t sample_bytes = 0;
             size_t walked = 0;
             size_t eid_skipped = 0;
-            bool truncated = false;
+            // Disclosure state, all data-driven: the sample-cap line prints only
+            // when a cap actually skipped an executable region, and the walk
+            // line only when the walk actually stopped before the module end.
+            size_t sample_capped = 0;
+            bool walk_capped = false;
+            bool walk_aborted = false;
+            const bool unknown_extent = (image_size == 0);
             ULONG_PTR eid_start = 0;
             ULONG_PTR eid_end = 0;
             const bool has_eid = GetRemoteEidRange(process, base, eid_start, eid_end);
 
+            // Walk terminator: the module image end. Without it a full walk
+            // would run into unrelated allocations past the module. If the
+            // image extent is unknown the walk is skipped rather than run
+            // unbounded, and the walk line discloses why.
+            const ULONG_PTR walk_end = unknown_extent ? 0 : (base + image_size);
+
+            std::vector<BYTE> chunk_buf(kSurveyChunkBytes);
+
             BYTE * cursor = reinterpret_cast<BYTE *>(base);
-            int regions = 0;
-            for (; regions < kMaxWalkRegions; ++regions)
+            size_t regions = 0;
+            for (;;)
             {
-                MEMORY_BASIC_INFORMATION mbi{};
-                if (!VirtualQueryEx(process, cursor, &mbi, sizeof(mbi)) || !mbi.RegionSize)
+                if (unknown_extent)
                 {
-                    truncated = true;
+                    walk_aborted = true;
                     break;
                 }
 
-                if (reinterpret_cast<ULONG_PTR>(mbi.BaseAddress) < base &&
-                    reinterpret_cast<ULONG_PTR>(mbi.BaseAddress) + mbi.RegionSize <= base)
+                if (max_walk_regions && regions >= max_walk_regions)
                 {
-                    cursor = reinterpret_cast<BYTE *>(mbi.BaseAddress) + mbi.RegionSize;
+                    walk_capped = true;
+                    break;
+                }
+
+                if (reinterpret_cast<ULONG_PTR>(cursor) >= walk_end)
+                {
+                    break;
+                }
+
+                MEMORY_BASIC_INFORMATION mbi{};
+                if (!VirtualQueryEx(process, cursor, &mbi, sizeof(mbi)) || !mbi.RegionSize)
+                {
+                    walk_aborted = true;
+                    break;
+                }
+
+                BYTE * next = reinterpret_cast<BYTE *>(mbi.BaseAddress) + mbi.RegionSize;
+                if (next <= cursor)
+                {
+                    walk_aborted = true;
+                    break;
+                }
+
+                // A region wholly below the image base cannot happen once the
+                // cursor starts at base, but guard anyway so a misreported
+                // BaseAddress can never walk backwards.
+                if (reinterpret_cast<ULONG_PTR>(next) <= base)
+                {
+                    cursor = next;
+                    ++regions;
                     continue;
                 }
 
                 if (has_eid)
                 {
                     const ULONG_PTR r_start = reinterpret_cast<ULONG_PTR>(mbi.BaseAddress);
-                    const ULONG_PTR r_end = r_start + mbi.RegionSize;
+                    const ULONG_PTR r_end = reinterpret_cast<ULONG_PTR>(next);
                     if (r_start < eid_end && r_end > eid_start)
                     {
                         ++eid_skipped;
-                        cursor = reinterpret_cast<BYTE *>(mbi.BaseAddress) + mbi.RegionSize;
-                        if (reinterpret_cast<ULONG_PTR>(cursor) - base > kMaxWalkBytes)
+                        cursor = next;
+                        ++regions;
+                        if (max_walk_bytes && reinterpret_cast<ULONG_PTR>(cursor) - base > max_walk_bytes)
                         {
-                            truncated = true;
+                            walk_capped = true;
                             break;
                         }
                         continue;
@@ -4272,59 +4380,74 @@ namespace
                         ++noaccess;
                         noaccess_bytes += mbi.RegionSize;
                     }
-                    else if (mbi.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ))
+                    else if (mbi.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY))
                     {
                         ++exec_regions;
-                        if (sampled < static_cast<size_t>(kInt3SampleRegions))
+                        if (max_sample_regions && sampled >= max_sample_regions)
                         {
-                            const SIZE_T want = mbi.RegionSize > kInt3SampleBytes ? kInt3SampleBytes : mbi.RegionSize;
-                            std::vector<BYTE> buf(static_cast<size_t>(want));
-                            SIZE_T got = 0;
-                            if (ReadProcessMemory(process, mbi.BaseAddress, buf.data(), want, &got) && got)
+                            ++sample_capped;
+                        }
+                        else
+                        {
+                            // Read the WHOLE region in bounded chunks so the
+                            // INT3 count is a total over this region, not a
+                            // fixed-size sample. A short or failed read stops
+                            // this region; the region counts as sampled only if
+                            // at least one byte was read.
+                            SIZE_T remaining = mbi.RegionSize;
+                            BYTE * addr = reinterpret_cast<BYTE *>(mbi.BaseAddress);
+                            size_t region_cc = 0;
+                            size_t region_read = 0;
+                            while (remaining)
                             {
+                                const SIZE_T want = remaining < kSurveyChunkBytes ? remaining : kSurveyChunkBytes;
+                                SIZE_T got = 0;
+                                if (!ReadProcessMemory(process, addr, chunk_buf.data(), want, &got) || !got)
+                                {
+                                    break;
+                                }
+
                                 for (size_t i = 0; i < static_cast<size_t>(got); ++i)
                                 {
-                                    if (buf[i] == 0xCC)
+                                    if (chunk_buf[i] == 0xCC)
                                     {
-                                        ++cc_bytes;
+                                        ++region_cc;
                                     }
                                 }
-                                sample_bytes += static_cast<size_t>(got);
+
+                                region_read += static_cast<size_t>(got);
+                                addr += got;
+                                remaining -= got;
+                                if (got < want)
+                                {
+                                    break;
+                                }
+                            }
+
+                            if (region_read)
+                            {
+                                cc_bytes += region_cc;
+                                sample_bytes += region_read;
                                 ++sampled;
                             }
                         }
                     }
                 }
 
-                BYTE * next = reinterpret_cast<BYTE *>(mbi.BaseAddress) + mbi.RegionSize;
-                if (next <= cursor)
-                {
-                    truncated = true;
-                    break;
-                }
                 cursor = next;
-
-                if (reinterpret_cast<ULONG_PTR>(cursor) - base > kMaxWalkBytes)
+                ++regions;
+                if (max_walk_bytes && reinterpret_cast<ULONG_PTR>(cursor) - base > max_walk_bytes)
                 {
-                    truncated = true;
+                    walk_capped = true;
                     break;
                 }
-            }
-
-            // The walk has no module-end terminator: exhausting the region
-            // budget exits silently, so without this the counts below would
-            // present as a full survey. A 64-iteration walk that never broke
-            // out is a partial window by construction - disclose it.
-            if (!truncated && regions >= kMaxWalkRegions)
-            {
-                truncated = true;
             }
 
             // Per-module verdict first, then the evidence, all on dotted fields
             // so this step lines up with the acquisition trace. The previous
             // form printed "242/8192" for INT3, which reads as a count out of a
-            // total but is really bytes inside a capped sample; the sample size
-            // and its share are now explicit.
+            // total but is really bytes inside a capped sample; with full
+            // coverage the sample is now the whole executable set.
             // Only the walked count carries green; the verdict tint (yellow
             // only, for the guarded alert state) is closed before the
             // parenthesis so "untrapped (" never inherits green.
@@ -4368,16 +4491,19 @@ namespace
                     kGreen, kReset,
                     kGreen, cc_pct, kReset,
                     kGreen, sampled, kReset, kGreen, exec_regions, kReset);
-                if (exec_regions > sampled)
+                // Only a real sample cap makes the INT3 count a floor; with the
+                // default (no cap) every executable region is read, so this is
+                // silent and the count above is a total.
+                if (sample_capped)
                 {
                     // Align under the INT3 value column (6 leading spaces plus the
                     // 12-wide "INT3:" field and its separating space) so this reads
                     // as a continuation of the line above, not a new field.
-                    wprintf(L"%*s%ls%lu%ls of %ls%lu%ls exec region(s) not sampled (cap %ls%d%ls), so the INT3 count is a floor, not a total\n",
+                    wprintf(L"%*s%ls%zu%ls of %ls%zu%ls exec region(s) not sampled (cap %ls%zu%ls), so the INT3 count is a floor, not a total\n",
                         static_cast<int>(StageField(L"INT3:", 12).size()) + 6, L"",
-                        kGreen, static_cast<unsigned long>(exec_regions - sampled), kReset,
-                        kGreen, static_cast<unsigned long>(exec_regions), kReset,
-                        kGreen, kInt3SampleRegions, kReset);
+                        kGreen, sample_capped, kReset,
+                        kGreen, exec_regions, kReset,
+                        kGreen, max_sample_regions, kReset);
                 }
             }
             else
@@ -4386,11 +4512,45 @@ namespace
                     StageField(L"INT3:", 12).c_str());
             }
 
-            if (truncated)
+            // Data-driven: this line prints only when the walk actually stopped
+            // before the module end - a configured cap, or a query failure.
+            // Reaching the module end is the normal, complete case and prints
+            // nothing.
+            if (walk_capped || walk_aborted)
             {
-                wprintf(L"%*sregion walk stopped early (cap %ls%d%ls regions / %ls%zu%ls MB); counts are partial\n",
+                std::wstring reason;
+                const auto append = [&reason](const std::wstring & part)
+                {
+                    if (!reason.empty())
+                    {
+                        reason += L" / ";
+                    }
+                    reason += part;
+                };
+
+                if (walk_capped)
+                {
+                    if (max_walk_regions)
+                    {
+                        wchar_t part[64] = {};
+                        swprintf_s(part, L"cap %ls%zu%ls regions", kGreen, max_walk_regions, kReset);
+                        append(part);
+                    }
+                    if (max_walk_bytes)
+                    {
+                        wchar_t part[64] = {};
+                        swprintf_s(part, L"cap %ls%zu%ls MB", kGreen, static_cast<size_t>(max_walk_bytes >> 20), kReset);
+                        append(part);
+                    }
+                }
+                if (walk_aborted)
+                {
+                    append(unknown_extent ? L"module extent unknown" : L"query failed before module end");
+                }
+
+                wprintf(L"%*sregion walk stopped early (%ls); counts are partial\n",
                     static_cast<int>(StageField(L"INT3:", 12).size()) + 6, L"",
-                    kGreen, kMaxWalkRegions, kReset, kGreen, static_cast<size_t>(kMaxWalkBytes >> 20), kReset);
+                    reason.c_str());
             }
 
             // Blank line between modules so each block reads separately.
@@ -5187,15 +5347,18 @@ namespace
         // for the whole timeout when the payload hangs, so name the victim
         // thread and the wait budget before the silence starts. Flush left;
         // the measured TID and timeout are tinted green.
-        // This TID is the thread that was REQUESTED, not necessarily the one that ends
-        // up hijacked: the donor scan may select a different thread entirely.
-        // Printing it as "the" working thread is what previously made a
-        // successful run look inconsistent, because the authoritative hijacked
-        // TID is only known once telemetry reports it at the end. The hijack may
-        // also resume the requested thread untouched if no donor is found.
+        // This TID is the sponsor thread that was REQUESTED, not necessarily the
+        // one that ends up hijacked: the runtime re-validates it (a parked
+        // non-alertable waiter or loader worker cannot be woken and is
+        // rejected) and the donor scan may then select a different thread
+        // entirely. Printing it as "the" working thread is what previously made
+        // a successful run look inconsistent, because the authoritative
+        // hijacked TID is only known once telemetry reports it at the end. The
+        // hijack may also resume the requested thread untouched if no donor is
+        // found.
         if (data.TargetTid)
         {
-            wprintf(L"Requested TID %ls0x%04lX%s, Timeout %ls%lu ms%s (hijacked thread reported on completion)...\n",
+            wprintf(L"Requested sponsor TID %ls0x%04lX%s, Timeout %ls%lu ms%s (runtime may reject it; hijacked thread reported on completion)...\n",
                 kGreen, static_cast<unsigned long>(data.TargetTid), kReset,
                 kGreen, static_cast<unsigned long>(data.Timeout), kReset);
         }
@@ -5281,6 +5444,21 @@ namespace
         {
             runtime.get_last_map_stats(&MapStats);
         }
+
+        // Thread-hijack outcome, measured in the target. Fetched BEFORE the
+        // acquisition trace is printed (SafeDebugAndVerifyStealth below) so the
+        // trace can name the TID that was actually hijacked and flag a
+        // sponsor-vs-used mismatch. This used to be a fixed "Thread context
+        // restored automatically" string with nothing behind it; the
+        // measurement is real: the runtime watches RIP until it leaves the
+        // hijack code page before reporting the restore.
+        THREAD_EXEC_STATS ThreadExec{};
+        if (runtime.get_last_thread_exec_stats)
+        {
+            runtime.get_last_thread_exec_stats(&ThreadExec);
+        }
+        Context.UsedTid = ThreadExec.HijackedTid;
+
         // Fail closed. If the handle is gone we cannot prove the stealth
         // properties, and every other unproven path in this gate (a missing
         // export, a fault inside verification) already reports failure. This
@@ -5298,17 +5476,8 @@ namespace
                 kRed, kReset);
         }
 
-        // Thread-hijack outcome, measured in the target. This used to be a fixed
-        // "Thread context restored automatically" string with nothing behind it,
-        // which asserted a restore that had never been checked. One line, and
-        // the measurement is real: the runtime watches RIP until it leaves the
-        // hijack code page before reporting the restore.
-        THREAD_EXEC_STATS ThreadExec{};
-        if (runtime.get_last_thread_exec_stats)
-        {
-            runtime.get_last_thread_exec_stats(&ThreadExec);
-        }
-
+        // ThreadExec was fetched above (before the acquisition trace) so the
+        // trace could name the hijacked TID; report the measured restore here.
         if (!runtime.get_last_thread_exec_stats || !ThreadExec.Attempted)
         {
             wprintf(L"  %ls[!]%ls Thread context not reported (no telemetry, or no donor was attempted).\n", kYellow, kReset);
@@ -5324,6 +5493,20 @@ namespace
                 kYellow, kReset, kYellow, kReset, kYellow,
                 static_cast<unsigned long>(ThreadExec.HijackedTid), kReset,
                 static_cast<unsigned long>(ThreadExec.FailCode));
+        }
+
+        // Data-driven sponsor fallback disclosure, independent of VerboseTrace
+        // (the detailed trace line only prints in verbose mode). A pre-opened
+        // sponsor TID is a hint: the runtime re-validates it and may select a
+        // different thread via the donor scan. Naming both TIDs here keeps a
+        // legitimate fallback from reading as an inconsistency.
+        if (ThreadExec.Attempted && data.TargetTid && ThreadExec.HijackedTid
+            && ThreadExec.HijackedTid != data.TargetTid)
+        {
+            wprintf(L"  %ls[!]%ls Sponsor TID %ls0x%04lX%ls not usable; hijacked TID %ls0x%04lX%ls instead (donor scan fallback).\n",
+                kYellow, kReset,
+                kGreen, static_cast<unsigned long>(data.TargetTid), kReset,
+                kGreen, static_cast<unsigned long>(ThreadExec.HijackedTid), kReset);
         }
         wprintf(L"\n");
         if (config.hook_restore)
