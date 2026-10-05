@@ -3080,6 +3080,7 @@ namespace
             int wx_rw = 0;
             int wx_regions = 0;
             SIZE_T wx_bytes = 0;
+            std::vector<ULONG_PTR> wx_alloc_bases;
             bool wx_reached_end = false;
 
             // A handful of offenders is enough to diagnose; the count is exact
@@ -3105,6 +3106,19 @@ namespace
                         break;
                     }
                     ++wx_regions;
+                    // Distinct AllocationBase values = distinct VAD/allocation
+                    // entries backing the image. A permission change splits a
+                    // region but never an allocation, so this counts how many
+                    // allocations the load created - the exact number a kernel
+                    // VAD-hide must remove. It is the load-shape metric that
+                    // matters for the driver phase, and it also catches a
+                    // regression if the image is ever mapped in pieces.
+                    if (wx_mbi.AllocationBase &&
+                        std::find(wx_alloc_bases.begin(), wx_alloc_bases.end(),
+                            ReCa<ULONG_PTR>(wx_mbi.AllocationBase)) == wx_alloc_bases.end())
+                    {
+                        wx_alloc_bases.push_back(ReCa<ULONG_PTR>(wx_mbi.AllocationBase));
+                    }
                     if (wx_mbi.State == MEM_COMMIT && wx_mbi.Protect != 0 && wx_mbi.Protect != PAGE_NOACCESS)
                     {
                         wx_bytes += wx_mbi.RegionSize;
@@ -3213,6 +3227,25 @@ namespace
                     wx_reached_end ? kReset : kYellow,
                     wx_reached_end ? L"reached end of image" : L"TRUNCATED - image not fully scanned",
                     kReset);
+
+                // Allocation (VAD) entries backing the image, and the resulting
+                // private-memory footprint. Region count is page-granular (a
+                // protection change splits regions); allocation count is what a
+                // kernel hide must unlink. One allocation means the entire image
+                // can be removed from a VAD walk with a single operation.
+                {
+                    const bool single = wx_alloc_bases.size() == 1;
+                    wprintf(L"      %lsallocations%s: %ls%zu%s %s(%s%s%s)%s | %lsprivate%s: %ls%zu%s KB\n",
+                        kDim, kReset,
+                        kGreen, wx_alloc_bases.size(), kReset,
+                        single ? kGreen : kYellow,
+                        single ? L"single" : L"split across",
+                        single ? kGreen : kYellow,
+                        single ? L"allocation" : L"allocations",
+                        kReset,
+                        kDim, kReset,
+                        kGreen, static_cast<size_t>(wx_bytes / 1024), kReset);
+                }
 
                 for (int i = 0; i < wx_rwx_listed; ++i)
                 {
