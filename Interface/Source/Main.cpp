@@ -3727,6 +3727,79 @@ namespace
     // an .eid page would break its VEH emulation and trip IntegrityCk. The
     // unified encrypted-IAT dispatcher and session-rotated string keys are
     // left alone for the same reason — there is no safe static restore.
+    // The .eid encrypted core itself is never even read: per the analysis it
+    // stays encrypted in memory and decrypts page-by-page on execution, so a
+    // survey read would only harvest ciphertext while risking a first-chance
+    // VEH on a guarded decrypting page. Its range is resolved from the remote
+    // section table and skipped outright (counted, disclosed).
+    bool GetRemoteEidRange(HANDLE process, ULONG_PTR base, ULONG_PTR & start_out, ULONG_PTR & end_out)
+    {
+        start_out = 0;
+        end_out = 0;
+        if (!process || !base)
+        {
+            return false;
+        }
+        IMAGE_DOS_HEADER dos{};
+        SIZE_T done = 0;
+        if (!ReadProcessMemory(process, reinterpret_cast<LPCVOID>(base), &dos, sizeof(dos), &done) ||
+            done != sizeof(dos) || dos.e_magic != IMAGE_DOS_SIGNATURE)
+        {
+            return false;
+        }
+        if (dos.e_lfanew <= 0 || dos.e_lfanew > 0x1000)
+        {
+            return false;
+        }
+        DWORD sig = 0;
+        if (!ReadProcessMemory(process, reinterpret_cast<LPCVOID>(base + static_cast<ULONG_PTR>(dos.e_lfanew)),
+            &sig, sizeof(sig), &done) || done != sizeof(sig) || sig != IMAGE_NT_SIGNATURE)
+        {
+            return false;
+        }
+        const ULONG_PTR file_hdr = base + static_cast<ULONG_PTR>(dos.e_lfanew) + sizeof(DWORD);
+        WORD num_sections = 0;
+        WORD opt_size = 0;
+        if (!ReadProcessMemory(process, reinterpret_cast<LPCVOID>(file_hdr + 2),
+            &num_sections, sizeof(num_sections), &done) || done != sizeof(num_sections))
+        {
+            return false;
+        }
+        if (!ReadProcessMemory(process, reinterpret_cast<LPCVOID>(file_hdr + 16),
+            &opt_size, sizeof(opt_size), &done) || done != sizeof(opt_size))
+        {
+            return false;
+        }
+        if (!num_sections || num_sections > 96)
+        {
+            return false;
+        }
+        const ULONG_PTR sec_table = file_hdr + sizeof(IMAGE_FILE_HEADER) + opt_size;
+        for (WORD i = 0; i < num_sections; ++i)
+        {
+            IMAGE_SECTION_HEADER sec{};
+            if (!ReadProcessMemory(process, reinterpret_cast<LPCVOID>(sec_table + static_cast<ULONG_PTR>(i) * sizeof(sec)),
+                &sec, sizeof(sec), &done) || done != sizeof(sec))
+            {
+                return false;
+            }
+            char name[9] = { 0 };
+            memcpy(name, sec.Name, 8);
+            if (strcmp(name, ".eid") == 0)
+            {
+                const DWORD extent = sec.Misc.VirtualSize ? sec.Misc.VirtualSize : sec.SizeOfRawData;
+                if (!extent)
+                {
+                    return false;
+                }
+                start_out = base + sec.VirtualAddress;
+                end_out = start_out + extent;
+                return end_out > start_out;
+            }
+        }
+        return false;
+    }
+
     void ReportGameTraps(HANDLE process, DWORD target_pid)
     {
         if (!process || !target_pid)
@@ -3777,7 +3850,11 @@ namespace
             size_t cc_bytes = 0;
             size_t sample_bytes = 0;
             size_t walked = 0;
+            size_t eid_skipped = 0;
             bool truncated = false;
+            ULONG_PTR eid_start = 0;
+            ULONG_PTR eid_end = 0;
+            const bool has_eid = GetRemoteEidRange(process, base, eid_start, eid_end);
 
             BYTE * cursor = reinterpret_cast<BYTE *>(base);
             int regions = 0;
@@ -3795,6 +3872,23 @@ namespace
                 {
                     cursor = reinterpret_cast<BYTE *>(mbi.BaseAddress) + mbi.RegionSize;
                     continue;
+                }
+
+                if (has_eid)
+                {
+                    const ULONG_PTR r_start = reinterpret_cast<ULONG_PTR>(mbi.BaseAddress);
+                    const ULONG_PTR r_end = r_start + mbi.RegionSize;
+                    if (r_start < eid_end && r_end > eid_start)
+                    {
+                        ++eid_skipped;
+                        cursor = reinterpret_cast<BYTE *>(mbi.BaseAddress) + mbi.RegionSize;
+                        if (reinterpret_cast<ULONG_PTR>(cursor) - base > kMaxWalkBytes)
+                        {
+                            truncated = true;
+                            break;
+                        }
+                        continue;
+                    }
                 }
 
                 if (mbi.State == MEM_COMMIT)
@@ -3886,6 +3980,13 @@ namespace
                 StageField(L"no-access:", 12).c_str(),
                 kGreen, noaccess, kReset,
                 kGreen, static_cast<size_t>(noaccess_bytes / 1024), kReset);
+
+            if (eid_skipped)
+            {
+                wprintf(L"      %ls%ls%zu%ls region(s) skipped (encrypted core, never read)\n",
+                    StageField(L"eid:", 12).c_str(),
+                    kGreen, eid_skipped, kReset);
+            }
 
             if (sample_bytes)
             {
