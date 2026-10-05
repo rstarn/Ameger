@@ -314,7 +314,10 @@ namespace PE_IMAGE
 				}
 
 				const DWORD patch_rva = block.VirtualAddress + static_cast<DWORD>(entries[index] & 0x0FFF);
-				if (patch_rva > view.NtHeaders->OptionalHeader.SizeOfImage - sizeof(ULONG_PTR))
+				// Guard the subtraction: SizeOfImage < sizeof(ULONG_PTR) would
+				// wrap to a huge bound and disable the check entirely.
+				if (view.NtHeaders->OptionalHeader.SizeOfImage < sizeof(ULONG_PTR) ||
+					patch_rva > view.NtHeaders->OptionalHeader.SizeOfImage - sizeof(ULONG_PTR))
 				{
 					return false;
 				}

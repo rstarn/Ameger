@@ -159,6 +159,10 @@ DWORD SR_HijackThread(HANDLE hTargetProc, f_Routine pRoutine, void * pArg, DWORD
 			sponsor_usable = false;
 			if (processInformation.SetProcess(hTargetProc))
 			{
+				// Publish the duplicate we already validated so GetTEB and the
+				// alertable check reuse it instead of opening a second handle on
+				// the same target thread.
+				processInformation.SetCurrentThreadHandle(Duplicated, SponsorTidActual);
 				do
 				{
 					if (processInformation.GetThreadId() != SponsorTidActual)
@@ -193,6 +197,8 @@ DWORD SR_HijackThread(HANDLE hTargetProc, f_Routine pRoutine, void * pArg, DWORD
 				// do not burn the timeout on it. Fall through to search.
 				LOG(2, "Sponsor validation snapshot failed; ignoring sponsor\n");
 			}
+
+			processInformation.SetCurrentThreadHandle(nullptr, 0);
 
 			if (sponsor_usable)
 			{

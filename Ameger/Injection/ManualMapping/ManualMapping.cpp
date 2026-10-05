@@ -742,7 +742,13 @@ NTSTATUS __declspec(code_seg(".mmap_sec$13")) __stdcall MMIH_LoadModule(MANUAL_M
 			{
 				const void * full_name_ptr = ReCa<const BYTE *>(entry_out) + dyno.LdrEntryFullDllName;
 				entry = BuildDependencyRecord(f, head, ReCa<HANDLE>(*hModule), ReCa<const UNICODE_STRING *>(full_name_ptr));
-				if (!entry && head)
+				// Fail closed on ANY failure to record the dependency, not just
+				// the head-present case: the previous `&& head` meant a caller
+				// that passed head == nullptr fell through to the dereference
+				// below and returned SUCCESS, leaking the LDR reference (the
+				// module stays loaded with no owned record to free it). The
+				// dependency record is how cleanup finds and dereferences it.
+				if (!entry)
 				{
 					f->LdrpDereferenceModule(ReCa<LDR_DATA_TABLE_ENTRY *>(entry_out));
 
@@ -1903,7 +1909,14 @@ DWORD __declspec(code_seg(".mmap_sec$0B")) __stdcall MMI_ExecuteDllMain(MANUAL_M
 
 		if ((pData->Flags & INJ_MM_RUN_UNDER_LDR_LOCK) && locked)
 		{
-			f->LdrUnlockLoaderLock(NULL, Cookie);
+			// Checked: an ignored unlock failure leaves the loader lock held
+			// for the life of the target, which deadlocks every later loader
+			// operation in the game. Surface it as a load failure (the image is
+			// already initialised, so the caller must restart the target).
+			if (!NT_SUCCESS(f->LdrUnlockLoaderLock(NULL, Cookie)))
+			{
+				return INJ_MM_ERR_LOADER_LOCK_FAILED;
+			}
 		}
 
 		return INJ_MM_ERR_DLLMAIN_FAILED;
@@ -1911,7 +1924,10 @@ DWORD __declspec(code_seg(".mmap_sec$0B")) __stdcall MMI_ExecuteDllMain(MANUAL_M
 
 	if ((pData->Flags & INJ_MM_RUN_UNDER_LDR_LOCK) && locked)
 	{
-		f->LdrUnlockLoaderLock(NULL, Cookie);
+		if (!NT_SUCCESS(f->LdrUnlockLoaderLock(NULL, Cookie)))
+		{
+			return INJ_MM_ERR_LOADER_LOCK_FAILED;
+		}
 	}
 
 	return INJ_ERR_SUCCESS;

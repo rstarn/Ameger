@@ -43,10 +43,18 @@ ULONG __stdcall DownloadManager::AddRef(void)
 
 ULONG __stdcall DownloadManager::Release(void)
 {
-    // Never frees: the only instance is an embedded member of SYMBOL_LOADER
-    // (m_DlMgr), so its lifetime is owned by that object, not by the ref count.
-    // If this class is ever heap-allocated, Release must delete at zero.
-    return static_cast<ULONG>(InterlockedDecrement(&m_RefCount));
+    // Never frees, deliberately. The only instance is an embedded member of
+    // SYMBOL_LOADER (m_DlMgr), so its lifetime is owned by that object, not by
+    // the ref count: `delete this` here would free a member and corrupt the
+    // loader. The COM contract wants the count to bottom out at zero, so clamp
+    // it there instead of letting it go negative, and record the count so a
+    // future heap-allocated use is visible rather than silent.
+    const LONG remaining = InterlockedDecrement(&m_RefCount);
+    if (remaining < 0)
+    {
+        InterlockedExchangeAdd(&m_RefCount, -remaining);
+    }
+    return static_cast<ULONG>(remaining < 0 ? 0 : remaining);
 }
 
 HRESULT __stdcall DownloadManager::OnStartBinding(DWORD dwReserved, IBinding * pib)

@@ -35,6 +35,18 @@ class ProcessInformation
 
 	HINSTANCE m_hWin32U = NULL;
 
+	// Optional pre-existing handle for the thread currently under inspection.
+	// GetTEB/IsThreadInAlertableState otherwise OpenThread by TID, which is a
+	// fresh handle on a target thread for every probe. When the caller already
+	// holds a usable thread handle for that exact TID (the sponsor path holds a
+	// verified duplicate), these queries reuse it instead of opening again.
+	HANDLE m_hCurrentThreadHandle = nullptr;
+	DWORD m_CurrentThreadHandleTid = 0;
+
+	// Resolves the handle to use for the current thread: the cached one when it
+	// matches this TID, otherwise nullptr (caller opens by TID as before).
+	HANDLE BorrowCurrentThreadHandle(DWORD tid) const;
+
 	ProcessInformation(const ProcessInformation &) = delete;
 	ProcessInformation & operator=(const ProcessInformation &) = delete;
 
@@ -42,6 +54,10 @@ public:
 
 	ProcessInformation();
 	~ProcessInformation();
+
+	// Publishes an already-open handle for `tid` so subsequent thread queries
+	// reuse it. Pass nullptr to clear. The handle is borrowed, never closed.
+	void SetCurrentThreadHandle(HANDLE thread, DWORD tid);
 
 	bool SetProcess(HANDLE hTargetProc);
 	bool NextThread();

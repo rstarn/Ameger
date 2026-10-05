@@ -314,20 +314,26 @@ namespace
 			return false;
 		}
 
-		if (!VirtualFreeEx(Candidate, Page, 0, MEM_RELEASE))
+// Retried once: a release that fails while the reserve is still live is
+	// occasionally transient, and a retry reclaims the page instead of leaving
+	// a permanently reserved hole in the candidate. Still fails closed if the
+	// second attempt fails.
+	for (int attempt = 0; attempt < 2; ++attempt)
+	{
+		if (VirtualFreeEx(Candidate, Page, 0, MEM_RELEASE))
 		{
-			// The reserve succeeded on this same handle, so a failed release is
-			// unexpected and worth reporting rather than leaking silently. The
-			// probe page then stays reserved in the target - bounded by the scan
-			// budget, but genuinely unreclaimable if the release keeps failing.
-			// The return value is unchanged: a candidate that cannot release the
-			// probe is rejected exactly as before.
-			LOG(1, "ProbeVmOperation: release failed (%lu)\n", GetLastError());
-			return false;
+			return true;
 		}
-
-		return true;
 	}
+
+	// The reserve succeeded on this same handle, so a persistently failed
+	// release is unexpected. The probe page then stays reserved in the target -
+	// bounded by the scan budget, but genuinely unreclaimable. The return value
+	// is unchanged: a candidate that cannot release the probe is rejected
+	// exactly as before.
+	LOG(1, "ProbeVmOperation: release failed twice (%lu)\n", GetLastError());
+	return false;
+}
 
 	bool VerifyProcessDonor(HANDLE Candidate, DWORD TargetPid)
 	{
@@ -892,9 +898,18 @@ namespace
 		&& ReadProcessMemory(Candidate, Page, &Readout, sizeof(Readout), &Done) && Done == sizeof(Readout)
 		&& Readout == Written;
 
-	if (!VirtualFreeEx(Candidate, Page, 0, MEM_RELEASE))
+	bool released = false;
+	for (int attempt = 0; attempt < 2; ++attempt)
 	{
-		LOG(1, "ProbeRoundtrip: release failed (%lu)\n", GetLastError());
+		if (VirtualFreeEx(Candidate, Page, 0, MEM_RELEASE))
+		{
+			released = true;
+			break;
+		}
+	}
+	if (!released)
+	{
+		LOG(1, "ProbeRoundtrip: release failed twice (%lu)\n", GetLastError());
 		return false;
 	}
 

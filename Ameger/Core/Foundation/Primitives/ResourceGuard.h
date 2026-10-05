@@ -76,6 +76,9 @@ public:
 
 class RemoteAllocation
 {
+	// Failed remote releases in this process (see reset/free_failed).
+	inline static unsigned long g_RemoteFreeFailures = 0;
+
 	HANDLE m_Process = nullptr;
 	void * m_Address = nullptr;
 
@@ -118,11 +121,25 @@ public:
 	{
 		if (m_Process && m_Process != INVALID_HANDLE_VALUE && m_Address)
 		{
-			VirtualFreeEx(m_Process, m_Address, 0, MEM_RELEASE);
+			// Counted, not ignored: a failed VirtualFreeEx leaves a remote
+			// region mapped in the target forever, and the caller has no other
+			// way to learn about it. Surfaced through free_failed().
+			if (!VirtualFreeEx(m_Process, m_Address, 0, MEM_RELEASE))
+			{
+				++g_RemoteFreeFailures;
+			}
 		}
 
 		m_Process = process;
 		m_Address = address;
+	}
+
+	// Number of remote regions this process failed to release. Diagnostic only
+	// (the guard has no channel back to the host), but it keeps the loss
+	// observable in a debugger instead of silently discarded.
+	inline static unsigned long & free_failed()
+	{
+		return g_RemoteFreeFailures;
 	}
 
 	void * get() const

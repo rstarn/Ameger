@@ -319,7 +319,10 @@ __forceinline bool MMI_IsApisetName(const MMAP_NATIVE::MANUAL_MAPPING_DATA * pDa
 template <class T>
 __forceinline void DeleteObject(MMAP_NATIVE::MANUAL_MAPPING_FUNCTION_TABLE * f, T * Object)
 {
-	if (Object)
+	// Same guards as NewObject: this used to dereference f->RtlFreeHeap and
+	// f->pLdrpHeap unconditionally, so a cleanup path reached before the heap
+	// was resolved (or with no function table) faulted inside the shell.
+	if (Object && f && f->RtlFreeHeap && f->pLdrpHeap)
 	{
 		f->RtlFreeHeap(f->pLdrpHeap, NULL, Object);
 	}

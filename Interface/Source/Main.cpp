@@ -3560,6 +3560,99 @@ namespace
                     posture_ok = false;
                 }
             }
+
+            // Payload posture: the loader can only erase what it maps, so the
+            // payload's own on-disk shape is the remaining exposure (export
+            // names, standard section names, debug directory, and any RWX
+            // section characteristic). Measured from the exact bytes that were
+            // hashed and mapped - never asserted. Advisory, not gating: the
+            // payload is a third-party binary this project does not build, so
+            // refusing to run it here would block a pinned, verified payload
+            // over a fingerprint we cannot remove from here.
+            if (local_pe && local_pe_size)
+            {
+                PE_IMAGE::VIEW payload_view{};
+                const DWORD payload_check = PE_IMAGE::Validate(local_pe, local_pe_size,
+                    IMAGE_FILE_MACHINE_AMD64, {}, payload_view);
+
+                size_t payload_exports = 0;
+                size_t payload_standard_sections = 0;
+                size_t payload_rwx_sections = 0;
+                DWORD payload_debug = 0;
+                const bool payload_ok = payload_check == FILE_ERR_SUCCESS && payload_view.NtHeaders != nullptr;
+                if (payload_ok)
+                {
+                    static const char kStd[][8] =
+                    {
+                        ".text", ".rdata", ".data", ".pdata",
+                        ".rsrc", ".reloc", ".edata", ".idata",
+                    };
+                    const IMAGE_SECTION_HEADER * sections = payload_view.Sections;
+                    const WORD count = payload_view.NtHeaders->FileHeader.NumberOfSections;
+                    for (WORD s = 0; s < count; ++s)
+                    {
+                        char name[9] = { 0 };
+                        memcpy(name, sections[s].Name, 8);
+                        for (size_t k = 0; k < sizeof(kStd) / sizeof(kStd[0]); ++k)
+                        {
+                            if (strcmp(name, kStd[k]) == 0)
+                            {
+                                ++payload_standard_sections;
+                                break;
+                            }
+                        }
+                        if ((sections[s].Characteristics & IMAGE_SCN_MEM_EXECUTE) &&
+                            (sections[s].Characteristics & IMAGE_SCN_MEM_WRITE))
+                        {
+                            ++payload_rwx_sections;
+                        }
+                    }
+                    payload_debug = payload_view.NtHeaders->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_DEBUG].Size;
+
+                    auto rva_to_offset = [&](DWORD rva) -> size_t
+                    {
+                        for (WORD s = 0; s < count; ++s)
+                        {
+                            const DWORD va = sections[s].VirtualAddress;
+                            const DWORD raw = sections[s].SizeOfRawData;
+                            if (raw && rva >= va && rva - va < raw)
+                            {
+                                const size_t off = static_cast<size_t>(sections[s].PointerToRawData) + (rva - va);
+                                if (off < local_pe_size)
+                                {
+                                    return off;
+                                }
+                            }
+                        }
+                        return static_cast<size_t>(-1);
+                    };
+                    const DWORD exp_rva = payload_view.NtHeaders->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress;
+                    if (exp_rva)
+                    {
+                        const size_t exp_off = rva_to_offset(exp_rva);
+                        if (exp_off != static_cast<size_t>(-1) && exp_off + 40 <= local_pe_size)
+                        {
+                            payload_exports = *ReCa<const DWORD *>(local_pe + exp_off + 24);
+                        }
+                    }
+                }
+
+                wprintf(L"  %ls[+]%ls Payload export names: %ls%zu%ls | standard sections: %ls%zu%ls | RWX sections: %ls%zu%ls | debug: %ls0x%lX%ls\n",
+                    kGreen, kReset,
+                    kGreen, payload_exports, kReset,
+                    kGreen, payload_standard_sections, kReset,
+                    kGreen, payload_rwx_sections, kReset,
+                    kGreen, static_cast<unsigned long>(payload_debug), kReset);
+
+                if (!payload_ok)
+                {
+                    wprintf(L"  %ls[!]%ls Payload image could not be re-parsed for a posture report.\n", kYellow, kReset);
+                }
+                else if (payload_rwx_sections)
+                {
+                    wprintf(L"  %ls[!]%ls Payload declares RWX section(s); mapped regions may inherit that.\n", kYellow, kReset);
+                }
+            }
         }
 
         if (isActive(INJ_ERASE_HEADER))
@@ -4944,14 +5037,57 @@ namespace
         {
             fwprintf(stderr, L"%lsOperation failed with code %08X%ls\n", kRed, result, kReset);
             PrintFailureHint(result);
-            // Same handle hygiene as the success path below: the load failed,
-            // so no later step needs target access; do not sit on open
-            // VM_WRITE-class handles through the exit pause.
+            // Any failure at or after the remote shell started leaves loader
+            // bookkeeping in the target that ntdll offers no way to reclaim
+            // (inverted-function-table entry, TLS index/block and the loader
+            // lock cookie all point into the freed image or stay held). Say so
+            // explicitly: retrying into the same process is not safe.
+            if (result >= 0x00400000u)
+            {
+                wprintf(L"  %ls[!]%ls Remote mapping reached the shell; unreclaimable loader state may remain.\n",
+                    kYellow, kReset);
+                wprintf(L"      Relaunch the target before attempting another load.\n");
+            }
             targetHandleGuard.reset();
             threadSponsorGuard.reset();
             sponsorGuard.reset();
             PauseBeforeExit();
             return 1;
+        }
+
+        // Release the CONTEXT-capable thread handle immediately now that the
+        // runtime holds its own duplicate. OpenThread itself is not observable
+        // from the target (no notification is sent on handle creation), but a
+        // system-wide handle enumeration shows an external process holding
+        // SUSPEND_RESUME|GET/SET_CONTEXT on one of the game's threads - the
+        // exact capability a context hijack needs, and far more incriminating
+        // than a query-only handle. Nothing after this point uses it: the
+        // verification steps read target memory through the process handle.
+        threadSponsorGuard.reset();
+        threadSponsorRaw = nullptr;
+
+        // Retire the write-capable process handle too, when nothing needs it.
+        // VM_WRITE|VM_OPERATION held by an outside process is the single most
+        // incriminating artifact in this design - it literally means "another
+        // process can write my memory" - so it is kept strictly to the window
+        // where the mapping actually happens. Verification and the trap survey
+        // only READ target memory, and the hook restore (the sole writer) is
+        // disabled in the stealth configuration, so a query+read handle is
+        // sufficient afterwards. Cost: one extra OpenProcess, which is not
+        // observable as a call; benefit: the strong handle stops existing.
+        if (sponsorRaw && !config.hook_restore)
+        {
+            sponsorGuard.reset();
+            sponsorRaw = nullptr;
+            targetHandle = nullptr;
+
+            targetHandle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ, FALSE, target.pid);
+            targetHandleGuard.reset(targetHandle);
+            if (!targetHandle)
+            {
+                wprintf(L"  %ls[!]%ls Could not re-open the target read-only for verification (0x%08X).\n",
+                    kYellow, kReset, GetLastError());
+            }
         }
 
         // Debug and verify stealth results in the remote process (pipeline runs

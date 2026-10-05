@@ -300,6 +300,22 @@ bool ProcessInformation::GetThreadState(KTHREAD_STATE & state, KWAIT_REASON & re
 		return true;
 	}
 
+HANDLE ProcessInformation::BorrowCurrentThreadHandle(DWORD tid) const
+{
+	if (m_hCurrentThreadHandle && m_hCurrentThreadHandle != INVALID_HANDLE_VALUE && tid && m_CurrentThreadHandleTid == tid)
+	{
+		return m_hCurrentThreadHandle;
+	}
+
+	return nullptr;
+}
+
+void ProcessInformation::SetCurrentThreadHandle(HANDLE thread, DWORD tid)
+{
+	m_hCurrentThreadHandle = thread;
+	m_CurrentThreadHandleTid = thread ? tid : 0;
+}
+
 void * ProcessInformation::GetTEB()
 {
 	if (!m_pCurrentThread || !m_pNtQueryInformationThread)
@@ -307,7 +323,11 @@ void * ProcessInformation::GetTEB()
 		return nullptr;
 	}
 
-	HANDLE hThread = OpenThread(THREAD_QUERY_INFORMATION | THREAD_QUERY_LIMITED_INFORMATION, FALSE, MDWD(m_pCurrentThread->ClientId.UniqueThread));
+	// Reuse the caller's handle for this TID when available; only open when
+	// we were not given one.
+	const HANDLE borrowed = BorrowCurrentThreadHandle(MDWD(m_pCurrentThread->ClientId.UniqueThread));
+	const bool owns_handle = borrowed == nullptr;
+	HANDLE hThread = borrowed ? borrowed : OpenThread(THREAD_QUERY_INFORMATION | THREAD_QUERY_LIMITED_INFORMATION, FALSE, MDWD(m_pCurrentThread->ClientId.UniqueThread));
 	if (!hThread)
 	{
 		return nullptr;
@@ -316,7 +336,10 @@ void * ProcessInformation::GetTEB()
 	THREAD_BASIC_INFORMATION tbi{ 0 };
 	auto ntRet = m_pNtQueryInformationThread(hThread, THREADINFOCLASS::ThreadBasicInformation, &tbi, sizeof(tbi), nullptr);
 
-	CloseHandle(hThread);
+	if (owns_handle)
+	{
+		CloseHandle(hThread);
+	}
 
 	if (NT_FAIL(ntRet))
 	{
@@ -328,12 +351,14 @@ void * ProcessInformation::GetTEB()
 
 bool ProcessInformation::IsThreadInAlertableState()
 {
-		if (!m_pCurrentThread)
-		{
-			return false;
-		}
+	if (!m_pCurrentThread)
+	{
+		return false;
+	}
 
-	HANDLE hThread = OpenThread(THREAD_GET_CONTEXT, FALSE, MDWD(m_pCurrentThread->ClientId.UniqueThread));
+	const HANDLE borrowed = BorrowCurrentThreadHandle(MDWD(m_pCurrentThread->ClientId.UniqueThread));
+	const bool owns_handle = borrowed == nullptr;
+	HANDLE hThread = borrowed ? borrowed : OpenThread(THREAD_GET_CONTEXT, FALSE, MDWD(m_pCurrentThread->ClientId.UniqueThread));
 	if (!hThread)
 	{
 		return false;
@@ -344,12 +369,18 @@ bool ProcessInformation::IsThreadInAlertableState()
 
 	if (!GetThreadContext(hThread, &ctx))
 	{
-		CloseHandle(hThread);
+		if (owns_handle)
+		{
+			CloseHandle(hThread);
+		}
 
 		return false;
 	}
 
-	CloseHandle(hThread);
+	if (owns_handle)
+	{
+		CloseHandle(hThread);
+	}
 
 	if (!ctx.Rip || !ctx.Rsp)
 	{
