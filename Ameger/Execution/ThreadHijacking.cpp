@@ -546,7 +546,7 @@ DWORD SR_HijackThread(HANDLE hTargetProc, f_Routine pRoutine, void * pArg, DWORD
 		{
 			INIT_ERROR_DATA(error_data, INJ_ERR_ADVANCED_NOT_DEFINED);
 
-			LOG(2, "W^X gs:[LastError] patch failed (ready=%d value=0x%X)\n",
+			LOG(2, "W^X gs patch failed (ready=%d value=0x%X)\n",
 				g_DynamicOffsets.Ready ? 1 : 0, teb_last_error);
 
 			ResumeThread(hThread);
@@ -569,9 +569,7 @@ DWORD SR_HijackThread(HANDLE hTargetProc, f_Routine pRoutine, void * pArg, DWORD
 	void * pRemoteFunc = pCode;
 	OldContext.Rip = reinterpret_cast<ULONG_PTR>(pRemoteFunc);
 
-	const DWORD data_size32 = static_cast<DWORD>(data_size);
 	LOG(2, "Remote thread shell prepared (W^X split: code RX 0x1000, state RW)\n");
-	LOG(3, "State bytes = %08X\n", data_size32);
 
 	LOG(2, "Acquiring thread with:\n");
 	LOG(3, "pRoutine = %p\n", pRemoteFunc);

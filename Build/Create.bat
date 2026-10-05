@@ -20,6 +20,7 @@ if defined ESC (
 for %%I in ("%~dp0..") do set "ROOT=%%~fI"
 set "BUILD_DIR=%ROOT%\Build"
 set "OUT_ROOT=%ROOT%\Build\Release"
+set "DLL_DIR=%OUT_ROOT%\DLLs"
 set "DEPS_RELEASE=%OUT_ROOT%"
 set "RELEASE_CACHE=%OUT_ROOT%\Cache"
 set "CACHE_RUNTIME=%RELEASE_CACHE%\Runtime"
@@ -32,7 +33,7 @@ set "CONFIG_SCRIPT=%SCRIPTS_DIR%\ProtectConfig.ps1"
 set "VERIFY_SCRIPT=%SCRIPTS_DIR%\VerifyEmbedMagic.ps1"
 set "CONFIG_MASTER=%BUILD_DIR%\Configuration.ini"
 set "PAYLOAD_ASSET=%ROOT%\Assets\DLL\Jlov.dll"
-set "PAYLOAD_DEST=%OUT_ROOT%\Jlov.dll"
+set "PAYLOAD_DEST=%DLL_DIR%\Jlov.dll"
 rem Stock runtime build output name (the runtime vcxproj TargetName). Referenced
 rem only before the hash-derived rename below; after the rename the release
 rem folder carries no file by this name.
@@ -143,12 +144,13 @@ if not defined H6 goto :hash_error
 if not defined H7 goto :hash_error
 set "RUNTIME_HASH_ARGS=/p:AmegerRuntimeHash0=%H0% /p:AmegerRuntimeHash1=%H1% /p:AmegerRuntimeHash2=%H2% /p:AmegerRuntimeHash3=%H3% /p:AmegerRuntimeHash4=%H4% /p:AmegerRuntimeHash5=%H5% /p:AmegerRuntimeHash6=%H6% /p:AmegerRuntimeHash7=%H7%"
 rem Rename the runtime DLL to the hash-derived name the Interface computes
-rem (RuntimeFileName() in Main.cpp: rtdll_<first 8 hex of H0>.dll). The hash
+rem (RuntimePath() in Main.cpp: DLLs\rtdll_<first 8 hex of H0>.dll). The hash
 rem above was taken from the stock path, and AddPE/BuildPE already ran on it, so
 rem this is the last step that touches the stock name. A failed move must abort
 rem rather than ship a folder whose runtime DLL is missing or misnamed.
 set "RUNTIME_DLL_NAME=rtdll_%H0:~2%.dll"
-set "RUNTIME_DLL=%DEPS_RELEASE%\%RUNTIME_DLL_NAME%"
+set "RUNTIME_DLL=%DLL_DIR%\%RUNTIME_DLL_NAME%"
+if not exist "%DLL_DIR%" mkdir "%DLL_DIR%"
 move /y "%RUNTIME_STOCK_DLL%" "%RUNTIME_DLL%" >nul
 if not exist "%RUNTIME_DLL%" goto :runtime_rename_error
 rem Value column is shared with BuildPE.ps1's closing summary line; both start
@@ -186,6 +188,8 @@ call :verify "%RUNTIME_DLL%" "x64 runtime"
 if errorlevel 1 goto :verify_error
 call :remove_import_artifacts "%DEPS_RELEASE%"
 if errorlevel 1 goto :cleanup_error
+call :remove_import_artifacts "%DLL_DIR%"
+if errorlevel 1 goto :cleanup_error
 call :sweep_artifacts
 if errorlevel 1 goto :cleanup_error
 echo.
@@ -208,9 +212,10 @@ echo.
 echo Build completed successfully.
 echo.
 echo Cache:   %C_GREEN%%RELEASE_CACHE%%C_RESET%
+echo Payload:     %C_GREEN%%PAYLOAD_DEST%%C_RESET%
 echo Interface x64: %C_GREEN%%OUT64%\Injector - x64.exe%C_RESET%
 echo Runtime DLL: %C_GREEN%%RUNTIME_DLL%%C_RESET%
-echo Payload:     %C_GREEN%%PAYLOAD_DEST%%C_RESET%
+
 echo.
 if "%NO_PAUSE%"=="0" pause
 exit /b 0
@@ -253,6 +258,7 @@ exit /b 0
 
 :prepare_cache
 if not exist "%DEPS_RELEASE%" mkdir "%DEPS_RELEASE%"
+if not exist "%DLL_DIR%" mkdir "%DLL_DIR%"
 if not exist "%RELEASE_CACHE%" mkdir "%RELEASE_CACHE%"
 if not exist "%CACHE_RUNTIME%" mkdir "%CACHE_RUNTIME%"
 if not exist "%CACHE_INTERFACE%" mkdir "%CACHE_INTERFACE%"
@@ -372,6 +378,7 @@ if errorlevel 1 (
   exit /b 1
 )
 echo   %C_GREEN%[+]%C_RESET% Payload deployed: %C_GREEN%%PAYLOAD_DEST%%C_RESET%
+powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -Command "Set-Clipboard -Value '%PAYLOAD_DEST%'" >nul 2>&1
 exit /b 0
 
 :msbuild_error
@@ -440,16 +447,8 @@ goto :failure
 
 :success_without_timestamp
 echo.
-echo %C_YELLOW%Timestamp/mutation SKIPPED BY REQUEST (AMEGER_SKIP_TIMESTAMP=1).%C_RESET%
-echo.
-echo Build completed successfully.
-echo.
-echo Cache:   %C_GREEN%%RELEASE_CACHE%%C_RESET%
-echo Interface x64: %C_GREEN%%OUT64%\Injector - x64.exe%C_RESET%
-echo Runtime DLL: %C_GREEN%%RUNTIME_DLL%%C_RESET%
-echo Payload:     %C_GREEN%%PAYLOAD_DEST%%C_RESET%
-if "%NO_PAUSE%"=="0" pause
-exit /b 0
+echo %C_RED%ERROR: AMEGER_SKIP_TIMESTAMP=1 ships unmutated binaries (stable timestamps, MSVC Rich fingerprint, standard section names, PDB debug directory). Refusing: rebuild without the bypass for any shipped build.%C_RESET%
+goto :failure
 
 :failure
 if "%NO_PAUSE%"=="0" pause

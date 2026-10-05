@@ -127,7 +127,7 @@ DWORD MMAP_NATIVE::ManualMap(const INJECTION_SOURCE & Source, HANDLE hTargetProc
 	{
 		INIT_ERROR_DATA(error_data, INJ_ERR_ADVANCED_NOT_DEFINED);
 
-		LOG(1, "Dynamic NT offsets not ready, refusing in-memory load\n");
+		LOG(1, "Dynamic OS offsets not ready, refusing in-memory load\n");
 
 		return INJ_ERR_SYMBOL_INIT_NOT_DONE;
 	}

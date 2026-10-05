@@ -113,7 +113,7 @@ DWORD ResolveImports(ERROR_DATA & error_data)
 	// plaintext in a LOG format string lands in .rdata and is caught by the
 	// interface's string-encryption gate. The name itself is already known
 	// from the line above.
-	LOG(1, "native nt module    loaded at %p\n", g_hNTDLL);
+	LOG(1, "native OS module    loaded at %p\n", g_hNTDLL);
 	LOG(1, "OSVersion = %lu\nOSBuildVersion = %lu\n", GetOSVersion(), GetOSBuildVersion());
 
 	auto k32_name = XOR_STR_W(L"kernel32.dll");
@@ -189,7 +189,7 @@ DWORD ResolveImports(ERROR_DATA & error_data)
 		}
 	});
 
-	LOG(1, "Start loading native ntdll symbols\n");
+	LOG(1, "Start loading native OS symbols\n");
 
 	if (LoadSymbolNative(S_FUNC(LdrUnloadDll)))							return INJ_ERR_GET_SYMBOL_ADDRESS_FAILED;
 
@@ -232,7 +232,7 @@ DWORD ResolveImports(ERROR_DATA & error_data)
 			table_ret = LoadSymbolNative(S_FUNC_AS(LdrpInvertedFunctionTable, "LdrpInvertedFunctionTables"));
 			if (table_ret != INJ_ERR_SUCCESS)
 			{
-				LOG(1, "Plural inverted table missing, trying singular\n");
+				LOG(1, "Plural entry missing, trying singular\n");
 				table_ret = LoadSymbolNative(S_FUNC(LdrpInvertedFunctionTable));
 			}
 		}
@@ -241,7 +241,7 @@ DWORD ResolveImports(ERROR_DATA & error_data)
 			table_ret = LoadSymbolNative(S_FUNC(LdrpInvertedFunctionTable));
 			if (table_ret != INJ_ERR_SUCCESS)
 			{
-				LOG(1, "Singular inverted table missing, trying plural\n");
+				LOG(1, "Singular entry missing, trying plural\n");
 				table_ret = LoadSymbolNative(S_FUNC_AS(LdrpInvertedFunctionTable, "LdrpInvertedFunctionTables"));
 			}
 		}
@@ -275,7 +275,7 @@ DWORD ResolveImports(ERROR_DATA & error_data)
 		{
 			INIT_ERROR_DATA(error_data, dyno_ret);
 
-			LOG(1, "Dynamic NT offsets failed: %08X\n", dyno_ret);
+			LOG(1, "Dynamic OS offsets failed: %08X\n", dyno_ret);
 
 			// pdb_guard releases the mapped table and deletes the cached PDB.
 			return INJ_ERR_GET_SYMBOL_ADDRESS_FAILED;
@@ -289,7 +289,7 @@ DWORD ResolveImports(ERROR_DATA & error_data)
 
 	sym_ntdll_native.Cleanup();
 
-	LOG(1, "Native ntdll symbols loaded\n");
+	LOG(1, "Native OS symbols loaded\n");
 
 	sym_parser.Cleanup();
 

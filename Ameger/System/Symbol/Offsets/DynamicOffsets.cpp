@@ -252,7 +252,7 @@ DWORD ResolveDynamicOffsets()
 		else
 		{
 			tmp.TlsEntryModuleEntry = static_cast<DWORD>(sizeof(LIST_ENTRY) + sizeof(IMAGE_TLS_DIRECTORY));
-			LOG(1, "DynamicOffsets: TLS_ENTRY module slot via SDK math 0x%X (PDB type absent)\n", tmp.TlsEntryModuleEntry);
+			LOG(1, "DynamicOffsets: TLS slot via SDK math 0x%X (PDB type absent)\n", tmp.TlsEntryModuleEntry);
 		}
 		ULONG64 tls_sz = 0;
 		if (sym_parser.GetTypeSizeAny(kTls, _countof(kTls), tls_sz) == SYMBOL_ERR_SUCCESS && tls_sz && tls_sz < 0x400)
@@ -262,7 +262,7 @@ DWORD ResolveDynamicOffsets()
 		else
 		{
 			tmp.TlsEntrySize = static_cast<DWORD>(sizeof(LIST_ENTRY) + sizeof(IMAGE_TLS_DIRECTORY) + sizeof(PVOID) + sizeof(SIZE_T));
-			LOG(1, "DynamicOffsets: TLS_ENTRY size via SDK math %lu\n", tmp.TlsEntrySize);
+			LOG(1, "DynamicOffsets: TLS size via SDK math %lu\n", tmp.TlsEntrySize);
 		}
 	}
 
@@ -284,7 +284,7 @@ DWORD ResolveDynamicOffsets()
 			// Fallback keeps the reverse-engineered size; it is only a heap
 			// allocation length, never an in-target field offset.
 			tmp.LdrpPathSearchContextSize = static_cast<DWORD>(sizeof(FALLBACK_CTX));
-			LOG(1, "DynamicOffsets: PATH_SEARCH_CONTEXT size via fallback %lu\n", tmp.LdrpPathSearchContextSize);
+			LOG(1, "DynamicOffsets: path context size via fallback %lu\n", tmp.LdrpPathSearchContextSize);
 		}
 		DWORD ctx_off = 0;
 		if (sym_parser.GetFieldOffsetAny(kPathCtx, _countof(kPathCtx), f_orig_full_dll.get(), ctx_off) == SYMBOL_ERR_SUCCESS && ctx_off < 0x400)
@@ -294,7 +294,7 @@ DWORD ResolveDynamicOffsets()
 		else
 		{
 			tmp.LdrpPathSearchOriginalFullDllName = static_cast<DWORD>(offsetof(FALLBACK_CTX, c));
-			LOG(1, "DynamicOffsets: PATH_SEARCH_CONTEXT name via fallback 0x%X\n", tmp.LdrpPathSearchOriginalFullDllName);
+			LOG(1, "DynamicOffsets: path context name via fallback 0x%X\n", tmp.LdrpPathSearchOriginalFullDllName);
 		}
 	}
 
@@ -306,7 +306,7 @@ DWORD ResolveDynamicOffsets()
 		HMODULE hNtdll = GetModuleHandleW(ntdll_name.get());
 		if (!hNtdll)
 		{
-			LOG(1, "DynamicOffsets: no ntdll for wait disassembly\n");
+			LOG(1, "DynamicOffsets: no OS module for wait disassembly\n");
 			return SYMBOL_ERR_SYMBOL_SEARCH_FAILED;
 		}
 		auto dly = XOR_STR_A("NtDelayExecution");
@@ -380,7 +380,7 @@ DWORD ResolveDynamicOffsets()
 
 	tmp.Ready = 1;
 	g_DynamicOffsets = tmp;
-	LOG(1, "DynamicOffsets ready: TEB{Flags=0x%X LastErr=0x%X Peb=0x%X} PEB{Build=0x%X Ldr=0x%X} KUSER{cookie=0x%X} LDR{DllBase=0x%X size=%lu} INV{count=0x%X entries=0x%X}\n",
+	LOG(1, "DynamicOffsets ready: t0=0x%X t1=0x%X t2=0x%X p0=0x%X p1=0x%X k0=0x%X l0=0x%X sz=%lu i0=0x%X i1=0x%X\n",
 		tmp.TebSameTebFlags, tmp.TebLastErrorValue, tmp.TebProcessEnvironmentBlock,
 		tmp.PebOsBuildNumber, tmp.PebLdr, tmp.KuserCookie, tmp.LdrEntryDllBase, tmp.LdrEntrySize,
 		tmp.InvertedTableCount, tmp.InvertedTableEntries);

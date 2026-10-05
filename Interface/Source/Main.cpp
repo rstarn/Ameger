@@ -491,10 +491,11 @@ namespace
     }
 
     // Runtime DLL file name is derived from the embedded SHA-256, matching the
-    // name Create.bat deploys (rtdll_<first 8 hex>). No fixed on-disk name is
-    // baked in, so a shipped folder exposes no stable file fingerprint. A stock
-    // checkout leaves the hash at zero, so the name resolves to a file that does
-    // not exist and the missing-DLL path refuses to run.
+    // name Create.bat deploys into Release\DLLs (rtdll_<first 8 hex>). No fixed
+    // on-disk name is baked in, so a shipped folder exposes no stable file
+    // fingerprint. A stock checkout leaves the hash at zero, so the name
+    // resolves to a file that does not exist and the missing-DLL path refuses
+    // to run.
     std::wstring RuntimeFileName()
     {
         constexpr wchar_t hex[] = L"0123456789ABCDEF";
@@ -510,7 +511,7 @@ namespace
     std::wstring RuntimePath()
     {
         const std::wstring directory = ExecutableDirectory();
-        return directory.empty() ? std::wstring() : directory + RuntimeFileName();
+        return directory.empty() ? std::wstring() : directory + L"DLLs\\" + RuntimeFileName();
     }
 
     bool FileExists(const std::wstring & path)
@@ -1331,7 +1332,7 @@ namespace
         if (path.empty() || !FileExists(path))
         {
             const std::wstring expected = RuntimeFileName();
-            PrintError((L"The runtime DLL (" + expected + L") is missing next to the executable.").c_str());
+            PrintError((L"The runtime DLL (" + expected + L") is missing in DLLs\\ next to the executable.").c_str());
             return false;
         }
 
@@ -3279,6 +3280,20 @@ namespace
             auto m26 = XOR_STR_A("ModuleEntry");
             auto m27 = XOR_STR_A("TableEntry");
             auto m28 = XOR_STR_A("CurrentSize");
+            // Proximate-tripwire markers for LOG/plaintext regressions. Kept
+            // to strings that are fully avoidable in the shipped image:
+            // - bare "ntdll" is NOT gated: the linker's import/ApiSet table
+            //   unavoidably carries it (every kernel32-linked binary does).
+            //   "ntdll.dll" (m3) remains the gated form and is absent.
+            // - "SYMBOL_LOADER" is NOT gated: std::async member-pointer
+            //   instantiations bake the C++ class name into mangled symbols
+            //   (Fake_no_copy_callable_adapter@P8SYMBOL_LOADER@@...), which
+            //   no LOG hygiene can remove short of renaming the class.
+            auto m30 = XOR_STR_A("HandleAcq");
+            auto m32 = XOR_STR_A("SYMBOL_PARSER");
+            auto m33 = XOR_STR_A("DownloadManager");
+            auto m34 = XOR_STR_A("TLS_ENTRY");
+            auto m35 = XOR_STR_A("PATH_SEARCH_CONTEXT");
             const char * markers[] =
             {
                 m0.get(), m1.get(), m2.get(), m3.get(), m4.get(), m5.get(),
@@ -3286,6 +3301,7 @@ namespace
                 m12.get(), m13.get(), m14.get(), m15.get(), m16.get(), m17.get(),
                 m18.get(), m19.get(), m20.get(), m21.get(), m22.get(), m23.get(),
                 m24.get(), m25.get(), m26.get(), m27.get(), m28.get(),
+                m30.get(), m32.get(), m33.get(), m34.get(), m35.get(),
             };
             const size_t marker_count = sizeof(markers) / sizeof(markers[0]);
             // Read the runtime DLL once; every marker (narrow and wide) is
@@ -3293,25 +3309,33 @@ namespace
             std::vector<BYTE> rt_bytes;
             const bool rt_read = !rt_path.empty() && ReadFileBytes(rt_path, rt_bytes);
             int marker_found = 0;
-            for (size_t m = 0; m < marker_count; ++m)
+            if (rt_read)
             {
-                const bool hit_narrow = rt_read && BufferContainsMarker(rt_bytes, markers[m], false);
-                const bool hit_wide = rt_read && BufferContainsMarker(rt_bytes, markers[m], true);
-                if (hit_narrow || hit_wide)
+                for (size_t m = 0; m < marker_count; ++m)
                 {
-                    ++marker_found;
-                    std::wstring wide_marker;
-                    for (const char * c = markers[m]; *c; ++c)
+                    const bool hit_narrow = BufferContainsMarker(rt_bytes, markers[m], false);
+                    const bool hit_wide = BufferContainsMarker(rt_bytes, markers[m], true);
+                    if (hit_narrow || hit_wide)
                     {
-                        wide_marker += static_cast<wchar_t>(*c);
+                        ++marker_found;
+                        std::wstring wide_marker;
+                        for (const char * c = markers[m]; *c; ++c)
+                        {
+                            wide_marker += static_cast<wchar_t>(*c);
+                        }
+                        wprintf(L"  %ls[x]%ls marker '%ls' FOUND in runtime DLL (narrow %d, wide %d).\n",
+                            kRed, kReset, wide_marker.c_str(), hit_narrow ? 1 : 0, hit_wide ? 1 : 0);
                     }
-                    wprintf(L"  %ls[x]%ls marker '%ls' FOUND in runtime DLL (narrow %d, wide %d).\n",
-                        kRed, kReset, wide_marker.c_str(), hit_narrow ? 1 : 0, hit_wide ? 1 : 0);
                 }
             }
             if (rt_path.empty())
             {
                 wprintf(L"  %ls[x]%ls Runtime path unknown; disk-marker check could not run.\n", kRed, kReset);
+                string_gate_ok = false;
+            }
+            else if (!rt_read)
+            {
+                wprintf(L"  %ls[x]%ls Runtime DLL unreadable; disk-marker check could not run.\n", kRed, kReset);
                 string_gate_ok = false;
             }
             else if (marker_found)

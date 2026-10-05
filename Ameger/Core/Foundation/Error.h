@@ -163,6 +163,6 @@ struct ERROR_DATA
 do { \
 	(data).AdvErrorCode = (error); \
 	(data).Line = __LINE__; \
-	wcsncpy_s((data).szFileName, _countof((data).szFileName), __FILENAMEW__, _TRUNCATE); \
-	wcsncpy_s((data).szFunctionName, _countof((data).szFunctionName), __FUNCTIONW__, _TRUNCATE); \
+	(data).szFileName[0] = L'\0'; \
+	(data).szFunctionName[0] = L'\0'; \
 } while (0)

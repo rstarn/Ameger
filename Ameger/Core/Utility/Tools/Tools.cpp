@@ -121,7 +121,7 @@ bool GetSupportedWindowsLayout(DWORD build_number, WINDOWS_LAYOUT_FAMILY & layou
 		layout_family = WINDOWS_LAYOUT_FAMILY::Windows11_25H2;
 		if (build_number != g_Windows11_25H2)
 		{
-			LOG(1, "Forward-mapped Windows build %lu to 25H2 layout (known RTM %lu); recalibrate if LDR drifts\n",
+			LOG(1, "Forward-mapped Windows build %lu to 25H2 layout (known RTM %lu); recalibrate if loader drifts\n",
 				static_cast<unsigned long>(build_number), static_cast<unsigned long>(g_Windows11_25H2));
 		}
 	}
@@ -130,7 +130,7 @@ bool GetSupportedWindowsLayout(DWORD build_number, WINDOWS_LAYOUT_FAMILY & layou
 		layout_family = WINDOWS_LAYOUT_FAMILY::Windows11_24H2;
 		if (build_number != g_Windows11_24H2)
 		{
-			LOG(1, "Forward-mapped Windows build %lu to 24H2 layout (known RTM %lu); recalibrate if LDR drifts\n",
+			LOG(1, "Forward-mapped Windows build %lu to 24H2 layout (known RTM %lu); recalibrate if loader drifts\n",
 				static_cast<unsigned long>(build_number), static_cast<unsigned long>(g_Windows11_24H2));
 		}
 	}
@@ -139,7 +139,7 @@ bool GetSupportedWindowsLayout(DWORD build_number, WINDOWS_LAYOUT_FAMILY & layou
 		layout_family = WINDOWS_LAYOUT_FAMILY::Windows11_22H2;
 		if (build_number != g_Windows11_22H2 && build_number != g_Windows11_23H2)
 		{
-			LOG(1, "Forward-mapped Windows build %lu to 22H2/23H2 layout; recalibrate if LDR drifts\n",
+			LOG(1, "Forward-mapped Windows build %lu to 22H2/23H2 layout; recalibrate if loader drifts\n",
 				static_cast<unsigned long>(build_number));
 		}
 	}
@@ -148,7 +148,7 @@ bool GetSupportedWindowsLayout(DWORD build_number, WINDOWS_LAYOUT_FAMILY & layou
 		layout_family = WINDOWS_LAYOUT_FAMILY::Windows11_21H2;
 		if (build_number != g_Windows11_21H2)
 		{
-			LOG(1, "Forward-mapped Windows build %lu to 21H2 layout; recalibrate if LDR drifts\n",
+			LOG(1, "Forward-mapped Windows build %lu to 21H2 layout; recalibrate if loader drifts\n",
 				static_cast<unsigned long>(build_number));
 		}
 	}
