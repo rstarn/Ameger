@@ -165,29 +165,34 @@ DWORD SR_HijackThread(HANDLE hTargetProc, f_Routine pRoutine, void * pArg, DWORD
 				processInformation.SetCurrentThreadHandle(Duplicated, SponsorTidActual);
 				do
 				{
-					if (processInformation.GetThreadId() != SponsorTidActual)
+					// Only the enumeration entry whose TID matches the sponsor is
+					// interesting. Written as a positive test rather than
+					// "continue" on mismatch: continue re-evaluates the while
+					// condition, which does advance the enumeration and is
+					// bounded by the thread count, but reads like a loop-next
+					// and invites a real spin if the condition ever changes.
+					if (processInformation.GetThreadId() == SponsorTidActual)
 					{
-						continue;
-					}
-					if (processInformation.IsThreadWorkerThread())
-					{
-						LOG(2, "Sponsor TID %06X is a loader worker; ignoring sponsor\n", SponsorTidActual);
+						if (processInformation.IsThreadWorkerThread())
+						{
+							LOG(2, "Sponsor TID %06X is a loader worker; ignoring sponsor\n", SponsorTidActual);
+							break;
+						}
+						KTHREAD_STATE st{};
+						KWAIT_REASON wr{};
+						const bool have_state = processInformation.GetThreadState(st, wr);
+						const bool alertable = processInformation.IsThreadInAlertableState();
+						if (alertable || (have_state && st == KTHREAD_STATE::Running))
+						{
+							sponsor_usable = true;
+						}
+						else
+						{
+							LOG(2, "Sponsor TID %06X not alertable/Running (state=%d reason=%d); ignoring sponsor\n",
+								SponsorTidActual, have_state ? static_cast<int>(st) : -1, have_state ? static_cast<int>(wr) : -1);
+						}
 						break;
 					}
-					KTHREAD_STATE st{};
-					KWAIT_REASON wr{};
-					const bool have_state = processInformation.GetThreadState(st, wr);
-					const bool alertable = processInformation.IsThreadInAlertableState();
-					if (alertable || (have_state && st == KTHREAD_STATE::Running))
-					{
-						sponsor_usable = true;
-					}
-					else
-					{
-						LOG(2, "Sponsor TID %06X not alertable/Running (state=%d reason=%d); ignoring sponsor\n",
-							SponsorTidActual, have_state ? static_cast<int>(st) : -1, have_state ? static_cast<int>(wr) : -1);
-					}
-					break;
 				}
 				while (processInformation.NextThread());
 			}

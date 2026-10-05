@@ -17,7 +17,10 @@ if defined ESC (
     set "C_YELLOW=%ESC%[93m"
 )
 
-for %%I in ("%~dp0..") do set "ROOT=%%~fI"
+rem This script lives in Build\Executors\, so the repository root is two levels
+rem up. Rooting at "%~dp0.." resolved to Build\ itself and made every path
+rem below expand to Build\Build\Release.
+for %%I in ("%~dp0..\..") do set "ROOT=%%~fI"
 set "BUILD_DIR=%ROOT%\Build"
 set "OUT_ROOT=%ROOT%\Build\Release"
 set "DLL_DIR=%OUT_ROOT%\DLLs"
@@ -33,6 +36,10 @@ set "CONFIG_SCRIPT=%SCRIPTS_DIR%\ProtectConfig.ps1"
 set "VERIFY_SCRIPT=%SCRIPTS_DIR%\VerifyEmbedMagic.ps1"
 set "CONFIG_MASTER=%BUILD_DIR%\Configuration.ini"
 set "PAYLOAD_ASSET=%ROOT%\Assets\DLL\Jlov.dll"
+rem Optional pre-protected payload drop point. If this file exists (or
+rem AMEGER_PAYLOAD points somewhere) it is deployed instead of the pristine
+rem asset and the PayloadSha256 pin is re-pinned to match it.
+set "PAYLOAD_PROTECTED=%ROOT%\Assets\DLL\Jlov.protected.dll"
 set "PAYLOAD_DEST=%DLL_DIR%\Jlov.dll"
 rem Stock runtime build output name (the runtime vcxproj TargetName). Referenced
 rem only before the hash-derived rename below; after the rename the release
@@ -210,6 +217,12 @@ if not exist "%MUTATE_SCRIPT%" goto :mutate_exe_error
 powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%MUTATE_SCRIPT%" "%OUT64%\Host - x64.exe"
 if errorlevel 1 goto :mutate_exe_error
 
+rem The baseline must be recorded AFTER the EXE mutations above, not earlier:
+rem BuildPE.ps1 renames .text to .main and friends, so a manifest captured
+rem before that point would describe a binary that no longer exists.
+call :write_section_manifest
+if errorlevel 1 goto :manifest_error
+
 :timestamp_skipped
 echo.
 echo Build completed successfully.
@@ -363,15 +376,37 @@ exit /b 0
 rem Ship the target payload next to the EXE so the release folder is
 rem self-contained. Fail closed: a missing asset or a failed copy would leave
 rem the injector without the DLL it targets, so never skip silently.
-if not exist "%PAYLOAD_ASSET%" (
-  echo   %C_RED%ERROR: payload asset not found: %PAYLOAD_ASSET%%C_RESET%
+rem
+rem Source resolution, in order:
+rem   1. %AMEGER_PAYLOAD%          explicit path to a prepared DLL
+rem   2. Assets\DLL\Jlov.protected.dll   conventional drop point
+rem   3. Assets\DLL\Jlov.dll       the pristine asset (default)
+rem Option 1/2 exist so an already VMProtect'd payload can be shipped without
+rem hand-editing anything. When the source is not the pristine asset its digest
+rem no longer matches the PayloadSha256 pin, so the master is re-pinned to
+rem whatever was actually deployed; otherwise the verification below would
+rem reject the build.
+set "PAYLOAD_SRC=%PAYLOAD_ASSET%"
+set "PAYLOAD_IS_PREPARED="
+if defined AMEGER_PAYLOAD (
+  set "PAYLOAD_SRC=%AMEGER_PAYLOAD%"
+  set "PAYLOAD_IS_PREPARED=1"
+) else if exist "%PAYLOAD_PROTECTED%" (
+  set "PAYLOAD_SRC=%PAYLOAD_PROTECTED%"
+  set "PAYLOAD_IS_PREPARED=1"
+)
+if not exist "%PAYLOAD_SRC%" (
+  echo   %C_RED%ERROR: payload asset not found: %PAYLOAD_SRC%%C_RESET%
   exit /b 1
 )
-copy /y "%PAYLOAD_ASSET%" "%PAYLOAD_DEST%" >nul
+if defined PAYLOAD_IS_PREPARED echo   %C_YELLOW%[+]%C_RESET% Prepared payload: %C_YELLOW%%PAYLOAD_SRC%%C_RESET%
+copy /y "%PAYLOAD_SRC%" "%PAYLOAD_DEST%" >nul
 if errorlevel 1 (
   echo   %C_RED%ERROR: failed to copy payload to %PAYLOAD_DEST%%C_RESET%
   exit /b 1
 )
+if defined PAYLOAD_IS_PREPARED call :repin_payload
+if errorlevel 1 goto :payload_pin_error
 rem Fail closed: the deployed DLL must match the PayloadSha256 pin in the
 rem plaintext master. A stale or substituted payload would silently defeat the
 rem injector's pinned-hash startup check, so verify now and abort on mismatch.
@@ -383,6 +418,42 @@ if errorlevel 1 (
 echo   %C_GREEN%[+]%C_RESET% Payload deployed: %C_GREEN%%PAYLOAD_DEST%%C_RESET%
 powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -Command "Set-Clipboard -Value '%PAYLOAD_DEST%'" >nul 2>&1
 exit /b 0
+
+:repin_payload
+rem Point PayloadSha256 at the payload actually deployed. Only reached when a
+rem prepared/protected DLL was substituted, because that digest cannot equal
+rem the pristine pin committed in the master.
+set "DEPLOYED_SHA="
+for /f "usebackq tokens=1,2 delims==" %%A in (`powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -Command "$h=([BitConverter]::ToString([Security.Cryptography.SHA256]::Create().ComputeHash([IO.File]::ReadAllBytes('%PAYLOAD_DEST%'))) -replace '-',''); Write-Output ('DEPLOYED_SHA=' + $h)"`) do set "%%A=%%B"
+if not defined DEPLOYED_SHA (
+  echo   %C_RED%ERROR: unable to hash the prepared payload for re-pinning.%C_RESET%
+  exit /b 1
+)
+powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -Command "$c=[IO.File]::ReadAllText('%CONFIG_MASTER%'); $c=[regex]::Replace($c,'(?m)^PayloadSha256\s*=.*$','PayloadSha256 = '+('%DEPLOYED_SHA%')); [IO.File]::WriteAllText('%CONFIG_MASTER%',$c,[Text.Encoding]::ASCII)"
+if errorlevel 1 (
+  echo   %C_RED%ERROR: unable to re-pin PayloadSha256 for the prepared payload.%C_RESET%
+  exit /b 1
+)
+echo   %C_GREEN%[+]%C_RESET% PayloadSha256 re-pinned to %C_GREEN%%DEPLOYED_SHA%%C_RESET%
+exit /b 0
+
+:write_section_manifest
+rem Record the post-mutation section names of both shippable binaries. The
+rem protection stages need a baseline to tell "already virtualized" apart from
+rem "renamed by BuildPE": this project deliberately rewrites section names
+rem (.text becomes .main and friends), so any heuristic based on "is the name
+rem standard" reports our own build as already protected and blocks it. A
+rem recorded baseline makes the comparison exact. The manifest lives in Cache
+rem so it never ships in the release folder.
+set "MANIFEST=%RELEASE_CACHE%\pe-sections.txt"
+powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -Command "$out=@(); foreach($p in @('%OUT64%\Host - x64.exe','%PAYLOAD_DEST%')){ if(-not (Test-Path -LiteralPath $p)){exit 1}; $b=[IO.File]::ReadAllBytes($p); $e=[BitConverter]::ToInt32($b,0x3C); $c=$e+4; $n=[BitConverter]::ToUInt16($b,$c+2); $z=[BitConverter]::ToUInt16($b,$c+16); $s=$c+20+$z; $names=@(); for($i=0;$i -lt $n;$i++){ $o=$s+40*$i; $nm=[Text.Encoding]::ASCII.GetString($b,$o,8).Trim([char]0); $x=[BitConverter]::ToUInt32($b,$o+36); if($x -band 0x20000000){ $names += ($nm + '+X') } else { $names += $nm } }; $out += ([IO.Path]::GetFileName($p) + ':' + ($names -join ',')) }; [IO.File]::WriteAllLines('%MANIFEST%',$out)"
+if errorlevel 1 exit /b 1
+if not exist "%MANIFEST%" exit /b 1
+exit /b 0
+
+:manifest_error
+echo   %C_RED%ERROR: unable to record the PE section baseline manifest.%C_RESET%
+goto :failure
 
 :msbuild_error
 echo %C_RED%ERROR: MSBuild was not found.%C_RESET%

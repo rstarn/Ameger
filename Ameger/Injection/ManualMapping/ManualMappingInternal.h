@@ -160,6 +160,11 @@ namespace MMAP_NATIVE
 
 		ALIGN BYTE *	pAllocationBase	= nullptr;
 		ALIGN BYTE *	pImageBase		= nullptr;
+		// Pages touched once immediately after the image reservation, so the
+		// demand-zero soft faults are all raised in one early burst instead of
+		// being scattered across mapping, TLS and DllMain. Diagnostic only:
+		// SIZE_T so it needs no new alignment slot.
+		ALIGN SIZE_T	PrefaultedPages	= 0;
 		ALIGN BYTE *	pRawData		= nullptr;
 		ALIGN DWORD		RawSize			= 0;
 		

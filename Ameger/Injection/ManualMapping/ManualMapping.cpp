@@ -943,7 +943,40 @@ DWORD __declspec(code_seg(".mmap_sec$02")) __stdcall MMI_MapSections(MANUAL_MAPP
 	
 	pData->pImageBase = pData->pAllocationBase;
 
-	
+	// Pre-fault the freshly reserved image before anything executes from it.
+	//
+	// Warden installs a vectored exception handler and has no SEH frames at
+	// all, so every fault raised in this process is delivered to it - including
+	// a fault whose faulting address is inside memory it has never seen. The
+	// donor thread's RIP is already unbacked for the whole of this routine, so
+	// the controllable variable is how many faults occur and when. Freshly
+	// committed pages are demand-zero, so every first touch faults; scattering
+	// those faults across section mapping, relocation, import fixup, TLS and
+	// DllMain produces a long tail of exceptions at unpredictable addresses.
+	// Touching each page exactly once here concentrates them into a single
+	// early burst that occurs while only this routine is running, and after
+	// this loop the rest of the map runs fault-free.
+	//
+	// This does not eliminate the window - only a kernel-side allocation of
+	// pre-committed pages would - but it removes the unpredictable part.
+	//
+	// The stride is the 4 KiB page, deliberately NOT BASE_ALIGNMENT: that macro
+	// is 0x10 and exists for structure alignment, so using it here would walk
+	// the image sixteen times more often than needed.
+	if (pData->pImageBase && ImgSize)
+	{
+		volatile BYTE * touch = pData->pImageBase;
+		SIZE_T faulted = 0;
+		for (SIZE_T offset = 0; offset < ImgSize; offset += 0x1000)
+		{
+			touch[offset] = touch[offset];
+			++faulted;
+		}
+		// Cover the final partial page as well.
+		touch[ImgSize - 1] = touch[ImgSize - 1];
+		pData->PrefaultedPages = faulted;
+	}
+
 	f->memmove(pData->pImageBase, pData->pRawData, pData->pOptionalHeader->SizeOfHeaders);
 
 	auto * pCurrentSectionHeader = IMAGE_FIRST_SECTION(pData->pNtHeaders);
