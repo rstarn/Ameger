@@ -13,6 +13,14 @@ static THREAD_EXEC_STATS g_ThreadExecStats{};
 
 namespace
 {
+	// Handle-needing probes per search pass. GetTEB (worker check) and the
+	// alertable check each OpenThread on a target thread, so an unbounded walk
+	// opened a game-thread handle for every candidate in the process - a
+	// handle-enumeration fingerprint far louder than any single syscall.
+	// Snapshot data (state/reason/TID) needs no handle, so it filters first and
+	// only this many candidates are confirmed by handle.
+	constexpr DWORD kMaxHandleProbes = 4;
+
 	DWORD FindHijackThread(ProcessInformation & processInformation, bool allow_waiting, bool alertable_only)
 	{
 		// Thread-state values are download-dependent (see g_DynamicOffsets,
@@ -25,6 +33,7 @@ namespace
 		}
 		const KWAIT_REASON wrQueue = static_cast<KWAIT_REASON>(g_DynamicOffsets.WaitReasonWrQueue);
 		const KTHREAD_STATE running = static_cast<KTHREAD_STATE>(g_DynamicOffsets.ThreadStateRunning);
+		DWORD probes = 0;
 		do
 		{
 			KWAIT_REASON reason;
@@ -35,32 +44,58 @@ namespace
 			}
 
 			const DWORD candidate = processInformation.GetThreadId();
-			if (!candidate || candidate == GetCurrentThreadId() || processInformation.IsThreadWorkerThread())
+			if (!candidate || candidate == GetCurrentThreadId())
 			{
 				continue;
 			}
 
+			// Handle-free filter first: a WrQueue waiter never wakes on
+			// PostThreadMessage, so a WrQueue thread is only ever considered
+			// in the final all-inclusive tier.
 			if (reason == wrQueue && !allow_waiting)
 			{
 				continue;
 			}
 
-			if (alertable_only)
+			// Second handle-free filter: a tier that accepts on state alone
+			// must never spend a probe proving what the snapshot already said.
+			// Ordering matters - || short-circuits, so the cheap test is first.
+			const bool state_qualifies = allow_waiting || state == running;
+			if (state_qualifies && !alertable_only)
 			{
-				// Stealth-first pass: only a thread already parked in an
-				// alertable wait. Borrowing it avoids suspending a Running
-				// thread that may be inside a timing/integrity loop, where
-				// the stall itself is the signal. Same accept set as below,
-				// only reordered - Running stays available as fallback.
-				if (processInformation.IsThreadInAlertableState())
+				// The worker check reads TEB::SameTebFlags, so it needs a
+				// handle too. It is counted against the same budget: a process
+				// full of loader workers would otherwise open one handle per
+				// worker thread just to reject each of them.
+				if (probes >= kMaxHandleProbes)
 				{
-					return candidate;
+					break;
+				}
+				++probes;
+
+				if (processInformation.IsThreadWorkerThread())
+				{
+					continue;
 				}
 
+				return candidate;
+			}
+
+			// Everything below needs a handle on the target thread. Once the
+			// budget is spent this pass can no longer confirm alertability, so
+			// it stops instead of walking the whole thread list.
+			if (probes >= kMaxHandleProbes)
+			{
+				break;
+			}
+			++probes;
+
+			if (processInformation.IsThreadWorkerThread())
+			{
 				continue;
 			}
 
-			if (allow_waiting || processInformation.IsThreadInAlertableState() || state == running)
+			if (processInformation.IsThreadInAlertableState())
 			{
 				return candidate;
 			}

@@ -101,7 +101,10 @@ namespace
 		UniqueHandle Token(RawToken);
 
 		LUID Luid{ 0 };
-		if (!LookupPrivilegeValueW(nullptr, SE_DEBUG_NAME, &Luid))
+		// SE_DEBUG_NAME is a plaintext SDK literal ("SeDebugPrivilege") that
+		// would otherwise persist in .rdata; decrypt it onto the stack for
+		// the duration of this call only.
+		if (!LookupPrivilegeValueW(nullptr, XOR_STR_W(L"SeDebugPrivilege").get(), &Luid))
 		{
 			return false;
 		}

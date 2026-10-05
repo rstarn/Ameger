@@ -157,7 +157,7 @@ if not exist "%DLL_DIR%" mkdir "%DLL_DIR%"
 move /y "%RUNTIME_STOCK_DLL%" "%RUNTIME_DLL%" >nul
 if not exist "%RUNTIME_DLL%" goto :runtime_rename_error
 rem Value column is shared with BuildPE.ps1's closing summary line; both start
-rem at 2-space indent. "10/10 mutations applied" is 23 chars, "Runtime SHA-256:"
+rem at 2-space indent. "11/11 mutations applied" is 23 chars, "Runtime SHA-256:"
 rem is 16, so the 8 spaces below land the hash under the path. If you retune one,
 rem retune the other.
 echo   %C_GREEN%[+]%C_RESET% Runtime SHA-256:        %RUNTIME_SHA256%
@@ -179,7 +179,7 @@ echo.
 
 echo [%C_GREEN%6%C_RESET%/%C_GREEN%6%C_RESET%] Sweeping intermediates into Cache and verifying...
 echo.
-call :verify "%OUT64%\Injector - x64.exe" "x64 Interface"
+call :verify "%OUT64%\Host - x64.exe" "x64 Interface"
 if errorlevel 1 goto :verify_error
 call :verify_embed
 if errorlevel 1 goto :verify_content_error
@@ -204,10 +204,10 @@ if /i "%AMEGER_SKIP_TIMESTAMP%"=="1" goto :success_without_timestamp
 if not exist "%TIMESTAMP_SCRIPT%" goto :timestamp_missing
 where powershell.exe >nul 2>&1
 if errorlevel 1 goto :timestamp_missing
-powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%TIMESTAMP_SCRIPT%" "%OUT64%\Injector - x64.exe"
+powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%TIMESTAMP_SCRIPT%" "%OUT64%\Host - x64.exe"
 if errorlevel 1 goto :timestamp_error
 if not exist "%MUTATE_SCRIPT%" goto :mutate_exe_error
-powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%MUTATE_SCRIPT%" "%OUT64%\Injector - x64.exe"
+powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%MUTATE_SCRIPT%" "%OUT64%\Host - x64.exe"
 if errorlevel 1 goto :mutate_exe_error
 
 :timestamp_skipped
@@ -216,7 +216,7 @@ echo Build completed successfully.
 echo.
 echo Cache:   %C_GREEN%%RELEASE_CACHE%%C_RESET%
 echo Payload:     %C_GREEN%%PAYLOAD_DEST%%C_RESET%
-echo Interface x64: %C_GREEN%%OUT64%\Injector - x64.exe%C_RESET%
+echo Interface x64: %C_GREEN%%OUT64%\Host - x64.exe%C_RESET%
 echo Runtime DLL: %C_GREEN%%RUNTIME_DLL%%C_RESET%
 
 echo.
@@ -295,7 +295,7 @@ exit /b 0
 rem The interface embeds the runtime DLL's 8 SHA-256 words (AmegerRuntimeHash0..7
 rem computed above); prove they are really present, in order, as little-endian
 rem dwords rather than the default zero constants.
-powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%VERIFY_SCRIPT%" -Check Embed -Path "%OUT64%\Injector - x64.exe" -Words "%H0%,%H1%,%H2%,%H3%,%H4%,%H5%,%H6%,%H7%"
+powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%VERIFY_SCRIPT%" -Check Embed -Path "%OUT64%\Host - x64.exe" -Words "%H0%,%H1%,%H2%,%H3%,%H4%,%H5%,%H6%,%H7%"
 exit /b %ERRORLEVEL%
 
 :verify_config_magic

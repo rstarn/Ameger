@@ -2915,26 +2915,28 @@ namespace
             wprintf(L"\n\n[%ls%d%ls/%ls%d%ls] Clean data directories...\n\n", kGreen, step, kReset, kGreen, total, kReset);
             const bool have_shell_report = MapStats &&
                 (MapStats->CleanedMask || MapStats->ImportSize || MapStats->DelayImportSize ||
-                 MapStats->RelocSize || MapStats->TlsSize || MapStats->DebugSize);
+                 MapStats->RelocSize || MapStats->TlsSize || MapStats->DebugSize || MapStats->ExportSize);
 
             if (have_shell_report)
             {
                 // Reported by the shell from inside the target - the only source
                 // that survives the header erasure.
-                wprintf(L"  %ls[+]%ls Import = %ls%d%ls | DelayImport = %ls%d%ls | Reloc = %ls%d%ls | TLS = %ls%d%ls | Debug = %ls%d%ls\n",
+                wprintf(L"  %ls[+]%ls Import = %ls%d%ls | DelayImport = %ls%d%ls | Reloc = %ls%d%ls | TLS = %ls%d%ls | Debug = %ls%d%ls | Export = %ls%d%ls\n",
                     kGreen, kReset,
                     kGreen, static_cast<int>((MapStats->CleanedMask >> IMAGE_DIRECTORY_ENTRY_IMPORT) & 1), kReset,
                     kGreen, static_cast<int>((MapStats->CleanedMask >> IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT) & 1), kReset,
                     kGreen, static_cast<int>((MapStats->CleanedMask >> IMAGE_DIRECTORY_ENTRY_BASERELOC) & 1), kReset,
                     kGreen, static_cast<int>((MapStats->CleanedMask >> IMAGE_DIRECTORY_ENTRY_TLS) & 1), kReset,
-                    kGreen, static_cast<int>((MapStats->CleanedMask >> IMAGE_DIRECTORY_ENTRY_DEBUG) & 1), kReset);
-                wprintf(L"  %ls[+]%ls Pre-clean sizes: Import %ls0x%08X%ls | DelayImport %ls0x%08X%ls | Reloc %ls0x%08X%ls | TLS %ls0x%08X%ls | Debug %ls0x%08X%ls\n",
+                    kGreen, static_cast<int>((MapStats->CleanedMask >> IMAGE_DIRECTORY_ENTRY_DEBUG) & 1), kReset,
+                    kGreen, static_cast<int>((MapStats->CleanedMask >> IMAGE_DIRECTORY_ENTRY_EXPORT) & 1), kReset);
+                wprintf(L"  %ls[+]%ls Pre-clean sizes: Import %ls0x%08X%ls | DelayImport %ls0x%08X%ls | Reloc %ls0x%08X%ls | TLS %ls0x%08X%ls | Debug %ls0x%08X%ls | Export %ls0x%08X%ls\n",
                     kGreen, kReset,
                     kGreen, MapStats->ImportSize, kReset,
                     kGreen, MapStats->DelayImportSize, kReset,
                     kGreen, MapStats->RelocSize, kReset,
                     kGreen, MapStats->TlsSize, kReset,
-                    kGreen, MapStats->DebugSize, kReset);
+                    kGreen, MapStats->DebugSize, kReset,
+                    kGreen, MapStats->ExportSize, kReset);
                 wprintf(L"\n  %ls[+]%ls All data directories zeroed successfully.\n", kGreen, kReset);
             }
             else if (nt_data)
@@ -4585,6 +4587,19 @@ namespace
     // Runs target selection, DLL validation, and injection.
     int RunInteractiveWizard(Runtime & runtime)
     {
+        // Bland per-run console title: the default title is the executable
+        // path (which names the tool), and window titles are a historical
+        // enumeration vector. A fresh random suffix per run leaves no stable
+        // title hash; nothing else depends on the title.
+        {
+            ULONGLONG tick = GetTickCount64();
+            tick ^= tick >> 29;
+            tick *= 0xBF58476D1CE4E5B9ull;
+            tick ^= tick >> 32;
+            wchar_t title[16] = { 0 };
+            swprintf_s(title, L"Host-%08X", static_cast<unsigned int>(tick & 0xFFFFFFFFu));
+            SetConsoleTitleW(title);
+        }
         if (!LoadRuntime(runtime))
         {
             PauseBeforeExit();
@@ -4842,8 +4857,15 @@ namespace
         FileHandleGuard targetHandleGuard;
         if (!targetHandle)
         {
-            const DWORD scan_mask = PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ |
-                PROCESS_VM_WRITE | PROCESS_VM_OPERATION;
+            // Verification/survey reads need QUERY + VM_READ only. WRITE and
+            // OPERATION exist solely for the hook-restore writes, so they are
+            // requested only when HookRestore can actually write; otherwise
+            // this fallback handle carries the quietest usable mask.
+            DWORD scan_mask = PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ;
+            if (config.hook_restore)
+            {
+                scan_mask |= PROCESS_VM_WRITE | PROCESS_VM_OPERATION;
+            }
             targetHandle = OpenProcess(scan_mask, FALSE, target.pid);
             targetHandleGuard.reset(targetHandle);
             if (!targetHandle)
@@ -4888,14 +4910,6 @@ namespace
                 PrintHookScanResult(L"Pre-load hook", pre_stats, pre_unhooked, pre_remaining);
             }
         }
-        else
-        {
-            wprintf(L"    Hook restoration disabled (HookRestore = N).\n");
-        }
-        wprintf(L"\n");
-
-        // Blank line sets the headline apart from the status block below.
-        wprintf(L"Working...\n\n");
 
         // A single attempt, always. The failure path deliberately does not
         // retry in-process: a retry would be a second exposure into a target
@@ -4914,7 +4928,7 @@ namespace
         // the measured TID and timeout are tinted green.
         if (data.TargetTid)
         {
-            wprintf(L"Working (TID %ls0x%04lX%s, timeout %ls%lu ms%s)...\n",
+            wprintf(L"Working (TID %ls0x%04lX%s, Timeout %ls%lu ms%s)...\n",
                 kGreen, static_cast<unsigned long>(data.TargetTid), kReset,
                 kGreen, static_cast<unsigned long>(data.Timeout), kReset);
         }
@@ -4930,6 +4944,12 @@ namespace
         {
             fwprintf(stderr, L"%lsOperation failed with code %08X%ls\n", kRed, result, kReset);
             PrintFailureHint(result);
+            // Same handle hygiene as the success path below: the load failed,
+            // so no later step needs target access; do not sit on open
+            // VM_WRITE-class handles through the exit pause.
+            targetHandleGuard.reset();
+            threadSponsorGuard.reset();
+            sponsorGuard.reset();
             PauseBeforeExit();
             return 1;
         }
@@ -5007,15 +5027,27 @@ namespace
                 PrintHookScanResult(L"Post-load hook", post_stats, unhooked, remaining);
             }
         }
-        else
-        {
-            wprintf(L"    Hook restoration disabled (HookRestore = N).\n");
-        }
+
+        // Drop every open handle into the target the moment verification no
+        // longer needs them: VM_WRITE-class handles held by an outside
+        // process are the loudest handle-enumeration signal, and everything
+        // below works off already-collected results. The runtime duplicated
+        // what it needed during CoreExecute, so closing here changes nothing
+        // functionally. Guards close their handles; raw locals are nulled so
+        // no later path can reuse them.
+        // 
+        targetHandleGuard.reset();
+        threadSponsorGuard.reset();
+        sponsorGuard.reset();
+        const bool had_target = (targetHandle != nullptr);
+        targetHandle = nullptr;
+        threadSponsorRaw = nullptr;
+        sponsorRaw = nullptr;
 
         wprintf(L"\n");
         if (!stealth_gate_ok)
         {
-            if (!targetHandle)
+            if (!had_target)
             {
                 // Verification was skipped entirely (no handle to inspect), so
                 // blaming string encryption would be a lie: nothing was proven

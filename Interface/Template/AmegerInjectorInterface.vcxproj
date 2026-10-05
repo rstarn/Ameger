@@ -28,7 +28,7 @@
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
     <OutDir>$(ProjectDir)..\..\Build\$(Configuration)\</OutDir>
     <IntDir>$(ProjectDir)..\..\Build\obj\Interface\$(Configuration)\$(PlatformShortName)\</IntDir>
-    <TargetName>Injector - $(PlatformShortName)</TargetName>
+    <TargetName>Host - $(PlatformShortName)</TargetName>
     <AmegerRuntimeHash0>0</AmegerRuntimeHash0>
     <AmegerRuntimeHash1>0</AmegerRuntimeHash1>
     <AmegerRuntimeHash2>0</AmegerRuntimeHash2>

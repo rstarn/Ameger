@@ -264,7 +264,7 @@ bool GetSymbolCacheRoot(std::wstring & out)
 	out.clear();
 
 	wchar_t local_app_data[MAX_PATH]{ 0 };
-	const DWORD length = GetEnvironmentVariableW(L"LOCALAPPDATA", local_app_data, MAX_PATH);
+	const DWORD length = GetEnvironmentVariableW(XOR_STR_W(L"LOCALAPPDATA").get(), local_app_data, MAX_PATH);
 	if (!length || length >= MAX_PATH)
 	{
 		return false;
@@ -277,8 +277,10 @@ bool GetSymbolCacheRoot(std::wstring & out)
 	}
 
 	// Neutral, non-descriptive leaf: nothing in the path names the tool, the
-	// target, or that it caches symbols. Created on demand.
-	root += L"LocalCache\\";
+	// target, or that it caches symbols. Created on demand. Both literals
+	// are stack-decrypted so neither persists in .rdata.
+	auto leaf = XOR_STR_W(L"LocalCache\\");
+	root += leaf.get();
 
 	const DWORD attributes = GetFileAttributesW(root.c_str());
 	if (attributes == INVALID_FILE_ATTRIBUTES)

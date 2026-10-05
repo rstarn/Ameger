@@ -82,7 +82,7 @@ DWORD __stdcall InitializeRuntime()
 	}
 
 	wchar_t * windows_directory = nullptr;
-	if (_wdupenv_s(&windows_directory, nullptr, L"WINDIR") || !windows_directory)
+	if (_wdupenv_s(&windows_directory, nullptr, XOR_STR_W(L"WINDIR").get()) || !windows_directory)
 	{
 		LOG(0, "Couldn't resolve %%WINDIR%%\n");
 

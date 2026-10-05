@@ -1934,13 +1934,14 @@ DWORD __declspec(code_seg(".mmap_sec$0C")) __stdcall MMI_CleanDataDirectories(MA
 	pData->MapStats.DebugSize		= pData->pOptionalHeader->DataDirectory[IMAGE_DIRECTORY_ENTRY_DEBUG].Size;
 	pData->MapStats.RelocSize		= pData->pOptionalHeader->DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC].Size;
 	pData->MapStats.TlsSize			= pData->pOptionalHeader->DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS].Size;
+	pData->MapStats.ExportSize		= pData->pOptionalHeader->DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].Size;
 	pData->MapStats.CleanedMask		=
 		((pData->MapStats.ImportSize		? 1u : 0u) << IMAGE_DIRECTORY_ENTRY_IMPORT) |
 		((pData->MapStats.DelayImportSize	? 1u : 0u) << IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT) |
 		((pData->MapStats.DebugSize			? 1u : 0u) << IMAGE_DIRECTORY_ENTRY_DEBUG) |
 		((pData->MapStats.RelocSize			? 1u : 0u) << IMAGE_DIRECTORY_ENTRY_BASERELOC) |
-		((pData->MapStats.TlsSize			? 1u : 0u) << IMAGE_DIRECTORY_ENTRY_TLS);
-	pData->MapStats.Reserved = 0;
+		((pData->MapStats.TlsSize			? 1u : 0u) << IMAGE_DIRECTORY_ENTRY_TLS) |
+		((pData->MapStats.ExportSize		? 1u : 0u) << IMAGE_DIRECTORY_ENTRY_EXPORT);
 
 	
 	DWORD Size = pData->pOptionalHeader->DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].Size;
@@ -2063,6 +2064,66 @@ DWORD __declspec(code_seg(".mmap_sec$0C")) __stdcall MMI_CleanDataDirectories(MA
 
 		pData->pOptionalHeader->DataDirectory[IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT].VirtualAddress = 0;
 		pData->pOptionalHeader->DataDirectory[IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT].Size = 0;
+	}
+
+	// Export directory: DLL + function names are the last plaintext strings
+	// in a mapped image. Nothing resolves them after load (no loader entry
+	// exists, so GetProcAddress can never work on this image), and DllMain
+	// plus TLS callbacks already ran above, so the whole directory - names,
+	// tables and header - is wiped. Thunks are import-side and untouched;
+	// only export metadata dies here.
+	Size = pData->pOptionalHeader->DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].Size;
+	if (Size)
+	{
+		auto * pExportDir = ReCa<IMAGE_EXPORT_DIRECTORY *>(pData->pImageBase + pData->pOptionalHeader->DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress);
+		if (!MMI_InImage(pData, pExportDir, sizeof(*pExportDir)))
+		{
+			return INJ_MM_ERR_INVALID_PE_IMAGE;
+		}
+
+		if (pExportDir->Name)
+		{
+			const size_t dll_length = MMI_ImageStringLength(pData, ReCa<char *>(pData->pImageBase + pExportDir->Name));
+			if (dll_length && MMI_InImage(pData, pData->pImageBase + pExportDir->Name, dll_length + 1))
+			{
+				f->RtlZeroMemory(pData->pImageBase + pExportDir->Name, dll_length + 1);
+			}
+			pExportDir->Name = 0;
+		}
+
+		const DWORD name_count = pExportDir->NumberOfNames;
+		if (name_count && name_count < 4096)
+		{
+			auto * pNameRVAs = ReCa<DWORD *>(pData->pImageBase + pExportDir->AddressOfNames);
+			auto * pFuncRVAs = ReCa<DWORD *>(pData->pImageBase + pExportDir->AddressOfFunctions);
+			auto * pOrdinals = ReCa<WORD *>(pData->pImageBase + pExportDir->AddressOfNameOrdinals);
+			if (MMI_InImage(pData, pNameRVAs, name_count * sizeof(DWORD)) &&
+				MMI_InImage(pData, pFuncRVAs, pExportDir->NumberOfFunctions * sizeof(DWORD)) &&
+				MMI_InImage(pData, pOrdinals, name_count * sizeof(WORD)))
+			{
+				for (DWORD i = 0; i < name_count; ++i)
+				{
+					if (!pNameRVAs[i])
+					{
+						continue;
+					}
+					const size_t func_length = MMI_ImageStringLength(pData, ReCa<char *>(pData->pImageBase + pNameRVAs[i]));
+					if (func_length && MMI_InImage(pData, pData->pImageBase + pNameRVAs[i], func_length + 1))
+					{
+						f->RtlZeroMemory(pData->pImageBase + pNameRVAs[i], func_length + 1);
+					}
+					pNameRVAs[i] = 0;
+				}
+
+				f->RtlZeroMemory(pFuncRVAs, pExportDir->NumberOfFunctions * sizeof(DWORD));
+				f->RtlZeroMemory(pOrdinals, name_count * sizeof(WORD));
+			}
+		}
+
+		f->RtlZeroMemory(pExportDir, sizeof(*pExportDir));
+
+		pData->pOptionalHeader->DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress = 0;
+		pData->pOptionalHeader->DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].Size = 0;
 	}
 
 	

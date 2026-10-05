@@ -6,7 +6,7 @@
 # slack only), and PE32+ data-directory math computed from the section table
 # instead of hardcoded offsets.
 #
-# After linking, 10 mutations are applied in place (file size never changes):
+# After linking, 11 mutations are applied in place (file size never changes):
 #   1. TimeDateStamp      - crypto-random compile timestamp (also in
 #                           AddPE.ps1; re-randomized here, idempotent)
 #   2. Checksum           - crypto-random PE checksum (ignored by the loader
@@ -34,6 +34,9 @@
 #                           otherwise (never overwrites real bytes)
 #  10. DOS Stub           - randomize [0x40, e_lfanew); MZ magic and e_lfanew
 #                           itself are outside the range and untouched
+#  11. Export Name        - overwrite the export directory's DLL-name field
+#                           (link-time TargetName) with same-length random
+#                           alphanumerics; the loader never reads it
 #
 # Exit code 0 = file written (individual mutations may report skipped);
 # exit code 1 = structural validation, IO, or mutation failure (fail closed:
@@ -464,6 +467,34 @@ function Invoke-MutateDOSStub([byte[]]$Data, $Layout) {
     return ("DOS Stub - {0} bytes randomized" -f ($to - $from))
 }
 
+function Invoke-MutateExportName([byte[]]$Data, $Layout) {
+    # The export directory's DLL-name field otherwise carries the link-time
+    # TargetName into every build verbatim: a stable in-memory signature
+    # ("Ameger Injector - x64.dll"). Overwrite it in place with crypto-random
+    # alphanumerics of identical length (null terminator preserved), so file
+    # size and every RVA stay valid. The loader locates this DLL by file path
+    # and resolves its exports by function name; the directory's own name is
+    # never read by the loader or the repo validator.
+    $rva = Read-UInt32 $Data ($Layout.DataDirOffset + 0)
+    $size = Read-UInt32 $Data ($Layout.DataDirOffset + 4)
+    if ($rva -eq 0 -or $size -lt 40) { return "Export Name - none present (skipped)" }
+    $off = Convert-RvaToOffset $Data $Layout $rva
+    if ($off -lt 0 -or ($off + 40) -gt $Data.Length) { return "Export Name - could not resolve RVA (skipped)" }
+    $nameRva = Read-UInt32 $Data ($off + 12)
+    $nameOff = Convert-RvaToOffset $Data $Layout $nameRva
+    if ($nameOff -lt 0 -or $nameOff -ge $Data.Length) { return "Export Name - could not resolve name (skipped)" }
+    $len = 0
+    while (($nameOff + $len) -lt $Data.Length -and $Data[$nameOff + $len] -ne 0) { $len++ }
+    if ($len -lt 5) { return "Export Name - name too short (skipped)" }
+    $letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+    $alnum = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
+    $Data[$nameOff] = [byte][char]$letters[(Get-Random -Maximum $letters.Length)]
+    for ($i = 1; $i -lt $len; $i++) {
+        $Data[$nameOff + $i] = [byte][char]$alnum[(Get-Random -Maximum $alnum.Length)]
+    }
+    return ("Export Name - {0} chars randomized" -f $len)
+}
+
 $failed = $false
 try {
     foreach ($f in $Files) {
@@ -510,7 +541,8 @@ try {
             @{ N = 7; T = "OS Version"; F = { Invoke-MutateOSVersion $bytes $layout }.GetNewClosure() },
             @{ N = 8; T = "Polymorphic Junk"; F = { Invoke-MutatePolymorphicJunk $bytes $layout }.GetNewClosure() },
             @{ N = 9; T = "Build GUID"; F = { Invoke-MutateBuildGUID $bytes $layout }.GetNewClosure() },
-            @{ N = 10; T = "DOS Stub"; F = { Invoke-MutateDOSStub $bytes $layout }.GetNewClosure() }
+            @{ N = 10; T = "DOS Stub"; F = { Invoke-MutateDOSStub $bytes $layout }.GetNewClosure() },
+            @{ N = 11; T = "Export Name"; F = { Invoke-MutateExportName $bytes $layout }.GetNewClosure() }
         )
 
         $total = $steps.Count

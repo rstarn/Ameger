@@ -108,6 +108,9 @@ static_assert(sizeof(THREAD_EXEC_STATS) == 40);
 // the target.
 //   CleanedMask - bit i set => data directory i was non-zero and got zeroed.
 //   *Size       - the pre-cleanup size of that directory (0 = was absent).
+//   ExportSize reuses the former Reserved slot: export names ("ManualEntry"
+//   style) are the last plaintext strings in a mapped image, so the shell
+//   wipes the export directory exactly like the import ones.
 struct MAP_STATS
 {
 	DWORD CleanedMask = 0;
@@ -116,7 +119,7 @@ struct MAP_STATS
 	DWORD DebugSize = 0;
 	DWORD RelocSize = 0;
 	DWORD TlsSize = 0;
-	DWORD Reserved = 0;
+	DWORD ExportSize = 0;
 };
 
 static_assert(sizeof(MAP_STATS) == 28);
