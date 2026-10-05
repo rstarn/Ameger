@@ -10,8 +10,6 @@ namespace
 {
 	DWORD OpenTargetProcess(DWORD Pid, DWORD AccessMask, DWORD Flags, ULONG_PTR SponsorValue, UniqueHandle & Out, ERROR_DATA & ErrorData)
 	{
-		UNREFERENCED_PARAMETER(ErrorData);
-
 		Out.reset();
 
 		if (Flags & INJ_HANDLE_HIJACKING)
@@ -42,9 +40,9 @@ namespace
 						Stats.DonorPid = GetCurrentProcessId();
 						Stats.GrantedAccess = AccessMask;
 						Stats.NewHandle = PtrToUlong(Duplicated);
-					Stats.SponsorState = 2;
-					Stats.SponsorProbed = (Flags & INJ_SKIP_SPONSOR_ROUNDTRIP) ? 0 : 1;
-					Stats.FailCode = INJ_ERR_SUCCESS;
+						Stats.SponsorState = 2;
+						Stats.SponsorProbed = (Flags & INJ_SKIP_SPONSOR_ROUNDTRIP) ? 0 : 1;
+						Stats.FailCode = INJ_ERR_SUCCESS;
 						RecordHijackOutcome(Stats, false);
 						LOG(0, "Acquired target process handle from sponsor\n");
 
@@ -90,12 +88,12 @@ namespace
 				{
 					Out.reset(Hijacked);
 					RecordHijackOutcome(Stats, false);
-					LOG(0, "Acquired target process handle via hijacking\n");
+					LOG(0, "Acquired target process handle via acquisition\n");
 
 					return INJ_ERR_SUCCESS;
 				}
 
-				LOG(0, "Handle hijacking found no donor (%08X)\n", HijackRet);
+				LOG(0, "Handle acquisition found no donor (%08X)\n", HijackRet);
 				Stats.FailCode = HijackRet;
 			}
 			else if (Stats.FailCode == INJ_ERR_SUCCESS)
@@ -108,13 +106,15 @@ namespace
 			// this path exists to avoid it.
 			Stats.Source = static_cast<DWORD>(HijackSource::Scan);
 			RecordHijackOutcome(Stats, false);
-			LOG(0, "Handle hijacking found no donor; refusing (no direct fallback)\n");
+			LOG(0, "Handle acquisition found no donor; refusing (no direct fallback)\n");
+			INIT_ERROR_DATA(ErrorData, Stats.FailCode ? Stats.FailCode : static_cast<DWORD>(INJ_ERR_HANDLE_HIJACK_FAILED));
 			return INJ_ERR_HANDLE_HIJACK_FAILED;
 		}
 
 		Out.reset(OpenProcess(AccessMask, FALSE, Pid));
 		if (!Out)
 		{
+			INIT_ERROR_DATA(ErrorData, GetLastError());
 			return INJ_ERR_CANT_OPEN_PROCESS;
 		}
 
@@ -187,13 +187,13 @@ DWORD InitErrorStruct(const INJECTIONDATA_INTERNAL & Data, int Native, DWORD Err
 
 DWORD __stdcall InjectA(INJECTIONDATAA * pData) try
 {
-#pragma EXPORT_FUNCTION(__FUNCTION__, __FUNCDNAME__)
+#pragma EXPORT_FUNCTION("CoreLoadA", __FUNCDNAME__)
 
-	LOG(0, "InjectA called with pData = %p\n", pData);
+	LOG(0, "CoreLoadA called with pData = %p\n", pData);
 
 	if (WaitForSingleObject(g_hRunningEvent, 0) == WAIT_OBJECT_0)
 	{
-		LOG(0, "Different injection in progress. Wait for the other injection to finish first.\n");
+		LOG(0, "Different operation in progress. Wait for the other operation to finish first.\n");
 
 		return INJ_ERR_ALREADY_RUNNING;
 	}
@@ -225,20 +225,20 @@ catch (...)
 		pData->hDllOut = NULL;
 	}
 
-	LOG(0, "InjectA failed with an unhandled exception\n");
+	LOG(0, "CoreLoadA failed with an unhandled exception\n");
 
 	return INJ_ERR_UNHANDLED_EXCEPTION;
 }
 
 DWORD __stdcall InjectW(INJECTIONDATAW * pData) try
 {
-#pragma EXPORT_FUNCTION(__FUNCTION__, __FUNCDNAME__)
+#pragma EXPORT_FUNCTION("CoreLoadW", __FUNCDNAME__)
 
-	LOG(0, "InjectW called with pData = %p\n", pData);
+	LOG(0, "CoreLoadW called with pData = %p\n", pData);
 
 	if (WaitForSingleObject(g_hRunningEvent, 0) == WAIT_OBJECT_0)
 	{
-		LOG(0, "Different injection in progress. Wait for the other injection to finish first.\n");
+		LOG(0, "Different operation in progress. Wait for the other operation to finish first.\n");
 
 		return INJ_ERR_ALREADY_RUNNING;
 	}
@@ -270,16 +270,16 @@ catch (...)
 		pData->hDllOut = NULL;
 	}
 
-	LOG(0, "InjectW failed with an unhandled exception\n");
+	LOG(0, "CoreLoadW failed with an unhandled exception\n");
 
 	return INJ_ERR_UNHANDLED_EXCEPTION;
 }
 
 DWORD __stdcall Inject_Internal(INJECTIONDATA_INTERNAL * pData) try
 {
-#pragma EXPORT_FUNCTION(__FUNCTION__, __FUNCDNAME__)
+#pragma EXPORT_FUNCTION("CoreLoadInternal", __FUNCDNAME__)
 
-	LOG(0, "Inject_Internal called with pData = %p\n", pData);
+	LOG(0, "CoreLoadInternal called with pData = %p\n", pData);
 
 	if (!pData)
 	{
@@ -289,7 +289,7 @@ DWORD __stdcall Inject_Internal(INJECTIONDATA_INTERNAL * pData) try
 	InjectionGateGuard injection_guard;
 	if (!injection_guard)
 	{
-		LOG(0, "Different injection in progress. Wait for the other injection to finish first.\n");
+		LOG(0, "Different operation in progress. Wait for the other operation to finish first.\n");
 
 		return INJ_ERR_ALREADY_RUNNING;
 	}
@@ -323,7 +323,7 @@ DWORD __stdcall Inject_Internal(INJECTIONDATA_INTERNAL * pData) try
 	{
 		INIT_ERROR_DATA(error_data, INJ_ERR_ADVANCED_NOT_DEFINED);
 
-		LOG(0, "Only ManualMap is supported in this build\n");
+		LOG(0, "Only in-memory load is supported in this build\n");
 
 		return InitErrorStruct(Data, -1, INJ_ERR_INVALID_INJ_METHOD, error_data);
 	}
@@ -332,7 +332,7 @@ DWORD __stdcall Inject_Internal(INJECTIONDATA_INTERNAL * pData) try
 	{
 		INIT_ERROR_DATA(error_data, INJ_ERR_ADVANCED_NOT_DEFINED);
 
-		LOG(0, "Only HijackThread is supported in this build\n");
+		LOG(0, "Only thread acquisition is supported in this build\n");
 
 		return InitErrorStruct(Data, -1, INJ_ERR_INVALID_INJ_METHOD, error_data);
 	}
@@ -455,7 +455,13 @@ DWORD __stdcall Inject_Internal(INJECTIONDATA_INTERNAL * pData) try
 	const DWORD OpenRet = OpenTargetProcess(Data.ProcessID, access_mask, Data.Flags, Data.hHandleValue, hTargetProc, error_data);
 	if (OpenRet != INJ_ERR_SUCCESS)
 	{
-		INIT_ERROR_DATA(error_data, GetLastError());
+		// OpenTargetProcess fills ErrorData on its own failure paths (the
+		// meaningful hijack code, or GetLastError for a direct open). Only
+		// fall back to GetLastError when it left the sentinel in place.
+		if (error_data.AdvErrorCode == INJ_ERR_ADVANCED_NOT_DEFINED)
+		{
+			INIT_ERROR_DATA(error_data, GetLastError());
+		}
 
 		LOG(0, "OpenTargetProcess failed: %08X\n", (DWORD)error_data.AdvErrorCode);
 
@@ -534,7 +540,7 @@ DWORD __stdcall Inject_Internal(INJECTIONDATA_INTERNAL * pData) try
 		return InitErrorStruct(Data, native_target, FileErr, error_data);
 	}
 
-	LOG(0, "File validated and prepared for injection:\n %ls\n", Data.DllPath.c_str());
+	LOG(0, "File validated and prepared for load:\n %ls\n", Data.DllPath.c_str());
 	
 	HINSTANCE hOut = NULL;
 
@@ -543,7 +549,7 @@ DWORD __stdcall Inject_Internal(INJECTIONDATA_INTERNAL * pData) try
 
 	RetVal = MMAP_NATIVE::ManualMap(source, hTargetProc, Data.Method, Data.Flags, hOut, Data.Timeout, Data.hThreadHandleValue, Data.TargetTid, error_data);
 
-	LOG(0, "Injection finished\n");
+	LOG(0, "Load finished\n");
 
 	
 	
@@ -553,7 +559,7 @@ DWORD __stdcall Inject_Internal(INJECTIONDATA_INTERNAL * pData) try
 }
 catch (...)
 {
-	LOG(0, "Inject_Internal failed with an unhandled exception\n");
+	LOG(0, "CoreLoadInternal failed with an unhandled exception\n");
 
 	return INJ_ERR_UNHANDLED_EXCEPTION;
 }
@@ -588,13 +594,13 @@ DWORD InitErrorStruct(const INJECTIONDATA_INTERNAL & Data, int Native, DWORD Err
 
 DWORD __stdcall Memory_Inject(MEMORY_INJECTIONDATA * pData) try
 {
-#pragma EXPORT_FUNCTION(__FUNCTION__, __FUNCDNAME__)
+#pragma EXPORT_FUNCTION("CoreExecute", __FUNCDNAME__)
 
-	LOG(0, "Memory_Inject called with pData = %p\n", pData);
+	LOG(0, "CoreExecute called with pData = %p\n", pData);
 
 	if (WaitForSingleObject(g_hRunningEvent, 0) == WAIT_OBJECT_0)
 	{
-		LOG(0, "Different injection in progress. Wait for the other injection to finish first.\n");
+		LOG(0, "Different operation in progress. Wait for the other operation to finish first.\n");
 
 		return INJ_ERR_ALREADY_RUNNING;
 	}
@@ -623,7 +629,7 @@ DWORD __stdcall Memory_Inject(MEMORY_INJECTIONDATA * pData) try
 	InjectionGateGuard injection_guard;
 	if (!injection_guard)
 	{
-		LOG(0, "Different injection in progress. Wait for the other injection to finish first.\n");
+		LOG(0, "Different operation in progress. Wait for the other operation to finish first.\n");
 
 		return INJ_ERR_ALREADY_RUNNING;
 	}
@@ -657,7 +663,7 @@ DWORD __stdcall Memory_Inject(MEMORY_INJECTIONDATA * pData) try
 	{
 		INIT_ERROR_DATA(error_data, INJ_ERR_ADVANCED_NOT_DEFINED);
 
-		LOG(0, "Only HijackThread is supported in this build\n");
+		LOG(0, "Only thread acquisition is supported in this build\n");
 
 		return InitErrorStruct(Data, -1, INJ_ERR_INVALID_INJ_METHOD, error_data);
 	}
@@ -683,7 +689,13 @@ DWORD __stdcall Memory_Inject(MEMORY_INJECTIONDATA * pData) try
 	const DWORD OpenRet = OpenTargetProcess(Data.ProcessID, access_mask, Data.Flags, Data.hHandleValue, hTargetProc, error_data);
 	if (OpenRet != INJ_ERR_SUCCESS)
 	{
-		INIT_ERROR_DATA(error_data, GetLastError());
+		// OpenTargetProcess fills ErrorData on its own failure paths (the
+		// meaningful hijack code, or GetLastError for a direct open). Only
+		// fall back to GetLastError when it left the sentinel in place.
+		if (error_data.AdvErrorCode == INJ_ERR_ADVANCED_NOT_DEFINED)
+		{
+			INIT_ERROR_DATA(error_data, GetLastError());
+		}
 
 		LOG(0, "OpenTargetProcess failed: %08X\n", (DWORD)error_data.AdvErrorCode);
 
@@ -762,7 +774,7 @@ DWORD __stdcall Memory_Inject(MEMORY_INJECTIONDATA * pData) try
 		return InitErrorStruct(Data, native_target, FileErr, error_data);
 	}
 
-	LOG(0, "File validated and prepared for injection\n");
+	LOG(0, "File validated and prepared for load\n");
 
 	HINSTANCE hOut = NULL;
 
@@ -773,7 +785,7 @@ DWORD __stdcall Memory_Inject(MEMORY_INJECTIONDATA * pData) try
 
 	RetVal = MMAP_NATIVE::ManualMap(Source, hTargetProc, Data.Method, Data.Flags, hOut, Data.Timeout, Data.hThreadHandleValue, Data.TargetTid, error_data);
 
-	LOG(0, "Injection finished\n");
+	LOG(0, "Load finished\n");
 
 	
 	
@@ -788,14 +800,14 @@ catch (...)
 		pData->hDllOut = NULL;
 	}
 
-	LOG(0, "Memory_Inject failed with an unhandled exception\n");
+	LOG(0, "CoreExecute failed with an unhandled exception\n");
 
 	return INJ_ERR_UNHANDLED_EXCEPTION;
 }
 
 DWORD __stdcall GetSymbolState()
 {
-#pragma EXPORT_FUNCTION(__FUNCTION__, __FUNCDNAME__)
+#pragma EXPORT_FUNCTION("CoreSymbolState", __FUNCDNAME__)
 
 	try
 	{
@@ -832,7 +844,7 @@ DWORD __stdcall GetSymbolState()
 
 DWORD __stdcall GetImportState()
 {
-#pragma EXPORT_FUNCTION(__FUNCTION__, __FUNCDNAME__)
+#pragma EXPORT_FUNCTION("CoreImportState", __FUNCDNAME__)
 
 	try
 	{

@@ -64,7 +64,6 @@
 namespace
 {
     // Runtime state and Interface helpers.
-    constexpr wchar_t kRuntime64[] = L"Ameger Injector - x64.dll";
     constexpr wchar_t kReset[] = L"\x1b[0m";
     constexpr wchar_t kGreen[] = L"\x1b[92m";
     constexpr wchar_t kRed[] = L"\x1b[91m";
@@ -491,10 +490,27 @@ namespace
         return slash == std::wstring::npos ? std::wstring() : path.substr(0, slash + 1);
     }
 
+    // Runtime DLL file name is derived from the embedded SHA-256, matching the
+    // name Create.bat deploys (rtdll_<first 8 hex>). No fixed on-disk name is
+    // baked in, so a shipped folder exposes no stable file fingerprint. A stock
+    // checkout leaves the hash at zero, so the name resolves to a file that does
+    // not exist and the missing-DLL path refuses to run.
+    std::wstring RuntimeFileName()
+    {
+        constexpr wchar_t hex[] = L"0123456789ABCDEF";
+        std::wstring name = L"rtdll_";
+        for (int shift = 28; shift >= 0; shift -= 4)
+        {
+            name.push_back(hex[(AMEGER_RUNTIME_DLL_HASH0 >> shift) & 0x0F]);
+        }
+        name += L".dll";
+        return name;
+    }
+
     std::wstring RuntimePath()
     {
         const std::wstring directory = ExecutableDirectory();
-        return directory.empty() ? std::wstring() : directory + kRuntime64;
+        return directory.empty() ? std::wstring() : directory + RuntimeFileName();
     }
 
     bool FileExists(const std::wstring & path)
@@ -777,7 +793,6 @@ namespace
     // trace (the step total varies with the path taken; see PrintHijackTrace).
     struct HijackContext
     {
-        bool HijackFlag = false;
         bool PrivilegeAttempted = false;
         bool PrivilegeOk = false;
         bool SponsorOpened = false;
@@ -785,6 +800,7 @@ namespace
         DWORD SponsorAccess = 0;
         DWORD TargetPid = 0;
         std::wstring TargetName;
+        bool SponsorThreadAttempted = false;
         bool SponsorThreadOpened = false;
         ULONG_PTR SponsorThreadValue = 0;
         DWORD SponsorTid = 0;
@@ -850,9 +866,9 @@ namespace
     }
 
     // Encrypted-config marker. A DPAPI blob has no intrinsic signature, so the
-    // file carries this 8-byte prefix; anything without it is treated as a
-    // legacy plaintext config so an existing setup keeps working.
-    constexpr char kConfigBlobMagic[8] = { 'A', 'M', 'E', 'G', 'E', 'R', 'C', '1' };
+    // file carries this 8-byte prefix; a config without it is refused outright,
+    // because there is deliberately no plaintext fallback.
+    constexpr char kConfigBlobMagic[8] = { 'S', 'Y', 'S', 'C', 'F', 'G', '0', '1' };
 
     // Decrypts a DPAPI-protected config produced by Build\Scripts\ProtectConfig.ps1.
     // Scope is CurrentUser, matching the writer, so the file is readable only by
@@ -890,7 +906,6 @@ namespace
         path = ConfigurationPath();
         if (path.empty())
         {
-            config.target_name = L"Overwatch.exe";
             return false;
         }
 
@@ -899,7 +914,6 @@ namespace
             std::ifstream raw_file(path, std::ios::binary | std::ios::ate);
             if (!raw_file.good())
             {
-                config.target_name = L"Overwatch.exe";
                 invalid = true;
                 return false;
             }
@@ -907,7 +921,6 @@ namespace
             const std::streamoff raw_size = raw_file.tellg();
             if (raw_size < 0 || static_cast<unsigned long long>(raw_size) > 1024 * 1024)
             {
-                config.target_name = L"Overwatch.exe";
                 invalid = true;
                 return false;
             }
@@ -917,7 +930,6 @@ namespace
             raw_file.read(raw_bytes.data(), raw_size);
             if (!raw_file || raw_file.gcount() != raw_size)
             {
-                config.target_name = L"Overwatch.exe";
                 invalid = true;
                 return false;
             }
@@ -929,13 +941,14 @@ namespace
         {
             raw_bytes.swap(plaintext);
         }
-        else if (raw_bytes.size() > sizeof(kConfigBlobMagic) &&
-            memcmp(raw_bytes.data(), kConfigBlobMagic, sizeof(kConfigBlobMagic)) == 0)
+        else
         {
-            // Magic present but DPAPI refused: wrong account or host. Say so
-            // instead of mis-parsing ciphertext as an ini and reporting a
-            // confusing schema error.
-            config.target_name = L"Overwatch.exe";
+            // No plaintext fallback: a config that is not a DPAPI blob carrying
+            // the expected magic is refused outright. Accepting plaintext here
+            // would let a shipped plaintext ini be parsed, which is exactly the
+            // self-describing on-disk artifact the encryption exists to prevent.
+            // A magic-bearing blob that DPAPI refuses (wrong account or host)
+            // also lands here rather than being mis-parsed as an ini.
             invalid = true;
             return false;
         }
@@ -944,7 +957,6 @@ namespace
             const int required = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, raw_bytes.c_str(), static_cast<int>(raw_bytes.size()), nullptr, 0);
             if (required <= 0)
             {
-                config.target_name = L"Overwatch.exe";
                 invalid = true;
                 return false;
             }
@@ -952,7 +964,6 @@ namespace
             config_text.resize(static_cast<size_t>(required), L'\0');
             if (!MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, raw_bytes.c_str(), static_cast<int>(raw_bytes.size()), config_text.data(), required))
             {
-                config.target_name = L"Overwatch.exe";
                 invalid = true;
                 return false;
             }
@@ -1122,7 +1133,6 @@ namespace
         if (config.schema_version != 1)
         {
             config = WizardConfig{};
-            config.target_name = L"Overwatch.exe";
             invalid = true;
             return false;
         }
@@ -1137,7 +1147,6 @@ namespace
             if (!valid_hash)
             {
                 config = WizardConfig{};
-                config.target_name = L"Overwatch.exe";
                 invalid = true;
                 return false;
             }
@@ -1321,7 +1330,8 @@ namespace
         const std::wstring path = RuntimePath();
         if (path.empty() || !FileExists(path))
         {
-            PrintError(L"The Ameger Injector runtime DLL is missing in Build\\Release.");
+            const std::wstring expected = RuntimeFileName();
+            PrintError((L"The runtime DLL (" + expected + L") is missing next to the executable.").c_str());
             return false;
         }
 
@@ -1348,27 +1358,27 @@ namespace
             if (runtime.module)
             {
                 // Runtime export names are compile-time XORed (see KcStrings/Core/XorString.h).
-                auto exp_mem = XOR_STR_A("Memory_Inject");
+                auto exp_mem = XOR_STR_A("CoreExecute");
                 runtime.memory_inject = reinterpret_cast<f_Memory_Inject>(GetProcAddress(runtime.module, exp_mem.get()));
-                auto exp_sym = XOR_STR_A("GetSymbolState");
+                auto exp_sym = XOR_STR_A("CoreSymbolState");
                 runtime.get_symbol_state = reinterpret_cast<f_GetSymbolState>(GetProcAddress(runtime.module, exp_sym.get()));
-                auto exp_imp = XOR_STR_A("GetImportState");
+                auto exp_imp = XOR_STR_A("CoreImportState");
                 runtime.get_import_state = reinterpret_cast<f_GetImportState>(GetProcAddress(runtime.module, exp_imp.get()));
-                auto exp_init = XOR_STR_A("InitializeRuntime");
+                auto exp_init = XOR_STR_A("CoreStart");
                 runtime.initialize_runtime = reinterpret_cast<f_InitializeRuntime>(GetProcAddress(runtime.module, exp_init.get()));
-                auto exp_shut = XOR_STR_A("ShutdownRuntime");
+                auto exp_shut = XOR_STR_A("CoreStop");
                 runtime.shutdown_runtime = reinterpret_cast<f_ShutdownRuntime>(GetProcAddress(runtime.module, exp_shut.get()));
-                auto exp_dl = XOR_STR_A("StartDownload");
+                auto exp_dl = XOR_STR_A("CoreFetch");
                 runtime.start_download = reinterpret_cast<f_StartDownload>(GetProcAddress(runtime.module, exp_dl.get()));
-                auto exp_cb = XOR_STR_A("SetRawPrintCallback");
+                auto exp_cb = XOR_STR_A("CoreSetTrace");
                 runtime.set_raw_print_callback = reinterpret_cast<f_SetRawPrintCallback>(GetProcAddress(runtime.module, exp_cb.get()));
-                auto exp_hij = XOR_STR_A("GetLastHijackStats");
+                auto exp_hij = XOR_STR_A("CoreAcqStats");
                 runtime.get_last_hijack_stats = reinterpret_cast<f_GetLastHijackStats>(GetProcAddress(runtime.module, exp_hij.get()));
-                auto exp_map = XOR_STR_A("GetLastMapStats");
+                auto exp_map = XOR_STR_A("CoreLoadStats");
                 runtime.get_last_map_stats = reinterpret_cast<f_GetLastMapStats>(GetProcAddress(runtime.module, exp_map.get()));
-                auto exp_str = XOR_STR_A("GetLastStringStats");
+                auto exp_str = XOR_STR_A("CoreStrStats");
                 runtime.get_last_string_stats = reinterpret_cast<f_GetLastStringStats>(GetProcAddress(runtime.module, exp_str.get()));
-                auto exp_tec = XOR_STR_A("GetLastThreadExecStats");
+                auto exp_tec = XOR_STR_A("CoreExecStats");
                 runtime.get_last_thread_exec_stats = reinterpret_cast<f_GetLastThreadExecStats>(GetProcAddress(runtime.module, exp_tec.get()));
                 if (runtime.set_raw_print_callback)
                 {
@@ -1385,18 +1395,18 @@ namespace
 
         if (!runtime.memory_inject || !runtime.get_symbol_state || !runtime.get_import_state || !runtime.initialize_runtime || !runtime.start_download)
         {
-            PrintError(L"The runtime DLL does not expose the required injection functions.");
+            PrintError(L"The runtime DLL does not expose the required functions.");
             return false;
         }
 
         if (runtime.get_last_hijack_stats)
         {
-            wprintf(L"%ls[+]%ls Hijack telemetry export found.\n\n", kGreen, kReset);
+            wprintf(L"%ls[+]%ls Telemetry export found.\n\n", kGreen, kReset);
 
         }
         else
         {
-            wprintf(L"  %ls[!]%ls Hijack telemetry export missing; the Acquire process handle step will show no telemetry.\n", kYellow, kReset);
+            wprintf(L"  %ls[!]%ls Telemetry export missing; the Acquire process handle step will show no telemetry.\n", kYellow, kReset);
         }
 
         // No post-load re-verification: the handle above is opened with
@@ -1743,7 +1753,15 @@ namespace
     bool SelectTarget(const std::wstring & configured_name, TargetSelection & target, bool & cancelled)
     {
         cancelled = false;
-        target.requested_name = NormalizeProcessName(configured_name.empty() ? L"Overwatch.exe" : configured_name);
+        if (configured_name.empty())
+        {
+            // Fail closed: there is no built-in default target. An empty
+            // ProcessName in the config is a configuration error, not a reason
+            // to guess a process name.
+            PrintError(L"No target process is configured (ProcessName is empty).");
+            return false;
+        }
+        target.requested_name = NormalizeProcessName(configured_name);
         target.by_name = true;
         wprintf(L"%ls[+]%ls Waiting for %ls... (Press Q to quit)\n", kGreen, kReset, target.requested_name.c_str());
         for (;;)
@@ -1753,27 +1771,6 @@ namespace
             {
                 target.pid = found;
                 wprintf(L"%ls[+]%ls %ls detected | PID: %ls%lu%ls\n", kGreen, kReset, target.name.c_str(), kGreen, static_cast<unsigned long>(found), kReset);
-                // Early-boot data: a target that has already been up for a
-                // while is the late-in-boot case that makes the payload's
-                // DllMain return FALSE (00400013). Warn only - late DllMain is
-                // probabilistic, not guaranteed, so this never aborts.
-                if (target.creation_time)
-                {
-                    FILETIME now_ft{};
-                    GetSystemTimeAsFileTime(&now_ft);
-                    const ULONGLONG now = (static_cast<ULONGLONG>(now_ft.dwHighDateTime) << 32) |
-                        now_ft.dwLowDateTime;
-                    if (now > target.creation_time)
-                    {
-                        const ULONGLONG age_seconds = (now - target.creation_time) / 10000000ull;
-                        if (age_seconds > 20ull)
-                        {
-                            wprintf(L"  %ls[!]%ls %ls has been running for %llus; injecting this late in the\n",
-                                kYellow, kReset, target.name.c_str(), age_seconds);
-                            wprintf(L"    game's boot is unreliable. Relaunch it and inject within the first seconds.\n");
-                        }
-                    }
-                }
                 return true;
             }
 
@@ -1946,7 +1943,7 @@ namespace
 
             if (info.dotnet)
             {
-                PrintError(L".NET assemblies are not supported in this ManualMap-only build.");
+                PrintError(L".NET assemblies are not supported in this memory-loading build.");
                 continue;
             }
             if (info.architecture == Architecture::X86)
@@ -2096,8 +2093,9 @@ namespace
     // (the total is not fixed - it varies with the path taken):
     // every stage the hijack pipeline went through, with the concrete handle
     // values and origins. Context carries interface-side facts (config,
-    // privilege, pre-open); Stats carries the runtime side. IsThread skips
-    // the sponsor stages (threads cannot be pre-opened).
+    // privilege, pre-open); Stats carries the runtime side. IsThread selects
+    // the thread-sponsor stages (pre-opened / pre-open failed / not attempted)
+    // instead of the process-sponsor stages.
     void PrintHijackTrace(const wchar_t * Kind, const HijackStats * Stats, const HijackContext * Context, DWORD Flags, bool IsThread)
     {
         if (!Stats || !Stats->Attempted)
@@ -2151,9 +2149,17 @@ namespace
                 StageLabel(L"Sponsor").c_str(), kGreen, static_cast<DWORD>(Context->SponsorThreadValue), kReset,
                 kGreen, Context->SponsorTid, kReset);
         }
+        else if (IsThread && Context && Context->SponsorThreadAttempted)
+        {
+            // The pre-open ran but no live thread could be opened (the snapshot
+            // pick raced an exiting thread, or OpenThread was denied). The
+            // runtime still searches, so this is a degraded path, not a stop.
+            wprintf(L"    %ls %ls %lsFAILED%ls (no valid TID)\n", StageTag(++Stage).c_str(),
+                StageLabel(L"Sponsor").c_str(), kRed, kReset);
+        }
         else if (IsThread)
         {
-            wprintf(L"    %ls %ls %lsn/a%ls (threads cannot be pre-opened)\n", StageTag(++Stage).c_str(),
+            wprintf(L"    %ls %ls %lsnot attempted%ls\n", StageTag(++Stage).c_str(),
                 StageLabel(L"Sponsor").c_str(), kYellow, kReset);
         }
         else if (Context && Context->SponsorOpened)
@@ -2176,7 +2182,7 @@ namespace
         }
         else
         {
-            wprintf(L"    %ls %ls %lsnone%ls (scan / direct only)\n", StageTag(++Stage).c_str(),
+            wprintf(L"    %ls %ls %lsnone%ls (donor scan only)\n", StageTag(++Stage).c_str(),
                 StageLabel(L"Sponsor").c_str(), kYellow, kReset);
         }
 
@@ -2243,7 +2249,7 @@ namespace
             }
             else
             {
-                swprintf_s(Text, L"SCAN HIJACK");
+                swprintf_s(Text, L"DONOR SCAN");
             }
             wprintf(L"    %ls %ls %ls%s%ls, granted %ls0x%08X%ls\n", StageTag(++Stage).c_str(), StageLabel(L"Result").c_str(),
                 kGreen, Text, kReset, kGreen, Stats->GrantedAccess, kReset);
@@ -2753,7 +2759,7 @@ namespace
             }
 
             wprintf(L"\n");
-            wprintf(L"  %ls[+]%ls Inverted function table updated for %lsRtlAddFunctionTable%ls (by design; not measured)\n", kGreen, kReset, kGreen, kReset);
+            wprintf(L"  %ls[+]%ls Inverted function table updated for %ls%s%ls (by design; not measured)\n", kGreen, kReset, kGreen, XOR_STR_W(L"RtlAddFunctionTable").get(), kReset);
         }
 
         // Dedicated, result-based debug for the VEH-removal stealth fix. Keep
@@ -2761,9 +2767,9 @@ namespace
         // print what the build actually does now, not a promise in prose.
         {
             ++step;
-            wprintf(L"\n\n[%ls%d%ls/%ls%d%ls] Verify exception stealth...\n\n", kGreen, step, kReset, kGreen, total, kReset);
+            wprintf(L"\n\n[%ls%d%ls/%ls%d%ls] Verify exception handling...\n\n", kGreen, step, kReset, kGreen, total, kReset);
 
-            wprintf(L"  %ls[+]%ls Injector VEH shell............ %lsnone by design; not measured%ls\n",
+            wprintf(L"  %ls[+]%ls Launcher VEH shell............ %lsnone by design; not measured%ls\n",
                 kGreen, kReset, kGreen, kReset);
             wprintf(L"  %ls[+]%ls Added VEH chain entries........ %ls0%ls (by design; not measured)\n",
                 kGreen, kReset, kGreen, kReset);
@@ -2884,7 +2890,7 @@ namespace
         {
             ++step;
             wprintf(L"\n\n[%ls%d%ls/%ls%d%ls] Execute DllMain...\n\n", kGreen, step, kReset, kGreen, total, kReset);
-            wprintf(L"  %ls[+]%ls %lsDllMain(DLL_PROCESS_ATTACH)%ls invocation by design; success inferred from the injection result.\n", kGreen, kReset, kGreen, kReset);
+            wprintf(L"  %ls[+]%ls %lsDllMain(DLL_PROCESS_ATTACH)%ls invocation by design; success inferred from the operation result.\n", kGreen, kReset, kGreen, kReset);
             wprintf(L"  %ls[+]%ls DllMain return value: %lsTRUE%ls (by design; not measured)\n", kGreen, kReset, kGreen, kReset);
         }
 
@@ -3240,13 +3246,46 @@ namespace
             // Every entry is a literal that must not survive anywhere in the
             // shipped runtime DLL. Keep this list in step with the string tiers:
             // add a marker whenever a new sensitive name is introduced as a
-            // literal anywhere in the runtime project.
-            static const char * markers[] =
+            // literal anywhere in the runtime project. The markers are stored as
+            // compile-time ciphertext (XOR_STR_A) so this list leaves no plaintext
+            // names in the shipped EXE either; each named object below outlives
+            // the scan loop, so its .get() pointer stays valid for its duration.
+            auto m0 = XOR_STR_A("msdl.microsoft.com/download/symbols");
+            auto m1 = XOR_STR_A("NtUserMsgWaitForMultipleObjectsEx");
+            auto m2 = XOR_STR_A("LdrpLoadDllInternal");
+            auto m3 = XOR_STR_A("ntdll.dll");
+            auto m4 = XOR_STR_A("_RTL_INVERTED_FUNCTION_TABLE");
+            auto m5 = XOR_STR_A("_INVERTED_FUNCTION_TABLE_USER_MODE");
+            auto m6 = XOR_STR_A("_RTL_INVERTED_FUNCTION_TABLE_ENTRY");
+            auto m7 = XOR_STR_A("_INVERTED_FUNCTION_TABLE_ENTRY");
+            auto m8 = XOR_STR_A("_LDR_DATA_TABLE_ENTRY");
+            auto m9 = XOR_STR_A("_LDR_DDAG_NODE");
+            auto m10 = XOR_STR_A("_LDRP_PATH_SEARCH_CONTEXT");
+            auto m11 = XOR_STR_A("_LDRP_TLS_ENTRY");
+            auto m12 = XOR_STR_A("_KTHREAD_STATE");
+            auto m13 = XOR_STR_A("_KWAIT_REASON");
+            auto m14 = XOR_STR_A("_KUSER_SHARED_DATA");
+            auto m15 = XOR_STR_A("SameTebFlags");
+            auto m16 = XOR_STR_A("ProcessEnvironmentBlock");
+            auto m17 = XOR_STR_A("LastErrorValue");
+            auto m18 = XOR_STR_A("OSBuildNumber");
+            auto m19 = XOR_STR_A("FullDllName");
+            auto m20 = XOR_STR_A("DdagNode");
+            auto m21 = XOR_STR_A("OriginalFullDllName");
+            auto m22 = XOR_STR_A("ExceptionDirectory");
+            auto m23 = XOR_STR_A("ExceptionDirectorySize");
+            auto m24 = XOR_STR_A("SizeOfTable");
+            auto m25 = XOR_STR_A("FunctionTable");
+            auto m26 = XOR_STR_A("ModuleEntry");
+            auto m27 = XOR_STR_A("TableEntry");
+            auto m28 = XOR_STR_A("CurrentSize");
+            const char * markers[] =
             {
-                "msdl.microsoft.com/download/symbols",
-                "NtUserMsgWaitForMultipleObjectsEx",
-                "LdrpLoadDllInternal",
-                "ntdll.dll",
+                m0.get(), m1.get(), m2.get(), m3.get(), m4.get(), m5.get(),
+                m6.get(), m7.get(), m8.get(), m9.get(), m10.get(), m11.get(),
+                m12.get(), m13.get(), m14.get(), m15.get(), m16.get(), m17.get(),
+                m18.get(), m19.get(), m20.get(), m21.get(), m22.get(), m23.get(),
+                m24.get(), m25.get(), m26.get(), m27.get(), m28.get(),
             };
             const size_t marker_count = sizeof(markers) / sizeof(markers[0]);
             // Read the runtime DLL once; every marker (narrow and wide) is
@@ -3281,7 +3320,7 @@ namespace
                     kRed, kReset, kRed, static_cast<size_t>(marker_found), marker_count, kReset);
                 wprintf(L"      These names are plaintext in .rdata and are directly scannable in the target.\n");
                 wprintf(L"      A decrypt path that /O2 can constant-fold will always leak here; see\n");
-                wprintf(L"      Ameger\\Core\\Foundation\\Primitives\\KcStrings\\Core\\DomainKey.h.\n");
+                wprintf(L"      the encrypted-string helper header used by the runtime build.\n");
                 string_gate_ok = false;
             }
             else
@@ -3404,7 +3443,7 @@ namespace
         if (survey_game_traps)
         {
             ++step;
-            wprintf(L"\n\n[%ls%d%ls/%ls%d%ls] Survey game traps...\n\n", kGreen, step, kReset, kGreen, total, kReset);
+            wprintf(L"\n\n[%ls%d%ls/%ls%d%ls] Survey target traps...\n\n", kGreen, step, kReset, kGreen, total, kReset);
             ReportGameTraps(process, survey_pid);
             wprintf(L"\n");
         }
@@ -3428,7 +3467,7 @@ namespace
         }
         __except (EXCEPTION_EXECUTE_HANDLER)
         {
-            wprintf(L"  %ls[x]%ls Stealth verification faulted; gate cannot be satisfied.\n", kRed, kReset);
+            wprintf(L"  %ls[x]%ls Verification faulted; gate cannot be satisfied.\n", kRed, kReset);
             return false;
         }
     }
@@ -3508,6 +3547,40 @@ namespace
                     break;
                 }
             } while (Module32NextW(snapshot, &entry));
+        }
+
+        CloseHandle(snapshot);
+        return found;
+    }
+
+    // Returns the target's own main module (the executable) from a module
+    // snapshot. The trap survey derives its module set from the process instead
+    // of a hardcoded allowlist: a fixed set of names is itself an identifying
+    // artifact.
+    bool GetRemoteMainModule(HANDLE process, std::wstring & name_out, ULONG_PTR & base_out)
+    {
+        name_out.clear();
+        base_out = 0;
+        if (!process)
+        {
+            return false;
+        }
+
+        HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, GetProcessId(process));
+        if (snapshot == INVALID_HANDLE_VALUE)
+        {
+            return false;
+        }
+
+        MODULEENTRY32W entry{};
+        entry.dwSize = sizeof(entry);
+        bool found = false;
+        if (Module32FirstW(snapshot, &entry))
+        {
+            // The first module in a snapshot is the process's main executable.
+            name_out = entry.szModule;
+            base_out = reinterpret_cast<ULONG_PTR>(entry.modBaseAddr);
+            found = !name_out.empty() && base_out != 0;
         }
 
         CloseHandle(snapshot);
@@ -3625,7 +3698,7 @@ namespace
         return name;
     }
 
-    // Read-only, guard-aware survey of game-module traps (.eid page guards,
+    // Read-only, guard-aware survey of target-module traps (.eid page guards,
     // INT3 trampolines). NEVER writes: restoring a Warden INT3 or unguarding
     // an .eid page would break its VEH emulation and trip IntegrityCk. The
     // unified encrypted-IAT dispatcher and session-rotated string keys are
@@ -3637,11 +3710,18 @@ namespace
             return;
         }
 
-        const wchar_t * game_modules[] =
+        // The survey set is generic: only the target's own main module. A fixed
+        // list of game-specific names is itself an identifying artifact, so the
+        // module is resolved from the process rather than hardcoded.
+        std::vector<std::wstring> survey_modules;
         {
-            L"Overwatch.exe",
-            L"Overwatch_loader.dll"
-        };
+            std::wstring main_name;
+            ULONG_PTR main_base = 0;
+            if (GetRemoteMainModule(process, main_name, main_base))
+            {
+                survey_modules.push_back(main_name);
+            }
+        }
 
         // INT3 scanning reads executable pages, and a full sweep of a large
         // module is slow and pointless for a survey. This is a survey, not a
@@ -3653,9 +3733,9 @@ namespace
         constexpr SIZE_T kMaxWalkBytes = (16u << 20); // 16 MB
 
         int found = 0;
-        for (size_t m = 0; m < sizeof(game_modules) / sizeof(game_modules[0]); ++m)
+        for (size_t m = 0; m < survey_modules.size(); ++m)
         {
-            const wchar_t * mod = game_modules[m];
+            const wchar_t * mod = survey_modules[m].c_str();
             ULONG_PTR base = 0;
             if (!GetRemoteModuleBase(process, mod, base) || !base)
             {
@@ -3826,7 +3906,7 @@ namespace
 
         if (!found)
         {
-            wprintf(L"  %ls[!]%ls No known game modules present; nothing to survey.\n", kYellow, kReset);
+            wprintf(L"  %ls[!]%ls No target module present; nothing to survey.\n", kYellow, kReset);
         }
     }
 
@@ -4022,36 +4102,36 @@ namespace
         {
             wprintf(L"Reason: the mapping, imports, TLS and loader-lock stages all succeeded; the payload's\n");
             wprintf(L"own DllMain(DLL_PROCESS_ATTACH) returned FALSE, i.e. the payload refused to initialize.\n");
-            wprintf(L"This is state/thread dependent, not a mapping fault. Inject earlier in the target's startup:\n");
-            wprintf(L"relaunch the game and inject once the injector reports its symbol download is complete.\n");
+            wprintf(L"This is state/thread dependent, not a mapping fault. Load earlier in the target's startup:\n");
+            wprintf(L"relaunch the game and load once the launcher reports its symbol download is complete.\n");
             wprintf(L"A failed attempt also leaves loader bookkeeping in the target that cannot be reclaimed,\n");
             wprintf(L"so relaunch the game before trying again.\n");
         }
         else if (code == INJ_ERR_HANDLE_HIJACK_FAILED)
         {
-            wprintf(L"Reason: handle hijacking found no donor; acquisition is stealth-only and fails closed.\n");
-            wprintf(L"Check HandleHijacking / HijackScan in Configuration.ini, or run elevated so the\n");
+            wprintf(L"Reason: handle acquisition found no donor; the path is donor-only and fails closed.\n");
+            wprintf(L"Check the handle-acquisition settings in Configuration.ini, or run elevated so the\n");
             wprintf(L"sponsor pre-open succeeds.\n");
         }
         else if (code == SR_HT_ERR_OPEN_REFUSED)
         {
-            wprintf(L"Reason: thread handle hijacking found no donor; acquisition is stealth-only and\n");
+            wprintf(L"Reason: thread handle acquisition found no donor; the path is donor-only and\n");
             wprintf(L"fails closed (there is no direct OpenThread fallback). Run elevated so the sponsor\n");
             wprintf(L"thread pre-open succeeds, or retry while the target is active.\n");
         }
         else if (code == SR_HT_ERR_NO_THREADS)
         {
-            wprintf(L"Reason: no hijackable thread found. Retry while the target is active.\n");
+            wprintf(L"Reason: no usable donor thread found. Retry while the target is active.\n");
         }
         else if (code == SR_ERR_TARGET_EXITED)
         {
-            wprintf(L"Reason: the target process exited during injection.\n");
+            wprintf(L"Reason: the target process exited during loading.\n");
         }
         else if (code == SR_HT_ERR_REMOTE_PENDING_TIMEOUT)
         {
             wprintf(L"Note: the payload timed out, but the thread context was restored automatically.\n");
-            wprintf(L"Reason: the victim thread never scheduled the hijack stub (State stayed Pending),\n");
-            wprintf(L"so the manual-mapping shell never started. This is thread selection, not stealth:\n");
+            wprintf(L"Reason: the victim thread never scheduled the donor stub (State stayed Pending),\n");
+            wprintf(L"so the memory-loading shell never started. This is thread selection, not a verification issue:\n");
             wprintf(L"CleanDataDirectories and HookRestore are unrelated - keep them enabled.\n");
             wprintf(L"Relaunch the target before retrying; the runtime now re-validates the sponsor\n");
             wprintf(L"TID (alertable/Running, non-worker) and falls back to its own search on mismatch.\n");
@@ -4074,7 +4154,7 @@ namespace
             // Every other code gets a short pointer instead of a bare hex value
             // with no explanation; keep it terse so the common cases above are
             // not buried.
-            wprintf(L"Reason: unclassified failure 0x%08lX; see Ameger/Core/Foundation/Error.h.\n",
+            wprintf(L"Reason: unclassified failure 0x%08lX; see the runtime error header.\n",
                 static_cast<unsigned long>(code));
         }
     }
@@ -4132,7 +4212,7 @@ namespace
 
     void PrintRuntimeFailure(DWORD symbol_state, DWORD import_state)
     {
-        // InitializeRuntime failures are propagated through symbol_state /
+        // CoreStart (InitializeRuntime) failures are propagated through symbol_state /
         // import_state by WaitForRuntime. Report them as init failures, not
         // as symbol-download failures: 0x4E (BUILD_UNSUPPORTED) previously
         // printed as "Failed to load symbols", sending operators down the
@@ -4182,7 +4262,7 @@ namespace
             }
             PrintError(L"Supported: Windows 11 21H2 (22000), 22H2/23H2 (22621-22631), 24H2 (26100+), 25H2 (26200+).");
             PrintError(L"Windows 10 and older builds are not supported by this x64/Win11-only build.");
-            PrintError(L"Failed to initialize the injection runtime (OS gate, not a symbol download failure).");
+            PrintError(L"Failed to initialize the runtime (OS gate, not a symbol download failure).");
             return;
         }
         if (symbol_state == INJ_ERR_SYMBOL_INIT_NOT_DONE)
@@ -4202,7 +4282,7 @@ namespace
         {
             fwprintf(stderr, L"%lsFailed to resolve imports: 0x%08X%ls\n", kRed, import_state, kReset);
         }
-        PrintError(L"Failed to initialize the injection runtime or download symbols.");
+        PrintError(L"Failed to initialize the runtime or download symbols.");
     }
 
     // Runs target selection, DLL validation, and injection.
@@ -4215,8 +4295,8 @@ namespace
         }
 
         wprintf(L"Runtime module base = %ls%p%ls\n", kGreen, reinterpret_cast<void *>(runtime.module), kReset);
-        wprintf(L"Execution: %lsThreadHijacking%ls\n", kGreen, kReset);
-        wprintf(L"Mode: %lsManualMapping%ls\n\n", kGreen, kReset);
+        wprintf(L"Execution: %lsThreadDonor%ls\n", kGreen, kReset);
+        wprintf(L"Mode: %lsMemoryLoading%ls\n\n", kGreen, kReset);
 
         WizardConfig config;
         std::wstring config_path;
@@ -4240,7 +4320,7 @@ namespace
         wprintf(L"\n");
         wprintf(L"Target: %ls%ls%ls | Timeout: %ls%d%ls ms\n",
             kGreen, config.target_name.c_str(), kReset, kGreen, config.timeout, kReset);
-        wprintf(L"ManualMap flags: %ls0x%08X%ls\n", kGreen, BuildFlags(config), kReset);
+        wprintf(L"Load flags: %ls0x%08X%ls\n", kGreen, BuildFlags(config), kReset);
 
         // Fixed order: prompt for the payload BEFORE waiting for the target.
         // The old order (wait for target -> prompt for DLL -> inject) left a
@@ -4335,7 +4415,7 @@ namespace
 
         if (!RefreshTarget(target))
         {
-            PrintError(L"Target exited before injection. Re-run and choose faster.");
+            PrintError(L"Target exited before loading. Re-run and choose faster.");
             PauseBeforeExit();
             return 1;
         }
@@ -4356,7 +4436,6 @@ namespace
         // the injection call below. Facts go into HijackContext for the
         // acquisition trace's first step.
         HijackContext Context{};
-        Context.HijackFlag = config.handle_hijacking;
         Context.TargetPid = target.pid;
         Context.TargetName = target.name;
         Context.Verbose = config.verbose_trace && !config.quiet;
@@ -4392,7 +4471,7 @@ namespace
             {
                 const wchar_t * consequence = config.hijack_scan
                     ? L"runtime will scan only (no direct fallback)."
-                    : L"no acquisition path remains; injection will fail closed.";
+                    : L"no acquisition path remains; loading will fail closed.";
                 wprintf(L"  %ls[!]%ls Sponsor pre-open failed (0x%08X); %ls\n",
                     kYellow, kReset, sponsor_err, consequence);
             }
@@ -4415,6 +4494,7 @@ namespace
         HANDLE threadSponsorRaw = nullptr;
         if (config.handle_hijacking)
         {
+            Context.SponsorThreadAttempted = true;
             DWORD thread_sponsor_err = ERROR_SUCCESS;
             for (int attempt = 0; attempt < 8 && !threadSponsorRaw; ++attempt)
             {
@@ -4508,7 +4588,7 @@ namespace
             ScanAndRestoreHooks(targetHandle, pre_unhooked, pre_remaining, pre_stats);
             if (!config.quiet)
             {
-                PrintHookScanResult(L"Pre-injection hook", pre_stats, pre_unhooked, pre_remaining);
+                PrintHookScanResult(L"Pre-load hook", pre_stats, pre_unhooked, pre_remaining);
             }
         }
         else
@@ -4518,13 +4598,13 @@ namespace
         wprintf(L"\n");
 
         // Blank line sets the headline apart from the status block below.
-        wprintf(L"Injecting...\n\n");
+        wprintf(L"Working...\n\n");
 
         // A single attempt, always. The failure path deliberately does not
         // retry in-process: a retry would be a second exposure into a target
         // whose DllMain already ran and refused, and it leaves loader
         // bookkeeping that ntdll offers no API to reclaim - the
-        // RtlInsertInvertedFunctionTable entry (and the fake SEH directory it
+        // inverted-function-table entry (and the fake SEH directory it
         // may reference) and the LdrpHandleTlsData TLS index/block both point
         // into the freed image and dangle for the life of the target. Releasing
         // the TLS index would let a later TlsAlloc hand every thread a stale
@@ -4537,13 +4617,13 @@ namespace
         // the measured TID and timeout are tinted green.
         if (data.TargetTid)
         {
-            wprintf(L"Injecting (TID %ls0x%04lX%s, timeout %ls%lu ms%s)...\n",
+            wprintf(L"Working (TID %ls0x%04lX%s, timeout %ls%lu ms%s)...\n",
                 kGreen, static_cast<unsigned long>(data.TargetTid), kReset,
                 kGreen, static_cast<unsigned long>(data.Timeout), kReset);
         }
         else
         {
-            wprintf(L"Injecting (runtime thread search, timeout %ls%lu ms%s)...\n",
+            wprintf(L"Working (runtime thread search, timeout %ls%lu ms%s)...\n",
                 kGreen, static_cast<unsigned long>(data.Timeout), kReset);
         }
 
@@ -4551,7 +4631,7 @@ namespace
 
         if (result != INJ_ERR_SUCCESS)
         {
-            fwprintf(stderr, L"%lsInjection failed with code %08X%ls\n", kRed, result, kReset);
+            fwprintf(stderr, L"%lsOperation failed with code %08X%ls\n", kRed, result, kReset);
             PrintFailureHint(result);
             PauseBeforeExit();
             return 1;
@@ -4587,7 +4667,7 @@ namespace
         }
         else
         {
-            wprintf(L"%ls[x]%ls Stealth verification could not run (no target handle); the result is unproven.\n",
+            wprintf(L"%ls[x]%ls Verification could not run (no target handle); the result is unproven.\n",
                 kRed, kReset);
         }
 
@@ -4604,7 +4684,7 @@ namespace
 
         if (!runtime.get_last_thread_exec_stats || !ThreadExec.Attempted)
         {
-            wprintf(L"  %ls[!]%ls Thread context not reported (no telemetry, or no hijack was attempted).\n", kYellow, kReset);
+            wprintf(L"  %ls[!]%ls Thread context not reported (no telemetry, or no donor was attempted).\n", kYellow, kReset);
         }
         else if (ThreadExec.Success)
         {
@@ -4613,7 +4693,7 @@ namespace
         }
         else
         {
-            wprintf(L"  %ls[!]%ls Thread context %sNOT restored%s on TID: %s0x%04lX%s (code 0x%08lX) - it may still be running hijack code.\n",
+            wprintf(L"  %ls[!]%ls Thread context %sNOT restored%s on TID: %s0x%04lX%s (code 0x%08lX) - it may still be running donor code.\n",
                 kYellow, kReset, kYellow, kReset, kYellow,
                 static_cast<unsigned long>(ThreadExec.HijackedTid), kReset,
                 static_cast<unsigned long>(ThreadExec.FailCode));
@@ -4627,7 +4707,7 @@ namespace
             ScanAndRestoreHooks(targetHandle, unhooked, remaining, post_stats);
             if (!config.quiet)
             {
-                PrintHookScanResult(L"Post-injection hook", post_stats, unhooked, remaining);
+                PrintHookScanResult(L"Post-load hook", post_stats, unhooked, remaining);
             }
         }
         else
@@ -4638,11 +4718,24 @@ namespace
         wprintf(L"\n");
         if (!stealth_gate_ok)
         {
-            wprintf(L"%ls[x] STEALTH GATE FAILED%s - the payload is mapped in the target, but the\n", kRed, kReset);
-            wprintf(L"    runtime DLL does not pass string-encryption verification. It must not be\n");
-            wprintf(L"    treated as a clean injection: a plaintext symbol name in .rdata is\n");
-            wprintf(L"    scannable, and shipping it defeats the point of the string tiers.\n");
-            wprintf(L"    Fix the leak and rebuild before using this build.\n");
+            if (!targetHandle)
+            {
+                // Verification was skipped entirely (no handle to inspect), so
+                // blaming string encryption would be a lie: nothing was proven
+                // either way. Report it as unproven, not as a leak.
+                wprintf(L"%ls[x] VERIFICATION NOT PERFORMED%s - the payload is mapped in the\n", kRed, kReset);
+                wprintf(L"    target, but no target handle was available, so neither the string-encryption\n");
+                wprintf(L"    gate nor the W^X posture could be checked. The result is unproven; do not\n");
+                wprintf(L"    treat it as a clean load until it can be verified.\n");
+            }
+            else
+            {
+                wprintf(L"%ls[x] VERIFICATION GATE FAILED%s - the payload is mapped in the target, but the\n", kRed, kReset);
+                wprintf(L"    runtime DLL does not pass string-encryption verification. It must not be\n");
+                wprintf(L"    treated as a clean load: a plaintext symbol name in .rdata is\n");
+                wprintf(L"    scannable, and shipping it defeats the point of the string tiers.\n");
+                wprintf(L"    Fix the leak and rebuild before using this build.\n");
+            }
             PauseBeforeExit();
             return 1;
         }
@@ -4650,11 +4743,11 @@ namespace
         {
             wprintf(L"%ls[!] W^X advisory:%s the W^X posture was not confirmed (see the Verify W^X execution step).\n", kYellow, kReset);
             wprintf(L"    Either a mapped page is not RX as expected, or the image could not be queried\n");
-            wprintf(L"    or bounded. The injection is functional, but this weakens confidence in the\n");
+            wprintf(L"    or bounded. The load is functional, but this weakens confidence in the\n");
             wprintf(L"    W^X posture. Treat this build as suspect.\n\n");
         }
 
-        wprintf(L"Injection succeeded. DLL loaded at %ls%p%s.\n", kGreen, data.hDllOut, kReset);
+        wprintf(L"Operation succeeded. DLL loaded at %ls%p%s.\n", kGreen, data.hDllOut, kReset);
         PauseBeforeExit();
         return 0;
     }
@@ -4672,7 +4765,7 @@ int wmain()
     }
     catch (const std::bad_alloc &)
     {
-        PrintError(L"Out of memory during injection; aborting.");
+        PrintError(L"Out of memory during loading; aborting.");
         PauseBeforeExit();
         result = 1;
     }

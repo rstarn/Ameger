@@ -8,7 +8,7 @@
 # Usage:
 #   ProtectConfig.ps1 -Source <plaintext.ini> -Destination <encrypted.ini>
 #
-# Format: 8-byte ASCII magic "AMEGERC1" followed by a raw DPAPI blob of the
+# Format: 8-byte ASCII magic "SYSCFG01" followed by a raw DPAPI blob of the
 # exact input bytes (BOM included), which Interface/Source/Main.cpp
 # (DecryptConfigBlob) reverses before the normal UTF-8 parse. The magic is
 # what distinguishes an encrypted file from a legacy plaintext one.
@@ -20,7 +20,7 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-$magic = [Text.Encoding]::ASCII.GetBytes("AMEGERC1")
+$magic = [Text.Encoding]::ASCII.GetBytes("SYSCFG01")
 
 if (-not (Test-Path -LiteralPath $Source)) { Write-Host "ProtectConfig: source not found: $Source"; exit 1 }
 

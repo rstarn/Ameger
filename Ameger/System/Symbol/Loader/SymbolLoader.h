@@ -22,6 +22,11 @@ class SYMBOL_LOADER
 	
 	bool m_bReady = false;
 
+	// Directory created for the cached PDB (<cache root>\Symbols). Tracked so
+	// PurgePdb can best-effort remove only a directory this loader made.
+	std::wstring	m_szPdbDir		= std::wstring();
+	bool			m_bCreatedPdbDir = false;
+
 	bool VerifyExistingPdb(const GUID & guid, DWORD age);
 
 	SYMBOL_LOADER(const SYMBOL_LOADER &) = delete;

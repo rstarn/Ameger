@@ -335,26 +335,9 @@ function Get-ExceptionRanges([byte[]]$Data, $Layout) {
         if ($end -le $begin) { continue }
         [void]$ranges.Add(@{ Begin = $begin; End = $end })
     }
-    # Sort by Begin so Test-RangeCovered can binary-search instead of walking
-    # every entry.
+    # Sort by Begin so the junk-fill loop below can stop at the first range
+    # starting past a padding run instead of walking every entry.
     return ($ranges | Sort-Object -Property Begin)
-}
-
-function Test-RangeCovered($Ranges, [uint32]$Begin, [uint32]$End) {
-    if ($Ranges.Count -eq 0) { return $false }
-
-    # Last range whose Begin <= $Begin. .pdata ranges are sorted and
-    # non-overlapping, so that entry is the only candidate that can cover $Begin.
-    $lo = 0
-    $hi = $Ranges.Count - 1
-    while ($lo -le $hi) {
-        $mid = [int](($lo + $hi) / 2)
-        if ($Ranges[$mid].Begin -le $Begin) { $lo = $mid + 1 } else { $hi = $mid - 1 }
-    }
-    if ($hi -lt 0) { return $false }
-
-    $r = $Ranges[$hi]
-    return ($Begin -lt $r.End -and $r.Begin -lt $End)
 }
 
 function Invoke-MutatePolymorphicJunk([byte[]]$Data, $Layout) {
@@ -475,7 +458,7 @@ function Invoke-MutateDOSStub([byte[]]$Data, $Layout) {
     $e = $Layout.NtOffset
     $from = 0x40
     $to = $e
-    if (($to - $from) -lt 16) { return "DOS Stub - too small to randomize" }
+    if (($to - $from) -lt 16) { return "DOS Stub - too small to randomize (skipped)" }
     $rnd = Get-RandomBytes ($to - $from)
     [Array]::Copy($rnd, 0, $Data, $from, ($to - $from))
     return ("DOS Stub - {0} bytes randomized" -f ($to - $from))

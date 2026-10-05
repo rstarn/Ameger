@@ -139,7 +139,6 @@ HRESULT __stdcall DownloadManager::OnProgress(ULONG ulProgress, ULONG ulProgress
     if (ulProgressMax)
     {
         const float progress = static_cast<float>(ulProgress) / ulProgressMax;
-        m_fProgress.store(progress);
 
 		if (progress - m_fOldProgress >= 0.095f)
 		{

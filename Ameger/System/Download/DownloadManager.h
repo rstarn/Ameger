@@ -5,7 +5,6 @@
 class DownloadManager : public IBindStatusCallback
 {
     std::atomic<HANDLE> m_hInterruptEvent{nullptr};
-    std::atomic<float>  m_fProgress{0.0f};
     std::atomic<float>  m_fOldProgress{0.0f};
     bool                m_bForceRedownload  = false;
     LONG                m_RefCount          = 1;

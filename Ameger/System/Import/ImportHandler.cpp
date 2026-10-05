@@ -323,7 +323,7 @@ DWORD ResolveImports(ERROR_DATA & error_data)
 
 void __stdcall GetLastStringStats(STRING_STATS * Out)
 {
-#pragma EXPORT_FUNCTION(__FUNCTION__, __FUNCDNAME__)
+#pragma EXPORT_FUNCTION("CoreStrStats", __FUNCDNAME__)
 
 	if (Out)
 	{

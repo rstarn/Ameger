@@ -476,18 +476,20 @@ DWORD SYMBOL_LOADER::Initialize(const std::wstring & szModulePath, const std::ws
 
 	m_szPdbPath += L"Symbols\\";
 
-
-	if (!CreateDirectoryW(m_szPdbPath.c_str(), nullptr))
+	m_szPdbDir = m_szPdbPath;
+	m_bCreatedPdbDir = false;
+	if (CreateDirectoryW(m_szPdbPath.c_str(), nullptr))
 	{
-		if (GetLastError() != ERROR_ALREADY_EXISTS)
-		{
-			LOG(1, "SYMBOL_LOADER: can't create/open download path: 0x%08X\n", GetLastError());
+		m_bCreatedPdbDir = true;
+	}
+	else if (GetLastError() != ERROR_ALREADY_EXISTS)
+	{
+		LOG(1, "SYMBOL_LOADER: can't create/open download path: 0x%08X\n", GetLastError());
 
-			VirtualFree(pLocalImageBase, 0, MEM_RELEASE);
-			delete[] pRawData;
+		VirtualFree(pLocalImageBase, 0, MEM_RELEASE);
+		delete[] pRawData;
 
-			return SYMBOL_ERR_CANT_CREATE_DIRECTORY;
-		}
+		return SYMBOL_ERR_CANT_CREATE_DIRECTORY;
 	}
 
 	auto PdbFileName = CharArrayToStdWstring(pdbInformation->PdbFileName);
@@ -779,8 +781,9 @@ void SYMBOL_LOADER::PurgePdb()
 	}
 
 	// Safety: only ever remove a file this loader created, i.e. one that lives
-	// under the cache root we were handed and is named <pdb>. Never recurse,
-	// never touch a directory.
+	// under the cache root we were handed and is named <pdb>. Never recurse;
+	// the only directory touched is the empty Symbols directory this loader
+	// itself created (handled after a successful file purge below).
 	const DWORD attributes = GetFileAttributesW(m_szPdbPath.c_str());
 	if (attributes == INVALID_FILE_ATTRIBUTES || (attributes & FILE_ATTRIBUTE_DIRECTORY))
 	{
@@ -800,6 +803,16 @@ void SYMBOL_LOADER::PurgePdb()
 
 	LOG(1, "SYMBOL_LOADER: cached PDB purged from disk\n");
 	m_Filesize = 0;
+
+	// Best-effort: drop the Symbols directory too, but only when this loader
+	// created it and it is now empty. RemoveDirectoryW refuses a non-empty
+	// directory, so a shared cache holding other entries is never disturbed,
+	// and any failure is ignored - the PDB purge above already succeeded.
+	if (m_bCreatedPdbDir && !m_szPdbDir.empty())
+	{
+		RemoveDirectoryW(m_szPdbDir.c_str());
+		m_bCreatedPdbDir = false;
+	}
 }
 
 void SYMBOL_LOADER::SetDownload(bool bDownload)

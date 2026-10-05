@@ -9,7 +9,7 @@
 
 DWORD __stdcall SetRawPrintCallback(f_raw_print_callback print)
 {
-#pragma EXPORT_FUNCTION(__FUNCTION__, __FUNCDNAME__)
+#pragma EXPORT_FUNCTION("CoreSetTrace", __FUNCDNAME__)
 
 	g_print_raw_callback.store(print);
 

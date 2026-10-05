@@ -352,7 +352,7 @@ void ErrorLog(const ERROR_INFO & info)
 
 	// Debug channel only (console/callback when the operator attaches one).
 	// No PID, no full path, no file write.
-	LOG(1, "Inj failed: code=%08X adv=%08X flags=%08X mode=%d method=%d\n",
+	LOG(1, "Load failed: code=%08X adv=%08X flags=%08X mode=%d method=%d\n",
 		info.ErrorCode, info.AdvErrorCode, info.Flags,
 		static_cast<int>(info.InjectionMode), static_cast<int>(info.LaunchMethod));
 }
@@ -381,7 +381,7 @@ std::wstring CharArrayToStdWstring(const char * szString)
 
 void __stdcall StartDownload()
 {
-#pragma EXPORT_FUNCTION(__FUNCTION__, __FUNCDNAME__)
+#pragma EXPORT_FUNCTION("CoreFetch", __FUNCDNAME__)
 
 	const DWORD initialization_state = InitializeRuntime();
 	if (initialization_state != INJ_ERR_SUCCESS)

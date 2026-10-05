@@ -59,14 +59,6 @@ class DomainMask
 public:
     __forceinline DomainMask() noexcept : m_key(Compute()) {}
 
-    // One volatile read per call. Two calls are two independent loads, so the
-    // optimiser may not prove they return the same value and may not cancel
-    // the mask against the unmask.
-    __forceinline std::uint32_t Key() const noexcept
-    {
-        return m_key;
-    }
-
     __forceinline std::uint8_t Byte(std::size_t idx) const noexcept
     {
         return DomainByte(m_key, idx);

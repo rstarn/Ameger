@@ -79,10 +79,8 @@ bool ValidateProcessDonorHandle(HANDLE Candidate, DWORD TargetPid, DWORD Desired
 // only; per-candidate use inside scans would churn the target.
 bool ProbeMemoryRoundtrip(HANDLE Candidate);
 
-// Snapshot helpers for OpenTargetProcess-style callers.
+// Store the outcome of the last acquisition attempt for the given kind.
 void RecordHijackOutcome(const HijackStats & Stats, bool IsThread);
-void GetProcessHijackStats(HijackStats & Out);
-void GetThreadHijackStats(HijackStats & Out);
 
 // Exported for the interface (see GetLastHijackStats in Injection.h).
 void __stdcall GetLastHijackStats(HijackStats * ProcessOut, HijackStats * ThreadOut);

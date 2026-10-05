@@ -64,8 +64,6 @@ struct DYNAMIC_NT_OFFSETS
 	DWORD TlsEntryModuleEntry = 0;
 	DWORD TlsEntrySize = 0;
 
-	// Code-stub offsets (disassembled from in-memory ntdll, not PDB)
-	DWORD NtWaitReturnOffset = 0; // return-address delta after syscall (was 0x14)
 	// x64 ABI: [Rsp]=return addr + 0x20 shadow => 5th arg at +0x28. Stable by
 	// calling convention, not per-build. Kept as a field for uniformity.
 	DWORD MsgWaitFlagsStackOffset = 0x28;

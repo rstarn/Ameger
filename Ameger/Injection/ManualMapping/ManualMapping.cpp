@@ -57,12 +57,12 @@ DWORD MMAP_NATIVE::ManualMap(const INJECTION_SOURCE & Source, HANDLE hTargetProc
 	{
 		INIT_ERROR_DATA(error_data, INJ_ERR_ADVANCED_NOT_DEFINED);
 
-		LOG(1, "Unsupported launch method for ManualMap\n");
+		LOG(1, "Unsupported launch method for in-memory load\n");
 
 		return INJ_ERR_INVALID_INJ_METHOD;
 	}
 
-	LOG(1, "Begin ManualMap\n");
+	LOG(1, "Begin in-memory load\n");
 
 	WINDOWS_LAYOUT_FAMILY layout_family = WINDOWS_LAYOUT_FAMILY::Windows11_21H2;
 	if (!GetSupportedWindowsLayout(GetOSBuildVersion(), layout_family))
@@ -127,7 +127,7 @@ DWORD MMAP_NATIVE::ManualMap(const INJECTION_SOURCE & Source, HANDLE hTargetProc
 	{
 		INIT_ERROR_DATA(error_data, INJ_ERR_ADVANCED_NOT_DEFINED);
 
-		LOG(1, "Dynamic NT offsets not ready, refusing ManualMap\n");
+		LOG(1, "Dynamic NT offsets not ready, refusing in-memory load\n");
 
 		return INJ_ERR_SYMBOL_INIT_NOT_DONE;
 	}
@@ -242,7 +242,7 @@ DWORD MMAP_NATIVE::ManualMap(const INJECTION_SOURCE & Source, HANDLE hTargetProc
 	{
 		INIT_ERROR_DATA(error_data, INJ_ERR_ADVANCED_NOT_DEFINED);
 
-		LOG(1, "Function table contains unresolved native functions\n");
+		LOG(1, "Staging dispatch has unresolved entries\n");
 
 		return INJ_ERR_GET_PROC_ADDRESS_FAIL;
 	}
@@ -259,7 +259,7 @@ DWORD MMAP_NATIVE::ManualMap(const INJECTION_SOURCE & Source, HANDLE hTargetProc
 	LOG(2, "pArg           = %p\n", pArg);
 	LOG(2, "pShells        = %p\n", pShells);
 
-	LOG(2, "pFunctionTable = %p\n", pFunctionTable);
+	LOG(2, "pDispatch      = %p\n", pFunctionTable);
 
 	if (!WriteProcessMemory(hTargetProc, pArg, &data, sizeof(MANUAL_MAPPING_DATA), nullptr))
 	{
@@ -302,7 +302,7 @@ DWORD MMAP_NATIVE::ManualMap(const INJECTION_SOURCE & Source, HANDLE hTargetProc
 		return INJ_ERR_WPM_FAIL;
 	}
 
-	LOG(1, "Function table written to memory\n");
+	LOG(1, "Staging dispatch written to memory\n");
 
 	
 
@@ -360,8 +360,10 @@ DWORD MMAP_NATIVE::ManualMap(const INJECTION_SOURCE & Source, HANDLE hTargetProc
 		// NOT released here. Pending means the stub never ran (State stayed
 		// Pending), the thread was ForceRestored, and no image was mapped, so
 		// the staging block is safe to free via the guard destructor. Only
-		// TIMEOUT/RECOVERY (shell may still be live in the target) must leak.
-		if (dwRet == SR_HT_ERR_REMOTE_TIMEOUT || dwRet == SR_HT_ERR_RECOVERY_REQUIRED)
+		// RECOVERY_REQUIRED (the shell may still be live in the target) must
+		// leak; SR_HT_ERR_REMOTE_TIMEOUT is never returned by StartRoutine and
+		// has no branch here.
+		if (dwRet == SR_HT_ERR_RECOVERY_REQUIRED)
 		{
 			allocation_guard.release();
 		}
@@ -1768,21 +1770,19 @@ DWORD __declspec(code_seg(".mmap_sec$0A")) __stdcall MMI_HandleTLS(MANUAL_MAPPIN
 	pData->ntRet = f->LdrpHandleTlsData(pDummyLdr);
 	if (NT_FAIL(pData->ntRet))
 	{
-		// Freeing the dummy LDR entry here is safe only if LdrpHandleTlsData
-		// cannot fail after linking a TLS_ENTRY whose ModuleEntry is pDummyLdr
-		// into LdrpTlsList. Whether it can is an ntdll internal this source
-		// cannot establish: the ordering of LdrpAllocateTlsEntry, the list
-		// insertion and the later raw-data copy (each a possible failure point)
-		// is not visible here. If a failure can follow the insertion, this
-		// DeleteObject leaves a dangling ModuleEntry in LdrpTlsList for the life
-		// of the target. Resolving it needs the target build's
-		// LdrpHandleTlsData (disassembly or checked build): if insertion can
-		// precede a failure return, this path must unlink the entry, mirroring
-		// the success path below, before freeing. The free is not deferred on
-		// that guess - the entry must not outlive the image, and freeing later
-		// is not obviously safer.
-		DeleteObject(f, pDummyLdr);
-
+		// Leak pDummyLdr deliberately: do NOT free it on this failure path.
+		//
+		// Disassembly of the local ntdll (build 26300) shows the TLS_ENTRY is
+		// linked into LdrpTlsList inside LdrpAllocateTlsEntry, and that every
+		// LdrpAllocateTlsEntry failure return precedes the link. But
+		// LdrpHandleTlsData can itself fail after the link, and this source
+		// cannot prove each of its post-link failure returns unlinks the entry
+		// before returning. If one does not, freeing the dummy LDR entry here
+		// would leave a dangling TLS_ENTRY.ModuleEntry in LdrpTlsList for the
+		// life of the target. The dummy is at most one page (bounded by the
+		// ldr_size guard above), so per the codebase's leak-on-uncertainty
+		// policy it is kept mapped rather than risk a dangling loader pointer.
+		// The success path below unlinks the entry first and can free safely.
 		return static_cast<DWORD>(pData->ntRet);
 	}
 
@@ -2194,9 +2194,9 @@ DWORD __declspec(code_seg(".mmap_sec$0E")) __stdcall MMI_CleanUp(MANUAL_MAPPING_
 
 	// Forensic wipe of the staging block, which carries the operator's on-disk
 	// DLL path (the mapped image never does). This runs only if the shell
-	// reaches MMI_CleanUp. On SR_HT_ERR_REMOTE_TIMEOUT /
-	// SR_HT_ERR_RECOVERY_REQUIRED the host deliberately release()s the block
-	// (ManualMapping.cpp:394 and the release() sites in ThreadHijacking.cpp)
+	// reaches MMI_CleanUp. On SR_HT_ERR_RECOVERY_REQUIRED the host deliberately
+	// release()s the block (the release() site in ManualMapping.cpp and the
+	// release() sites in ThreadHijacking.cpp)
 	// because the shell may still be executing from it; if the shell never
 	// reaches this point, the wipe never runs and the path stays readable in
 	// the target. It is therefore best-effort, not a guarantee, and cannot be
@@ -2328,7 +2328,7 @@ void ResetMapStats()
 
 void __stdcall GetLastMapStats(MAP_STATS * Out)
 {
-#pragma EXPORT_FUNCTION(__FUNCTION__, __FUNCDNAME__)
+#pragma EXPORT_FUNCTION("CoreLoadStats", __FUNCDNAME__)
 
 	if (Out)
 	{

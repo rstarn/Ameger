@@ -134,14 +134,24 @@ bool ProcessInformation::SetProcess(HANDLE hTargetProc)
 
 	m_pCurrentProcess = m_pFirstProcess;
 
-	while (NEXT_SYSTEM_PROCESS_ENTRY(m_pCurrentProcess) != m_pCurrentProcess)
+	// Test the current entry first, then advance only while a next entry
+	// exists. The old loop condition (NEXT(cur) != cur) was evaluated before
+	// the body, so it terminated on the last entry without ever comparing its
+	// UniqueProcessId - the final process in the list could never match.
+	for (;;)
 	{
 		if (m_pCurrentProcess->UniqueProcessId == ReCa<void *>(PID))
 		{
 			break;
 		}
 
-		m_pCurrentProcess = NEXT_SYSTEM_PROCESS_ENTRY(m_pCurrentProcess);
+		auto pNext = NEXT_SYSTEM_PROCESS_ENTRY(m_pCurrentProcess);
+		if (pNext == m_pCurrentProcess)
+		{
+			break;
+		}
+
+		m_pCurrentProcess = pNext;
 	}
 
 	if (m_pCurrentProcess->UniqueProcessId != ReCa<void *>(PID))
@@ -346,18 +356,35 @@ bool ProcessInformation::IsThreadInAlertableState()
 		return false;
 	}
 
+	// Every stub in the table is the shared Win11 x64 syscall thunk
+	// (mov r10,rcx / mov eax,imm / test [SharedUserData+0x308],1 / syscall /
+	// ret; verified with dumpbin on the local ntdll). While a thread is parked
+	// in the kernel wait its Rip is the trailing ret, and syscall has already
+	// overwritten Rcx with that same return address. The syscall ABI receives
+	// arg0 in R10 (the stub moved it there), so at the ret the live arguments
+	// sit in R10(arg0) / Rdx(arg1) / R8(arg2) / R9(arg3). Reading callee-saved
+	// Rbx/Rsi could never observe an argument.
 	if (ctx.Rip == m_WaitFunctionReturnAddress[0]) 
 	{
-		
-		return (ctx.Rcx == TRUE);
+		// NtDelayExecution(BOOLEAN Alertable, ...): Alertable is arg0 -> R10.
+		return (ctx.R10 == TRUE);
 	}
 	else if (ctx.Rip == m_WaitFunctionReturnAddress[1]) 
 	{
-		return (ctx.Rbx == TRUE);
+		// NtWaitForSingleObject(Handle, BOOLEAN Alertable, ...): arg1 -> Rdx.
+		return (ctx.Rdx == TRUE);
 	}
-	else if (ctx.Rip == m_WaitFunctionReturnAddress[2] || ctx.Rip == m_WaitFunctionReturnAddress[3]) 
+	else if (ctx.Rip == m_WaitFunctionReturnAddress[2]) 
 	{
-		return (ctx.Rsi == TRUE);
+		// NtWaitForMultipleObjects(Count, Handles, WaitType, BOOLEAN Alertable,
+		// ...): Alertable is arg3 -> R9.
+		return (ctx.R9 == TRUE);
+	}
+	else if (ctx.Rip == m_WaitFunctionReturnAddress[3]) 
+	{
+		// NtSignalAndWaitForSingleObject(SignalHandle, WaitHandle,
+		// BOOLEAN Alertable, ...): Alertable is arg2 -> R8.
+		return (ctx.R8 == TRUE);
 	}
 	else if (ctx.Rip == m_WaitFunctionReturnAddress[4])
 	{

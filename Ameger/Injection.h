@@ -1,17 +1,5 @@
 #pragma once
 
-#define AMEGER_INJ_MOD_NAME64W L"Ameger Injector - x64.dll"
-#define AMEGER_INJ_MOD_NAME64A "Ameger Injector - x64.dll"
-
-#define AMEGER_INJ_MOD_NAMEW AMEGER_INJ_MOD_NAME64W
-#define AMEGER_INJ_MOD_NAMEA AMEGER_INJ_MOD_NAME64A
-
-#if defined(UNICODE) || defined(_UNICODE)
-#define AMEGER_INJ_MOD_NAME AMEGER_INJ_MOD_NAMEW
-#else
-#define AMEGER_INJ_MOD_NAME AMEGER_INJ_MOD_NAMEA
-#endif
-
 #include <Windows.h>
 #include "Core/Foundation/Primitives/InjectionTypes.h"
 

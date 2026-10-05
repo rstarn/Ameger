@@ -33,6 +33,10 @@ set "VERIFY_SCRIPT=%SCRIPTS_DIR%\VerifyEmbedMagic.ps1"
 set "CONFIG_MASTER=%BUILD_DIR%\Configuration.ini"
 set "PAYLOAD_ASSET=%ROOT%\Assets\DLL\Jlov.dll"
 set "PAYLOAD_DEST=%OUT_ROOT%\Jlov.dll"
+rem Stock runtime build output name (the runtime vcxproj TargetName). Referenced
+rem only before the hash-derived rename below; after the rename the release
+rem folder carries no file by this name.
+set "RUNTIME_STOCK_DLL=%DEPS_RELEASE%\Ameger Injector - x64.dll"
 rem The Interface embeds the runtime DLL's SHA-256 and refuses a mismatched DLL.
 set "LIBRARY_PROJ=%ROOT%\Interface\Template\AmegerInjector.vcxproj"
 set "INTERFACE_PROJ=%ROOT%\Interface\Template\AmegerInjectorInterface.vcxproj"
@@ -93,7 +97,8 @@ goto :seeds_ready
 
 :seeds_missing
 echo.
-echo   %C_YELLOW%Warning: per-build sentinels unavailable; using default constants.%C_RESET%
+echo   %C_RED%ERROR: per-build sentinel generation failed; refusing to build with a fixed sentinel.%C_RESET%
+goto :failure
 
 :seeds_ready
 call :build_project "%LIBRARY_PROJ%" x64 "%DEPS_RELEASE%" "%LIBRARY64_OBJ%" "%TOOLSET_ARG%" "%SDK_ARG%" "%MUTATE_ARGS%"
@@ -103,29 +108,30 @@ if /i "%AMEGER_SKIP_TIMESTAMP%"=="1" goto :runtime_timestamp_ready
 if not exist "%TIMESTAMP_SCRIPT%" goto :runtime_timestamp_missing
 where powershell.exe >nul 2>&1
 if errorlevel 1 goto :hash_error
-powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%TIMESTAMP_SCRIPT%" "%DEPS_RELEASE%\Ameger Injector - x64.dll"
+powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%TIMESTAMP_SCRIPT%" "%RUNTIME_STOCK_DLL%"
 if errorlevel 1 goto :timestamp_fatal
 goto :runtime_timestamp_ready
 
 :runtime_timestamp_missing
-echo   %C_YELLOW%Warning: AddPE.ps1 was not found; runtime hash still uses current bytes.%C_RESET%
+echo   %C_RED%ERROR: AddPE.ps1 was not found; refusing to continue with an untimestamped runtime DLL.%C_RESET%
+goto :failure
 
 :runtime_timestamp_ready
 if /i "%AMEGER_SKIP_TIMESTAMP%"=="1" goto :runtime_mutate_ready
 if not exist "%MUTATE_SCRIPT%" goto :runtime_mutate_missing
-powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%MUTATE_SCRIPT%" "%DEPS_RELEASE%\Ameger Injector - x64.dll"
+powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%MUTATE_SCRIPT%" "%RUNTIME_STOCK_DLL%"
 if errorlevel 1 goto :mutate_fatal
 goto :runtime_mutate_ready
 
 :runtime_mutate_missing
-echo   %C_YELLOW%Warning: BuildPE.ps1 was not found; runtime keeps stock PE headers.%C_RESET%
-goto :runtime_mutate_ready
+echo   %C_RED%ERROR: BuildPE.ps1 was not found; refusing to continue with an unmutated runtime DLL.%C_RESET%
+goto :failure
 
 :runtime_mutate_ready
 where powershell.exe >nul 2>&1
 if errorlevel 1 goto :hash_error
 set "RUNTIME_SHA256="
-for /f "usebackq tokens=1,2 delims==" %%A in (`powershell.exe -NoLogo -NoProfile -Command "$h=([BitConverter]::ToString([Security.Cryptography.SHA256]::Create().ComputeHash([IO.File]::ReadAllBytes('%DEPS_RELEASE%\Ameger Injector - x64.dll'))) -replace '-',''); Write-Output ('RUNTIME_SHA256=' + $h); Write-Output ('H0=0x' + $h.Substring(0,8)); Write-Output ('H1=0x' + $h.Substring(8,8)); Write-Output ('H2=0x' + $h.Substring(16,8)); Write-Output ('H3=0x' + $h.Substring(24,8)); Write-Output ('H4=0x' + $h.Substring(32,8)); Write-Output ('H5=0x' + $h.Substring(40,8)); Write-Output ('H6=0x' + $h.Substring(48,8)); Write-Output ('H7=0x' + $h.Substring(56,8))"`) do set "%%A=%%B"
+for /f "usebackq tokens=1,2 delims==" %%A in (`powershell.exe -NoLogo -NoProfile -Command "$h=([BitConverter]::ToString([Security.Cryptography.SHA256]::Create().ComputeHash([IO.File]::ReadAllBytes('%RUNTIME_STOCK_DLL%'))) -replace '-',''); Write-Output ('RUNTIME_SHA256=' + $h); Write-Output ('H0=0x' + $h.Substring(0,8)); Write-Output ('H1=0x' + $h.Substring(8,8)); Write-Output ('H2=0x' + $h.Substring(16,8)); Write-Output ('H3=0x' + $h.Substring(24,8)); Write-Output ('H4=0x' + $h.Substring(32,8)); Write-Output ('H5=0x' + $h.Substring(40,8)); Write-Output ('H6=0x' + $h.Substring(48,8)); Write-Output ('H7=0x' + $h.Substring(56,8))"`) do set "%%A=%%B"
 if not defined RUNTIME_SHA256 goto :hash_error
 if not defined H0 goto :hash_error
 if not defined H1 goto :hash_error
@@ -136,6 +142,15 @@ if not defined H5 goto :hash_error
 if not defined H6 goto :hash_error
 if not defined H7 goto :hash_error
 set "RUNTIME_HASH_ARGS=/p:AmegerRuntimeHash0=%H0% /p:AmegerRuntimeHash1=%H1% /p:AmegerRuntimeHash2=%H2% /p:AmegerRuntimeHash3=%H3% /p:AmegerRuntimeHash4=%H4% /p:AmegerRuntimeHash5=%H5% /p:AmegerRuntimeHash6=%H6% /p:AmegerRuntimeHash7=%H7%"
+rem Rename the runtime DLL to the hash-derived name the Interface computes
+rem (RuntimeFileName() in Main.cpp: rtdll_<first 8 hex of H0>.dll). The hash
+rem above was taken from the stock path, and AddPE/BuildPE already ran on it, so
+rem this is the last step that touches the stock name. A failed move must abort
+rem rather than ship a folder whose runtime DLL is missing or misnamed.
+set "RUNTIME_DLL_NAME=rtdll_%H0:~2%.dll"
+set "RUNTIME_DLL=%DEPS_RELEASE%\%RUNTIME_DLL_NAME%"
+move /y "%RUNTIME_STOCK_DLL%" "%RUNTIME_DLL%" >nul
+if not exist "%RUNTIME_DLL%" goto :runtime_rename_error
 rem Value column is shared with BuildPE.ps1's closing summary line; both start
 rem at 2-space indent. "10/10 mutations applied" is 23 chars, "Runtime SHA-256:"
 rem is 16, so the 8 spaces below land the hash under the path. If you retune one,
@@ -162,12 +177,12 @@ echo.
 call :verify "%OUT64%\Injector - x64.exe" "x64 Interface"
 if errorlevel 1 goto :verify_error
 call :verify_embed
-if errorlevel 1 goto :verify_error
+if errorlevel 1 goto :verify_content_error
 if /i not "%AMEGER_ENCRYPT_CONFIG%"=="0" (
   call :verify_config_magic
-  if errorlevel 1 goto :verify_error
+  if errorlevel 1 goto :verify_content_error
 )
-call :verify "%DEPS_RELEASE%\Ameger Injector - x64.dll" "x64 runtime"
+call :verify "%RUNTIME_DLL%" "x64 runtime"
 if errorlevel 1 goto :verify_error
 call :remove_import_artifacts "%DEPS_RELEASE%"
 if errorlevel 1 goto :cleanup_error
@@ -194,7 +209,7 @@ echo Build completed successfully.
 echo.
 echo Cache:   %C_GREEN%%RELEASE_CACHE%%C_RESET%
 echo Interface x64: %C_GREEN%%OUT64%\Injector - x64.exe%C_RESET%
-echo Runtime DLL: %C_GREEN%%DEPS_RELEASE%\Ameger Injector - x64.dll%C_RESET%
+echo Runtime DLL: %C_GREEN%%RUNTIME_DLL%%C_RESET%
 echo Payload:     %C_GREEN%%PAYLOAD_DEST%%C_RESET%
 echo.
 if "%NO_PAUSE%"=="0" pause
@@ -275,17 +290,30 @@ powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%VERIFY_SCRIPT%
 exit /b %ERRORLEVEL%
 
 :verify_config_magic
-rem Encryption is on, so the deployed config must carry the AMEGERC1 marker.
-powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%VERIFY_SCRIPT%" -Check Magic -Path "%OUT_ROOT%\Configuration.ini" -Magic AMEGERC1
+rem Encryption is on, so the deployed config must carry the SYSCFG01 marker.
+powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%VERIFY_SCRIPT%" -Check Magic -Path "%OUT_ROOT%\Configuration.ini" -Magic SYSCFG01
 exit /b %ERRORLEVEL%
 
 :remove_import_artifacts
-for %%F in ("%~1\*.lib" "%~1\*.exp") do if exist "%%~F" del /f /q "%%~F"
+rem Fail closed: a leftover .lib/.exp in the release folder is a build fingerprint,
+rem so a failed delete must abort the build rather than silently ship it.
+for %%F in ("%~1\*.lib" "%~1\*.exp") do if exist "%%~F" (
+  del /f /q "%%~F"
+  if exist "%%~F" exit /b 1
+)
 exit /b 0
 
 :sweep_artifacts
-for %%F in ("%DEPS_RELEASE%\Ameger Injector - *.pdb") do if exist "%%~F" move "%%~F" "%CACHE_RUNTIME%\" >nul
-for %%F in ("%OUT64%\Injector - x64.pdb") do if exist "%%~F" move "%%~F" "%CACHE_INTERFACE%\" >nul
+rem Same fail-closed rule for the intermediates: a .pdb left in the release
+rem folder leaks the original symbol paths, so a failed move must abort.
+for %%F in ("%DEPS_RELEASE%\Ameger Injector - *.pdb") do if exist "%%~F" (
+  move "%%~F" "%CACHE_RUNTIME%\" >nul
+  if exist "%%~F" exit /b 1
+)
+for %%F in ("%OUT64%\Injector - x64.pdb") do if exist "%%~F" (
+  move "%%~F" "%CACHE_INTERFACE%\" >nul
+  if exist "%%~F" exit /b 1
+)
 exit /b 0
 
 :protect_config
@@ -335,6 +363,14 @@ if errorlevel 1 (
   echo   %C_RED%ERROR: failed to copy payload to %PAYLOAD_DEST%%C_RESET%
   exit /b 1
 )
+rem Fail closed: the deployed DLL must match the PayloadSha256 pin in the
+rem plaintext master. A stale or substituted payload would silently defeat the
+rem injector's pinned-hash startup check, so verify now and abort on mismatch.
+powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%VERIFY_SCRIPT%" -Check PayloadHash -Path "%PAYLOAD_DEST%" -Config "%CONFIG_MASTER%"
+if errorlevel 1 (
+  echo   %C_RED%ERROR: deployed payload failed hash verification.%C_RESET%
+  exit /b 1
+)
 echo   %C_GREEN%[+]%C_RESET% Payload deployed: %C_GREEN%%PAYLOAD_DEST%%C_RESET%
 exit /b 0
 
@@ -358,8 +394,16 @@ goto :failure
 echo %C_RED%ERROR: unable to calculate the runtime DLL SHA-256.%C_RESET%
 goto :failure
 
+:runtime_rename_error
+echo %C_RED%ERROR: unable to rename the runtime DLL to its hash-derived name.%C_RESET%
+goto :failure
+
 :verify_error
 echo %C_RED%ERROR: one or more expected binaries are missing.%C_RESET%
+goto :failure
+
+:verify_content_error
+echo %C_RED%ERROR: embedded runtime hash or config magic verification failed.%C_RESET%
 goto :failure
 
 :cleanup_error
@@ -401,9 +445,9 @@ echo.
 echo Build completed successfully.
 echo.
 echo Cache:   %C_GREEN%%RELEASE_CACHE%%C_RESET%
-echo Payload:     %C_GREEN%%PAYLOAD_DEST%%C_RESET%
 echo Interface x64: %C_GREEN%%OUT64%\Injector - x64.exe%C_RESET%
-echo Runtime DLL: %C_GREEN%%DEPS_RELEASE%\Ameger Injector - x64.dll%C_RESET%
+echo Runtime DLL: %C_GREEN%%RUNTIME_DLL%%C_RESET%
+echo Payload:     %C_GREEN%%PAYLOAD_DEST%%C_RESET%
 if "%NO_PAUSE%"=="0" pause
 exit /b 0
 

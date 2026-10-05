@@ -20,7 +20,7 @@ namespace
 		// static Running/Waiting/WrQueue fallback here.
 		if (!g_DynamicOffsets.Ready)
 		{
-			LOG(2, "FindHijackThread: dynamic offsets not ready, refusing\n");
+			LOG(2, "FindAcquireThread: dynamic offsets not ready, refusing\n");
 			return 0;
 		}
 		const KWAIT_REASON wrQueue = static_cast<KWAIT_REASON>(g_DynamicOffsets.WaitReasonWrQueue);
@@ -73,7 +73,7 @@ namespace
 
 DWORD SR_HijackThread(HANDLE hTargetProc, f_Routine pRoutine, void * pArg, DWORD & Out, DWORD Timeout, DWORD Flags, ULONG_PTR SponsorThread, DWORD SponsorTid, ERROR_DATA & error_data)
 {
-	LOG(2, "Begin SR_HijackThread\n");
+	LOG(2, "Begin SR_AcquireThread\n");
 
 	ProcessInformation processInformation;
 	if (!processInformation.SetProcess(hTargetProc))
@@ -173,6 +173,13 @@ DWORD SR_HijackThread(HANDLE hTargetProc, f_Routine pRoutine, void * pArg, DWORD
 				Stats.DonorHandle = PtrToUlong(Sponsor);
 				Stats.GrantedAccess = hijackAccess;
 				Stats.NewHandle = PtrToUlong(hThread.get());
+				// Same sponsor telemetry shape as the process path
+				// (Injection.cpp): the identity/state check passed, the
+				// sponsor was used, and its probe ran (unless the caller
+				// opted out of the sponsor roundtrip).
+				Stats.SponsorState = 2;
+				Stats.SponsorValidated = 1;
+				Stats.SponsorProbed = (Flags & INJ_SKIP_SPONSOR_ROUNDTRIP) ? 0 : 1;
 				Stats.FailCode = INJ_ERR_SUCCESS;
 				RecordHijackOutcome(Stats, true);
 				LOG(2, "Acquired target thread handle from sponsor\n");
@@ -212,17 +219,17 @@ DWORD SR_HijackThread(HANDLE hTargetProc, f_Routine pRoutine, void * pArg, DWORD
 				}
 			}
 
-		ThreadID = FindHijackThread(processInformation, false, true);
+			ThreadID = FindHijackThread(processInformation, false, true);
 
-		if (!ThreadID && processInformation.SetProcess(hTargetProc))
-		{
-			ThreadID = FindHijackThread(processInformation, false, false);
-		}
+			if (!ThreadID && processInformation.SetProcess(hTargetProc))
+			{
+				ThreadID = FindHijackThread(processInformation, false, false);
+			}
 
-		if (!ThreadID && processInformation.SetProcess(hTargetProc))
-		{
-			ThreadID = FindHijackThread(processInformation, true, false);
-		}
+			if (!ThreadID && processInformation.SetProcess(hTargetProc))
+			{
+				ThreadID = FindHijackThread(processInformation, true, false);
+			}
 		}
 
 		if (!ThreadID)
@@ -239,9 +246,11 @@ DWORD SR_HijackThread(HANDLE hTargetProc, f_Routine pRoutine, void * pArg, DWORD
 
 	if (!hThread)
 	{
-		// Recorded unconditionally so the UI can distinguish "flag never
-		// arrived" (Source stays Direct, Attempted stays 1 with zero scan
-		// data) from "scan ran" - the scan path below overwrites this entry.
+		// Seed the scan record. It is only recorded if no handle is acquired
+		// below; a successful scan records its own ScanStats instead, and a
+		// missing INJ_HANDLE_HIJACKING flag takes the Direct branch. So the UI
+		// can tell "flag set but scan produced nothing" from "flag never
+		// arrived".
 		if (Flags & INJ_HANDLE_HIJACKING)
 		{
 			HijackStats Stats{ };
@@ -263,7 +272,7 @@ DWORD SR_HijackThread(HANDLE hTargetProc, f_Routine pRoutine, void * pArg, DWORD
 					ScanStats.Source = static_cast<DWORD>(HijackSource::Scan);
 					RecordHijackOutcome(ScanStats, true);
 					hThread.reset(Hijacked);
-					LOG(2, "Acquired target thread handle via hijacking\n");
+					LOG(2, "Acquired target thread handle via acquisition\n");
 				}
 				else
 				{
@@ -272,9 +281,11 @@ DWORD SR_HijackThread(HANDLE hTargetProc, f_Routine pRoutine, void * pArg, DWORD
 						ScanStats.FailCode = INJ_ERR_HANDLE_HIJACK_FAILED;
 					}
 					ScanStats.Source = static_cast<DWORD>(HijackSource::Scan);
-					RecordHijackOutcome(ScanStats, true);
+					// Carry the final scan counters into Stats; the single
+					// RecordHijackOutcome below records them once, rather
+					// than recording ScanStats and then Stats again.
 					Stats = ScanStats;
-					LOG(2, "Thread handle hijacking found no donor\n");
+					LOG(2, "Thread handle acquisition found no donor\n");
 				}
 			}
 
@@ -288,7 +299,7 @@ DWORD SR_HijackThread(HANDLE hTargetProc, f_Routine pRoutine, void * pArg, DWORD
 
 				INIT_ERROR_DATA(error_data, INJ_ERR_HANDLE_HIJACK_FAILED);
 
-				LOG(2, "Thread handle hijacking found no donor; refusing (no direct fallback)\n");
+				LOG(2, "Thread handle acquisition found no donor; refusing (no direct fallback)\n");
 
 				return SR_HT_ERR_OPEN_REFUSED;
 			}
@@ -562,7 +573,7 @@ DWORD SR_HijackThread(HANDLE hTargetProc, f_Routine pRoutine, void * pArg, DWORD
 	LOG(2, "Remote thread shell prepared (W^X split: code RX 0x1000, state RW)\n");
 	LOG(3, "State bytes = %08X\n", data_size32);
 
-	LOG(2, "Hijacking thread with:\n");
+	LOG(2, "Acquiring thread with:\n");
 	LOG(3, "pRoutine = %p\n", pRemoteFunc);
 	LOG(3, "pArg     = %p\n", pArg);
 
@@ -600,7 +611,7 @@ DWORD SR_HijackThread(HANDLE hTargetProc, f_Routine pRoutine, void * pArg, DWORD
 		{
 			LOG(2, "FlushInstructionCache failed: %08X\n", GetLastError());
 		}
-		LOG(2, "Hijack code promoted RW->RX, state stays RW\n");
+		LOG(2, "Acquired code promoted RW->RX, state stays RW\n");
 	}
 
 	if (!SetThreadContext(hThread, &OldContext))
@@ -770,7 +781,7 @@ DWORD SR_HijackThread(HANDLE hTargetProc, f_Routine pRoutine, void * pArg, DWORD
 			{
 				INIT_ERROR_DATA(error_data, target_exit);
 
-				LOG(2, "Target process exited during injection\n");
+				LOG(2, "Target process exited during load\n");
 
 				allocation_guard.release();
 
@@ -930,7 +941,7 @@ void ResetThreadExecStats()
 
 void __stdcall GetLastThreadExecStats(THREAD_EXEC_STATS * Out)
 {
-#pragma EXPORT_FUNCTION(__FUNCTION__, __FUNCDNAME__)
+#pragma EXPORT_FUNCTION("CoreExecStats", __FUNCDNAME__)
 
 	if (Out)
 	{

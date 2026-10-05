@@ -36,7 +36,7 @@ namespace
 
 DWORD __stdcall InitializeRuntime()
 {
-#pragma EXPORT_FUNCTION(__FUNCTION__, __FUNCDNAME__)
+#pragma EXPORT_FUNCTION("CoreStart", __FUNCDNAME__)
 
 	const LONG previous_state = InterlockedCompareExchange(&g_RuntimeInitializationState, 1, 0);
 	if (previous_state == 2)
@@ -140,7 +140,7 @@ DWORD __stdcall InitializeRuntime()
 
 DWORD __stdcall ShutdownRuntime()
 {
-#pragma EXPORT_FUNCTION(__FUNCTION__, __FUNCDNAME__)
+#pragma EXPORT_FUNCTION("CoreStop", __FUNCDNAME__)
 
 	const LONG state = InterlockedCompareExchange(&g_RuntimeInitializationState, 1, 0);
 	if (state == 0)

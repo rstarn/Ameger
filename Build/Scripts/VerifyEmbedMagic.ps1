@@ -1,20 +1,23 @@
 # Post-build integration verifier for Ameger Injector.
 #
-# Create.bat calls this after the interface EXE is built. Two checks, both
+# Create.bat calls this after the interface EXE is built. Three checks, all
 # fatal (exit 1) on failure:
 #   Embed - the interface EXE must contain the runtime DLL's 8 SHA-256 words
 #           (AmegerRuntimeHash0..7, passed from Create.bat) as little-endian
 #           dwords, in order. A sequential search proves the build really
 #           linked against the mutated runtime DLL instead of leaving the
 #           default zero constants (which Main.cpp rejects at startup).
-#   Magic - the deployed Configuration.ini must start with the "AMEGERC1"
+#   Magic - the deployed Configuration.ini must start with the "SYSCFG01"
 #           DPAPI marker, proving the shipped config is the encrypted copy
 #           rather than a plaintext (or absent) file.
+#   PayloadHash - the deployed Jlov.dll must match the PayloadSha256 pin in
+#           the plaintext master config, proving the shipped payload is the
+#           reviewed asset rather than a stale or substituted DLL.
 #
 # Exit code 0 = verified, 1 = fatal.
 param(
     [Parameter(Mandatory = $true)]
-    [ValidateSet("Embed", "Magic")]
+    [ValidateSet("Embed", "Magic", "PayloadHash")]
     [string]$Check,
 
     [Parameter(Mandatory = $true)]
@@ -25,7 +28,10 @@ param(
     # parameters reliably, and Create.bat invokes this with -File.
     [string]$Words,
 
-    [string]$Magic
+    [string]$Magic,
+
+    # Plaintext master Configuration.ini; only read by -Check PayloadHash.
+    [string]$Config
 )
 
 $ErrorActionPreference = "Stop"
@@ -94,6 +100,45 @@ if ($Check -eq "Embed") {
     }
 
     Write-Ok ("Embedded runtime hash: " + (Get-Painted $script:C_Green "8") + "/" + (Get-Painted $script:C_Green "8") + " dwords in order (" + (Get-Painted $script:C_Dim $Path) + ")")
+    exit 0
+}
+
+if ($Check -eq "PayloadHash") {
+    if ([string]::IsNullOrEmpty($Config)) {
+        Write-Fail "Expected a master config path"
+        exit 1
+    }
+    if (-not (Test-Path -LiteralPath $Config)) {
+        Write-Fail ("Master config not found: " + (Get-Painted $script:C_Dim $Config))
+        exit 1
+    }
+
+    # Parse the plaintext master directly rather than trusting a caller-supplied
+    # hash, so the pin and the shipped DLL are checked against the same reviewed
+    # file. Key match is case-insensitive, matching the runtime's own ini reader;
+    # a missing or empty pin is fatal (fail closed, never ship an unpinned DLL).
+    $pin = $null
+    foreach ($line in [IO.File]::ReadAllLines($Config)) {
+        $trimmed = $line.Trim()
+        if ($trimmed.Length -eq 0 -or $trimmed.StartsWith(";") -or $trimmed.StartsWith("#")) { continue }
+        $eq = $trimmed.IndexOf("=")
+        if ($eq -lt 1) { continue }
+        if ($trimmed.Substring(0, $eq).Trim() -ieq "PayloadSha256") {
+            $pin = $trimmed.Substring($eq + 1).Trim()
+            break
+        }
+    }
+    if ([string]::IsNullOrEmpty($pin)) {
+        Write-Fail ("PayloadSha256 pin missing in " + (Get-Painted $script:C_Dim $Config))
+        exit 1
+    }
+
+    $actual = ([BitConverter]::ToString([Security.Cryptography.SHA256]::Create().ComputeHash($data)) -replace "-", "")
+    if ($actual -ine $pin) {
+        Write-Fail ("Payload hash mismatch: expected " + $pin + ", got " + $actual + " (" + (Get-Painted $script:C_Dim $Path) + ")")
+        exit 1
+    }
+    Write-Ok ("Payload SHA-256: " + (Get-Painted $script:C_Green $actual) + " (" + (Get-Painted $script:C_Dim $Path) + ")")
     exit 0
 }
 

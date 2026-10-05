@@ -82,11 +82,75 @@ DWORD ResolveDynamicOffsets()
 
 	DYNAMIC_NT_OFFSETS tmp{};
 
-	static const char * kTeb[] = { "TEB", "_TEB" };
-	static const char * kPeb[] = { "PEB", "_PEB" };
-	static const char * kKuser[] = { "_KUSER_SHARED_DATA", "KUSER_SHARED_DATA" };
-	static const char * kLdrEntry[] = { "_LDR_DATA_TABLE_ENTRY", "LDR_DATA_TABLE_ENTRY" };
-	static const char * kDdag[] = { "_LDR_DDAG_NODE", "LDR_DDAG_NODE" };
+	// Every PDB type/field/enum name this resolver probes is held as
+	// compile-time ciphertext and decrypted into stack buffers here; the
+	// pointer arrays below only reference those buffers, which outlive every
+	// read in this function. Nothing below is a plaintext .rdata literal.
+	auto t_teb_a = XOR_STR_A("TEB");
+	auto t_teb_b = XOR_STR_A("_TEB");
+	auto t_peb_a = XOR_STR_A("PEB");
+	auto t_peb_b = XOR_STR_A("_PEB");
+	auto t_kuser_a = XOR_STR_A("_KUSER_SHARED_DATA");
+	auto t_kuser_b = XOR_STR_A("KUSER_SHARED_DATA");
+	auto t_ldr_a = XOR_STR_A("_LDR_DATA_TABLE_ENTRY");
+	auto t_ldr_b = XOR_STR_A("LDR_DATA_TABLE_ENTRY");
+	auto t_ddag_a = XOR_STR_A("_LDR_DDAG_NODE");
+	auto t_ddag_b = XOR_STR_A("LDR_DDAG_NODE");
+	auto t_invt_a = XOR_STR_A("_RTL_INVERTED_FUNCTION_TABLE");
+	auto t_invt_b = XOR_STR_A("RTL_INVERTED_FUNCTION_TABLE");
+	auto t_invt_c = XOR_STR_A("_INVERTED_FUNCTION_TABLE_USER_MODE");
+	auto t_invt_d = XOR_STR_A("INVERTED_FUNCTION_TABLE_USER_MODE");
+	auto t_inve_a = XOR_STR_A("_RTL_INVERTED_FUNCTION_TABLE_ENTRY");
+	auto t_inve_b = XOR_STR_A("RTL_INVERTED_FUNCTION_TABLE_ENTRY");
+	auto t_inve_c = XOR_STR_A("_INVERTED_FUNCTION_TABLE_ENTRY");
+	auto t_inve_d = XOR_STR_A("INVERTED_FUNCTION_TABLE_ENTRY");
+	auto t_tls_a = XOR_STR_A("_TLS_ENTRY");
+	auto t_tls_b = XOR_STR_A("TLS_ENTRY");
+	auto t_tls_c = XOR_STR_A("_LDRP_TLS_ENTRY");
+	auto t_tls_d = XOR_STR_A("LDRP_TLS_ENTRY");
+	auto t_path_a = XOR_STR_A("_LDRP_PATH_SEARCH_CONTEXT");
+	auto t_path_b = XOR_STR_A("LDRP_PATH_SEARCH_CONTEXT");
+	auto t_kstate_a = XOR_STR_A("_KTHREAD_STATE");
+	auto t_kstate_b = XOR_STR_A("KTHREAD_STATE");
+	auto t_kwait_a = XOR_STR_A("_KWAIT_REASON");
+	auto t_kwait_b = XOR_STR_A("KWAIT_REASON");
+
+	auto f_same_teb_flags = XOR_STR_A("SameTebFlags");
+	auto f_last_error = XOR_STR_A("LastErrorValue");
+	auto f_peb = XOR_STR_A("ProcessEnvironmentBlock");
+	auto f_os_major = XOR_STR_A("OSMajorVersion");
+	auto f_os_minor = XOR_STR_A("OSMinorVersion");
+	auto f_os_build = XOR_STR_A("OSBuildNumber");
+	auto f_ldr = XOR_STR_A("Ldr");
+	auto f_process_heap = XOR_STR_A("ProcessHeap");
+	auto f_loader_lock = XOR_STR_A("LoaderLock");
+	auto f_cookie = XOR_STR_A("Cookie");
+	auto f_dll_base = XOR_STR_A("DllBase");
+	auto f_size_of_image = XOR_STR_A("SizeOfImage");
+	auto f_full_dll_name = XOR_STR_A("FullDllName");
+	auto f_ddag_node = XOR_STR_A("DdagNode");
+	auto f_state = XOR_STR_A("State");
+	auto f_count = XOR_STR_A("Count");
+	auto f_current_size = XOR_STR_A("CurrentSize");
+	auto f_entries = XOR_STR_A("Entries");
+	auto f_table_entry = XOR_STR_A("TableEntry");
+	auto f_image_base = XOR_STR_A("ImageBase");
+	auto f_image_size = XOR_STR_A("ImageSize");
+	auto f_exception_dir = XOR_STR_A("ExceptionDirectory");
+	auto f_function_table = XOR_STR_A("FunctionTable");
+	auto f_exception_dir_size = XOR_STR_A("ExceptionDirectorySize");
+	auto f_size_of_table = XOR_STR_A("SizeOfTable");
+	auto f_module_entry = XOR_STR_A("ModuleEntry");
+	auto f_orig_full_dll = XOR_STR_A("OriginalFullDllName");
+	auto f_running = XOR_STR_A("Running");
+	auto f_waiting = XOR_STR_A("Waiting");
+	auto f_wr_queue = XOR_STR_A("WrQueue");
+
+	const char * kTeb[] = { t_teb_a.get(), t_teb_b.get() };
+	const char * kPeb[] = { t_peb_a.get(), t_peb_b.get() };
+	const char * kKuser[] = { t_kuser_a.get(), t_kuser_b.get() };
+	const char * kLdrEntry[] = { t_ldr_a.get(), t_ldr_b.get() };
+	const char * kDdag[] = { t_ddag_a.get(), t_ddag_b.get() };
 	// Inverted function table. 26xxx renamed the types and their fields while
 	// keeping the exact same on-disk layout (see NTDefinitions.h): the table
 	// became _INVERTED_FUNCTION_TABLE_USER_MODE {CurrentSize,MaximumSize,
@@ -94,12 +158,12 @@ DWORD ResolveDynamicOffsets()
 	// _INVERTED_FUNCTION_TABLE_ENTRY {union{FunctionTable,DynamicTable},
 	// ImageBase,SizeOfImage,SizeOfTable}. Both spellings are attempted below;
 	// the layout is still required to be present, so this stays fail-closed.
-	static const char * kInvTable[] = { "_RTL_INVERTED_FUNCTION_TABLE", "RTL_INVERTED_FUNCTION_TABLE", "_INVERTED_FUNCTION_TABLE_USER_MODE", "INVERTED_FUNCTION_TABLE_USER_MODE" };
-	static const char * kInvEntry[] = { "_RTL_INVERTED_FUNCTION_TABLE_ENTRY", "RTL_INVERTED_FUNCTION_TABLE_ENTRY", "_INVERTED_FUNCTION_TABLE_ENTRY", "INVERTED_FUNCTION_TABLE_ENTRY" };
-	static const char * kTls[] = { "_TLS_ENTRY", "TLS_ENTRY", "_LDRP_TLS_ENTRY", "LDRP_TLS_ENTRY" };
-	static const char * kPathCtx[] = { "_LDRP_PATH_SEARCH_CONTEXT", "LDRP_PATH_SEARCH_CONTEXT" };
-	static const char * kThreadState[] = { "_KTHREAD_STATE", "KTHREAD_STATE" };
-	static const char * kWaitReason[] = { "_KWAIT_REASON", "KWAIT_REASON" };
+	const char * kInvTable[] = { t_invt_a.get(), t_invt_b.get(), t_invt_c.get(), t_invt_d.get() };
+	const char * kInvEntry[] = { t_inve_a.get(), t_inve_b.get(), t_inve_c.get(), t_inve_d.get() };
+	const char * kTls[] = { t_tls_a.get(), t_tls_b.get(), t_tls_c.get(), t_tls_d.get() };
+	const char * kPathCtx[] = { t_path_a.get(), t_path_b.get() };
+	const char * kThreadState[] = { t_kstate_a.get(), t_kstate_b.get() };
+	const char * kWaitReason[] = { t_kwait_a.get(), t_kwait_b.get() };
 
 #define REQUIRE_FIELD(types, field, out) \
 	do { \
@@ -135,41 +199,41 @@ DWORD ResolveDynamicOffsets()
 
 	// TEB: SameTebFlags (worker check), LastErrorValue (stub gs:[] disp),
 	// ProcessEnvironmentBlock (kept for completeness; version reads use API).
-	REQUIRE_FIELD(kTeb, "SameTebFlags", tmp.TebSameTebFlags);
-	REQUIRE_FIELD(kTeb, "LastErrorValue", tmp.TebLastErrorValue);
-	REQUIRE_FIELD(kTeb, "ProcessEnvironmentBlock", tmp.TebProcessEnvironmentBlock);
+	REQUIRE_FIELD(kTeb, f_same_teb_flags.get(), tmp.TebSameTebFlags);
+	REQUIRE_FIELD(kTeb, f_last_error.get(), tmp.TebLastErrorValue);
+	REQUIRE_FIELD(kTeb, f_peb.get(), tmp.TebProcessEnvironmentBlock);
 
 	// PEB: version + loader pointers.
-	REQUIRE_FIELD(kPeb, "OSMajorVersion", tmp.PebOsMajorVersion);
-	REQUIRE_FIELD(kPeb, "OSMinorVersion", tmp.PebOsMinorVersion);
-	REQUIRE_FIELD(kPeb, "OSBuildNumber", tmp.PebOsBuildNumber);
-	REQUIRE_FIELD(kPeb, "Ldr", tmp.PebLdr);
-	REQUIRE_FIELD(kPeb, "ProcessHeap", tmp.PebProcessHeap);
-	REQUIRE_FIELD(kPeb, "LoaderLock", tmp.PebLoaderLock);
+	REQUIRE_FIELD(kPeb, f_os_major.get(), tmp.PebOsMajorVersion);
+	REQUIRE_FIELD(kPeb, f_os_minor.get(), tmp.PebOsMinorVersion);
+	REQUIRE_FIELD(kPeb, f_os_build.get(), tmp.PebOsBuildNumber);
+	REQUIRE_FIELD(kPeb, f_ldr.get(), tmp.PebLdr);
+	REQUIRE_FIELD(kPeb, f_process_heap.get(), tmp.PebProcessHeap);
+	REQUIRE_FIELD(kPeb, f_loader_lock.get(), tmp.PebLoaderLock);
 	REQUIRE_SIZE(kPeb, tmp.PebSize);
 
 	// KUSER_SHARED_DATA.Cookie field (base 0x7FFE0000 is fixed mapping).
-	REQUIRE_FIELD(kKuser, "Cookie", tmp.KuserCookie);
+	REQUIRE_FIELD(kKuser, f_cookie.get(), tmp.KuserCookie);
 
 	// LDR entry + DDAG node.
-	REQUIRE_FIELD(kLdrEntry, "DllBase", tmp.LdrEntryDllBase);
-	REQUIRE_FIELD(kLdrEntry, "SizeOfImage", tmp.LdrEntrySizeOfImage);
-	REQUIRE_FIELD(kLdrEntry, "FullDllName", tmp.LdrEntryFullDllName);
-	REQUIRE_FIELD(kLdrEntry, "DdagNode", tmp.LdrEntryDdagNode);
+	REQUIRE_FIELD(kLdrEntry, f_dll_base.get(), tmp.LdrEntryDllBase);
+	REQUIRE_FIELD(kLdrEntry, f_size_of_image.get(), tmp.LdrEntrySizeOfImage);
+	REQUIRE_FIELD(kLdrEntry, f_full_dll_name.get(), tmp.LdrEntryFullDllName);
+	REQUIRE_FIELD(kLdrEntry, f_ddag_node.get(), tmp.LdrEntryDdagNode);
 	REQUIRE_SIZE(kLdrEntry, tmp.LdrEntrySize);
-	REQUIRE_FIELD(kDdag, "State", tmp.LdrDdagNodeState);
+	REQUIRE_FIELD(kDdag, f_state.get(), tmp.LdrDdagNodeState);
 	REQUIRE_SIZE(kDdag, tmp.LdrDdagNodeSize);
 
 	// Inverted tables. Field names differ by build (Count/CurrentSize,
 	// Entries/TableEntry, ImageSize/SizeOfImage,
 	// ExceptionDirectory/FunctionTable, ExceptionDirectorySize/SizeOfTable);
 	// the offsets are identical.
-	REQUIRE_FIELD_ALT(kInvTable, "Count", "CurrentSize", tmp.InvertedTableCount);
-	REQUIRE_FIELD_ALT(kInvTable, "Entries", "TableEntry", tmp.InvertedTableEntries);
-	REQUIRE_FIELD(kInvEntry, "ImageBase", tmp.InvertedEntryImageBase);
-	REQUIRE_FIELD_ALT(kInvEntry, "ImageSize", "SizeOfImage", tmp.InvertedEntryImageSize);
-	REQUIRE_FIELD_ALT(kInvEntry, "ExceptionDirectory", "FunctionTable", tmp.InvertedEntryExceptionDirectory);
-	REQUIRE_FIELD_ALT(kInvEntry, "ExceptionDirectorySize", "SizeOfTable", tmp.InvertedEntryExceptionDirectorySize);
+	REQUIRE_FIELD_ALT(kInvTable, f_count.get(), f_current_size.get(), tmp.InvertedTableCount);
+	REQUIRE_FIELD_ALT(kInvTable, f_entries.get(), f_table_entry.get(), tmp.InvertedTableEntries);
+	REQUIRE_FIELD(kInvEntry, f_image_base.get(), tmp.InvertedEntryImageBase);
+	REQUIRE_FIELD_ALT(kInvEntry, f_image_size.get(), f_size_of_image.get(), tmp.InvertedEntryImageSize);
+	REQUIRE_FIELD_ALT(kInvEntry, f_exception_dir.get(), f_function_table.get(), tmp.InvertedEntryExceptionDirectory);
+	REQUIRE_FIELD_ALT(kInvEntry, f_exception_dir_size.get(), f_size_of_table.get(), tmp.InvertedEntryExceptionDirectorySize);
 	REQUIRE_SIZE(kInvEntry, tmp.InvertedEntrySize);
 
 #undef REQUIRE_FIELD
@@ -181,14 +245,14 @@ DWORD ResolveDynamicOffsets()
 	// IMAGE_TLS_DIRECTORY(40) + ModuleEntry, all SDK-stable).
 	{
 		DWORD off = 0;
-		if (sym_parser.GetFieldOffsetAny(kTls, _countof(kTls), "ModuleEntry", off) == SYMBOL_ERR_SUCCESS && off && off < 0x200)
+		if (sym_parser.GetFieldOffsetAny(kTls, _countof(kTls), f_module_entry.get(), off) == SYMBOL_ERR_SUCCESS && off && off < 0x200)
 		{
 			tmp.TlsEntryModuleEntry = off;
 		}
 		else
 		{
 			tmp.TlsEntryModuleEntry = static_cast<DWORD>(sizeof(LIST_ENTRY) + sizeof(IMAGE_TLS_DIRECTORY));
-			LOG(1, "DynamicOffsets: TLS_ENTRY.ModuleEntry via SDK math 0x%X (PDB type absent)\n", tmp.TlsEntryModuleEntry);
+			LOG(1, "DynamicOffsets: TLS_ENTRY module slot via SDK math 0x%X (PDB type absent)\n", tmp.TlsEntryModuleEntry);
 		}
 		ULONG64 tls_sz = 0;
 		if (sym_parser.GetTypeSizeAny(kTls, _countof(kTls), tls_sz) == SYMBOL_ERR_SUCCESS && tls_sz && tls_sz < 0x400)
@@ -223,14 +287,14 @@ DWORD ResolveDynamicOffsets()
 			LOG(1, "DynamicOffsets: PATH_SEARCH_CONTEXT size via fallback %lu\n", tmp.LdrpPathSearchContextSize);
 		}
 		DWORD ctx_off = 0;
-		if (sym_parser.GetFieldOffsetAny(kPathCtx, _countof(kPathCtx), "OriginalFullDllName", ctx_off) == SYMBOL_ERR_SUCCESS && ctx_off < 0x400)
+		if (sym_parser.GetFieldOffsetAny(kPathCtx, _countof(kPathCtx), f_orig_full_dll.get(), ctx_off) == SYMBOL_ERR_SUCCESS && ctx_off < 0x400)
 		{
 			tmp.LdrpPathSearchOriginalFullDllName = ctx_off;
 		}
 		else
 		{
 			tmp.LdrpPathSearchOriginalFullDllName = static_cast<DWORD>(offsetof(FALLBACK_CTX, c));
-			LOG(1, "DynamicOffsets: PATH_SEARCH_CONTEXT.OriginalFullDllName via fallback 0x%X\n", tmp.LdrpPathSearchOriginalFullDllName);
+			LOG(1, "DynamicOffsets: PATH_SEARCH_CONTEXT name via fallback 0x%X\n", tmp.LdrpPathSearchOriginalFullDllName);
 		}
 	}
 
@@ -278,8 +342,6 @@ DWORD ResolveDynamicOffsets()
 				return SYMBOL_ERR_SYMBOL_SEARCH_FAILED;
 			}
 		}
-		tmp.NtWaitReturnOffset = first;
-		LOG(1, "DynamicOffsets: NtWaitReturnOffset=0x%X (disassembled, consensus 4 fns)\n", first);
 	}
 
 	// Stable ABI + enums: PDB first, documented fallback (not drift-prone).
@@ -287,7 +349,7 @@ DWORD ResolveDynamicOffsets()
 	tmp.SameTebFlagsLoaderWorkerMask = 0x2000;
 	{
 		DWORD v = 0;
-		if (sym_parser.GetEnumValueAny(kThreadState, _countof(kThreadState), "Running", v) == SYMBOL_ERR_SUCCESS)
+		if (sym_parser.GetEnumValueAny(kThreadState, _countof(kThreadState), f_running.get(), v) == SYMBOL_ERR_SUCCESS)
 		{
 			tmp.ThreadStateRunning = v;
 		}
@@ -296,7 +358,7 @@ DWORD ResolveDynamicOffsets()
 			tmp.ThreadStateRunning = 2;
 			LOG(2, "DynamicOffsets: Running via stable fallback 2\n");
 		}
-		if (sym_parser.GetEnumValueAny(kThreadState, _countof(kThreadState), "Waiting", v) == SYMBOL_ERR_SUCCESS)
+		if (sym_parser.GetEnumValueAny(kThreadState, _countof(kThreadState), f_waiting.get(), v) == SYMBOL_ERR_SUCCESS)
 		{
 			tmp.ThreadStateWaiting = v;
 		}
@@ -305,7 +367,7 @@ DWORD ResolveDynamicOffsets()
 			tmp.ThreadStateWaiting = 5;
 			LOG(2, "DynamicOffsets: Waiting via stable fallback 5\n");
 		}
-		if (sym_parser.GetEnumValueAny(kWaitReason, _countof(kWaitReason), "WrQueue", v) == SYMBOL_ERR_SUCCESS)
+		if (sym_parser.GetEnumValueAny(kWaitReason, _countof(kWaitReason), f_wr_queue.get(), v) == SYMBOL_ERR_SUCCESS)
 		{
 			tmp.WaitReasonWrQueue = v;
 		}

@@ -13,7 +13,7 @@
 # "0" or a small loop counter in a disassembly diff.
 #
 # Strict Windows PowerShell 5.1. Exit code 0 = seeds produced,
-# 1 = failure (the caller must fall back to the default vcxproj values).
+# 1 = failure (fatal: the caller refuses to build with a fixed sentinel).
 
 param()
 
@@ -25,11 +25,14 @@ try {
     $rng.GetBytes($buf)
     $rng.Dispose()
 } catch {
-    Write-Host ("  [x] Seed generation failed: " + $_.Exception.Message)
+    Write-Host ("  [x] ERROR: seed generation failed (RNG unavailable): " + $_.Exception.Message) -ForegroundColor Red
     exit 1
 }
 
-if ($buf.Length -ne 4) { Write-Host "  [x] RNG returned a short buffer"; exit 1 }
+if ($buf.Length -ne 4) {
+    Write-Host "  [x] ERROR: RNG returned a short buffer; refusing to build with a fixed sentinel." -ForegroundColor Red
+    exit 1
+}
 
 $mmap = ([BitConverter]::ToUInt32($buf, 0) -bor 1) -band 0xFFFFFFFF
 
