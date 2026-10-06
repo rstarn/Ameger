@@ -516,7 +516,7 @@ namespace
             return ConfirmationResult::Unavailable;
         }
 
-        wprintf(L"%ls[+]%ls Press Enter to begin, or Q to quit: ", kGreen, kReset);
+        wprintf(L"%ls[+]%ls Press Enter to begin, or Q to quit: \n", kGreen, kReset);
         fflush(stdout);
 
         std::wstring entered;
