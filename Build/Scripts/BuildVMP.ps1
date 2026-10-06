@@ -14,6 +14,13 @@ param(
 # Choosing the name here makes it vary per build, so the signature has to be
 # rediscovered each time.
 #
+# VMProtect appends a numeric suffix to the chosen name in the deployed PE
+# section table: the project's ".XXXX" lands in the output as ".XXXX0" (the
+# bare name plus a trailing digit run). The ProtectDLL/ProtectEXE stages parse
+# the protected output and verify its VMProtect segment matches
+# ^<SEG_NAME>[0-9]*$, so this script prints the bare generated name and lets
+# those stages accept the suffix.
+#
 # The original template is never modified; the rewritten copy lives in the
 # staging directory and is deleted with it.
 #

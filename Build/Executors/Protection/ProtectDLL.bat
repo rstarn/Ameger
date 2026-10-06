@@ -151,6 +151,12 @@ if errorlevel 2 goto :fc_error
 if errorlevel 1 goto :output_invalid
 echo.
 echo   %C_GREEN%OK%C_RESET% Protected output validated.
+rem Confirm the output really carries the VMProtect segment we asked for before
+rem the bytes are deployed. Verification only: the binary is never renamed or
+rem patched here.
+call :verify_segment "%WORK_DIR%\out.dll"
+if errorlevel 1 goto :segment_error
+echo   %C_GREEN%[+]%C_RESET% VM segment: %C_GREEN%%VM_SEG%%C_RESET% (verified)
 rem Strip the export directory before the bytes are deployed: on disk it is the
 rem only identifying symbol, and nothing resolves it after a manual map.
 call :strip_exports "%WORK_DIR%\out.dll"
@@ -254,6 +260,7 @@ echo   %C_GREEN%[+]%C_RESET% No VMProtect traces in %C_GREEN%%DLL_DIR%%C_RESET%.
 echo.
 echo Payload already protected; release unchanged.
 echo.
+if defined VMSEG echo VM segment: %C_GREEN%%VMSEG%%C_RESET% (recorded)
 echo Payload: %C_GREEN%%TARGET%%C_RESET%
 if "%NO_PAUSE%"=="0" pause
 exit /b 0
@@ -378,7 +385,6 @@ exit /b 0
 
 :read_state
 set "STATE_MATCH=unknown"
-set "STATE_HASH="
 if not exist "%STATE_FILE%" exit /b 0
 set "SRC="
 set "OUT="
@@ -392,7 +398,6 @@ if /i "%CUR%"=="%OUT%" (
 )
 if defined SRC if /i "%CUR%"=="%SRC%" (
   set "STATE_MATCH=source"
-  set "STATE_HASH=%CUR%"
   exit /b 0
 )
 exit /b 0
@@ -420,6 +425,30 @@ if errorlevel 2 exit /b 2
 if not errorlevel 1 exit /b 1
 exit /b 0
 
+rem Usage: call :verify_segment <protected PE>
+rem Confirms the output carries a section whose name is the generated SEG_NAME
+rem with an optional trailing digit run. VMProtect appends a numeric suffix, so
+rem the project's ".XXXX" lands in the section table as ".XXXX0". Any other
+rem name means protection did not run with our generated project, so fail
+rem closed rather than deploy the artifact. Verification only: the binary is
+rem never renamed or patched.
+:verify_segment
+set "VM_SEG="
+set "VM_SEG_STATUS="
+rem A status token is parsed instead of relying on the child's exit code:
+rem for /f does not propagate a command's errorlevel reliably, and the value
+rem would be silently lost. PowerShell always exits 0 and reports via stdout.
+for /f "usebackq tokens=1,* delims==" %%A in (`powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -Command "$seg='%SEG_NAME%'; $b=[IO.File]::ReadAllBytes('%~1'); $e=[BitConverter]::ToInt32($b,0x3C); $c=$e+4; $n=[BitConverter]::ToUInt16($b,$c+2); $z=[BitConverter]::ToUInt16($b,$c+16); $s=$c+20+$z; $found=$null; for($i=0;$i -lt $n;$i++){ $o=$s+40*$i; $nm=[Text.Encoding]::ASCII.GetString($b,$o,8).Trim([char]0); if($nm.StartsWith($seg)){ $found=$nm; break } }; if($null -eq $found){ Write-Output 'VM_SEG_STATUS=missing'; Write-Output 'VM_SEG='; exit 0 }; Write-Output ('VM_SEG=' + $found); if($found -match ('^' + [regex]::Escape($seg) + '[0-9]*$')){ Write-Output 'VM_SEG_STATUS=ok' } else { Write-Output 'VM_SEG_STATUS=mismatch' }; exit 0"`) do set "%%A=%%B"
+if /i "%VM_SEG_STATUS%"=="ok" exit /b 0
+if /i "%VM_SEG_STATUS%"=="missing" (
+  echo   %C_RED%ERROR: no VMProtect segment found in the protected output.%C_RESET%
+) else (
+  echo   %C_RED%ERROR: VMProtect segment name mismatch in the protected output.%C_RESET%
+)
+echo   %C_RED%       expected: %SEG_NAME% (optionally followed by digits)%C_RESET%
+echo   %C_RED%       observed: %VM_SEG%%C_RESET%
+exit /b 1
+
 :assert_master_pin
 rem Fail closed if the master no longer pins the pristine asset. That pin is
 rem what Create.bat verifies the freshly copied payload against, so drift here
@@ -436,6 +465,7 @@ if not exist "%RELEASE_CACHE%" mkdir "%RELEASE_CACHE%"
 if not exist "%RELEASE_CACHE%" exit /b 1
 >"%STATE_FILE%" echo SRC=%SRC_SHA%
 >>"%STATE_FILE%" echo OUT=%OUT_SHA%
+>>"%STATE_FILE%" echo VMSEG=%VM_SEG%
 exit /b 0
 
 :tail_log
@@ -498,6 +528,11 @@ goto :failure
 
 :output_invalid
 echo   %C_RED%ERROR: VMProtect output failed validation; release left untouched.%C_RESET%
+goto :failure
+
+:segment_error
+echo   %C_RED%ERROR: the protected payload does not carry the generated VMProtect segment.%C_RESET%
+echo   %C_RED%       Release left untouched; the output was not deployed.%C_RESET%
 goto :failure
 
 :fc_error

@@ -1,6 +1,6 @@
 # Post-build integration verifier for Ameger Injector.
 #
-# Create.bat calls this after the interface EXE is built. Three checks, all
+# Create.bat calls this after the interface EXE is built. Four checks, all
 # fatal (exit 1) on failure:
 #   Embed - the interface EXE must contain the runtime DLL's 8 SHA-256 words
 #           (AmegerRuntimeHash0..7, passed from Create.bat) as little-endian
@@ -13,11 +13,14 @@
 #   PayloadHash - the deployed Jlov.dll must match the PayloadSha256 pin in
 #           the plaintext master config, proving the shipped payload is the
 #           reviewed asset rather than a stale or substituted DLL.
+#   DeployedPin - the shipped Configuration.ini (DPAPI-encrypted, or plaintext
+#           under the explicit opt-out) must pin the exact payload digest that
+#           ships beside it, so the launcher's startup hash check passes.
 #
 # Exit code 0 = verified, 1 = fatal.
 param(
     [Parameter(Mandatory = $true)]
-    [ValidateSet("Embed", "Magic", "PayloadHash")]
+    [ValidateSet("Embed", "Magic", "PayloadHash", "DeployedPin")]
     [string]$Check,
 
     [Parameter(Mandatory = $true)]
@@ -31,7 +34,10 @@ param(
     [string]$Magic,
 
     # Plaintext master Configuration.ini; only read by -Check PayloadHash.
-    [string]$Config
+    [string]$Config,
+
+    # Expected payload SHA-256; only used by -Check DeployedPin.
+    [string]$ExpectPin
 )
 
 $ErrorActionPreference = "Stop"
@@ -139,6 +145,61 @@ if ($Check -eq "PayloadHash") {
         exit 1
     }
     Write-Ok ("Payload SHA-256: " + (Get-Painted $script:C_Green $actual) + " (" + (Get-Painted $script:C_Dim $Path) + ")")
+    exit 0
+}
+
+if ($Check -eq "DeployedPin") {
+    if ([string]::IsNullOrEmpty($ExpectPin)) {
+        Write-Fail "Expected a payload SHA-256"
+        exit 1
+    }
+
+    # The deployed config may be DPAPI-encrypted (magic-prefixed) or plaintext
+    # (explicit opt-out). Recover the UTF-8 text the same way the runtime does:
+    # strip the magic and Unprotect in the CurrentUser scope, or read directly.
+    $magicBytes = [Text.Encoding]::ASCII.GetBytes("SYSCFG01")
+    $isEncrypted = $false
+    if ($data.Length -gt $magicBytes.Length) {
+        $isEncrypted = $true
+        for ($i = 0; $i -lt $magicBytes.Length; $i++) {
+            if ($data[$i] -ne $magicBytes[$i]) { $isEncrypted = $false; break }
+        }
+    }
+    if ($isEncrypted) {
+        Add-Type -AssemblyName System.Security | Out-Null
+        try {
+            $blob = New-Object byte[] ($data.Length - $magicBytes.Length)
+            [Array]::Copy($data, $magicBytes.Length, $blob, 0, $blob.Length)
+            $plainBytes = [Security.Cryptography.ProtectedData]::Unprotect($blob, $null, [Security.Cryptography.DataProtectionScope]::CurrentUser)
+        } catch {
+            Write-Fail ("DPAPI decrypt failed: " + $_.Exception.Message)
+            exit 1
+        }
+        $text = [Text.Encoding]::UTF8.GetString($plainBytes)
+    } else {
+        $text = [Text.Encoding]::UTF8.GetString($data)
+    }
+
+    $pin = $null
+    foreach ($line in ($text -split "\r?\n")) {
+        $trimmed = $line.Trim()
+        if ($trimmed.Length -eq 0 -or $trimmed.StartsWith(";") -or $trimmed.StartsWith("#")) { continue }
+        $eq = $trimmed.IndexOf("=")
+        if ($eq -lt 1) { continue }
+        if ($trimmed.Substring(0, $eq).Trim() -ieq "PayloadSha256") {
+            $pin = $trimmed.Substring($eq + 1).Trim()
+            break
+        }
+    }
+    if ([string]::IsNullOrEmpty($pin)) {
+        Write-Fail ("Deployed config pins no PayloadSha256 (" + (Get-Painted $script:C_Dim $Path) + ")")
+        exit 1
+    }
+    if ($pin -ine $ExpectPin) {
+        Write-Fail ("Deployed config pin mismatch: config pins " + $pin + ", deployed payload is " + $ExpectPin + " (" + (Get-Painted $script:C_Dim $Path) + ")")
+        exit 1
+    }
+    Write-Ok ("Deployed config pin: " + (Get-Painted $script:C_Green $pin) + " (" + (Get-Painted $script:C_Dim $Path) + ")")
     exit 0
 }
 

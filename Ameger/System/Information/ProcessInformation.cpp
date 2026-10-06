@@ -442,7 +442,7 @@ bool ProcessInformation::IsThreadWorkerThread()
 
 	// Fail-closed when the PDB offsets are not ready: treat as worker so the
 	// thread is skipped rather than hijacked on a stale guess.
-	if (!g_DynamicOffsets.Ready || !g_DynamicOffsets.TebSameTebFlags)
+	if (!g_DynamicOffsetsReady.load(std::memory_order_acquire) || !g_DynamicOffsets.TebSameTebFlags)
 	{
 		return true;
 	}

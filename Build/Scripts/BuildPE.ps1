@@ -344,6 +344,10 @@ function Get-ExceptionRanges([byte[]]$Data, $Layout) {
 }
 
 function Invoke-MutatePolymorphicJunk([byte[]]$Data, $Layout) {
+    # Bound: only runs of >= 64 bytes of 0x00/0xCC that sit inside an
+    # EXECUTABLE section carrying .pdata coverage are considered, and only the
+    # parts of such a run that fall outside every exception range are filled.
+    # Real code, real data and any exception-covered bytes are never written.
     $nops = @(
         @(0x90),
         @(0x66, 0x90),
@@ -569,6 +573,10 @@ try {
             }
         }
 
+        # Fail closed: a mutation that throws already set $failed above, and
+        # this structural re-validation catches one that silently corrupted the
+        # section table. Either way the file is not written and the caller
+        # refuses to continue on a nonzero exit, so a bad image never ships.
         try {
             $check = Get-PeLayout $bytes
             if ($check.NumSections -ne $layout.NumSections) { throw "section count changed" }

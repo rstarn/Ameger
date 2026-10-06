@@ -3881,6 +3881,19 @@ namespace
     // __try is incompatible with functions that require object unwinding.
     // A verification fault fails the gate rather than passing it: we could not
     // prove the stealth properties, so we must not report them as holding.
+    //
+    // Documented, not restructured: DebugAndVerifyStealth owns C++ containers
+    // (std::vector<BYTE>, std::wstring, std::unique_ptr) and this build is
+    // /EHsc, so an access violation raised inside the callee and caught by the
+    // __except below does NOT unwind the callee's C++ frames - its destructors
+    // never run and those blocks are lost. The loss is bounded and one-shot:
+    // it can only occur on the fault path (a verification bug, not a normal
+    // run), the fault fails the gate, and the process exits immediately after;
+    // the leaked blocks are the already-read runtime-DLL buffers (a few MB).
+    // Removing it would mean hoisting every owning local out of the ~1400-line
+    // verifier into a caller that returns normally - a large restructuring of
+    // verification logic that buys nothing on the success path. Left as-is
+    // deliberately rather than risk that rewrite.
     bool SafeDebugAndVerifyStealth(HANDLE process, HINSTANCE hRemoteBase, DWORD flags,
         const BYTE * local_pe, size_t local_pe_size, const HijackStats * ProcessHijack, const HijackStats * ThreadHijack,
         const HijackContext * Context, const MAP_STATS * MapStats, f_GetLastStringStats get_string_stats,
@@ -5536,10 +5549,14 @@ namespace
         // functionally. Guards close their handles; raw locals are nulled so
         // no later path can reuse them.
         // 
+        // Capture the diagnostic verdict before the guards run. had_target
+        // means "a handle was available for verification", not "the guard
+        // still owns one"; reading it after reset() only happened to work
+        // because the raw copy is not nulled by the guard.
+        const bool had_target = (targetHandle != nullptr);
         targetHandleGuard.reset();
         threadSponsorGuard.reset();
         sponsorGuard.reset();
-        const bool had_target = (targetHandle != nullptr);
         targetHandle = nullptr;
         threadSponsorRaw = nullptr;
         sponsorRaw = nullptr;

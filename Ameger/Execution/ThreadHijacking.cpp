@@ -98,7 +98,7 @@ namespace
 		// Thread-state values are download-dependent (see g_DynamicOffsets,
 		// resolved from ntdll.pdb enums). Fail-closed when not ready: no
 		// static Running/Waiting/WrQueue fallback here.
-		if (!g_DynamicOffsets.Ready)
+		if (!g_DynamicOffsetsReady.load(std::memory_order_acquire))
 		{
 			LOG(2, "FindAcquireThread: dynamic offsets not ready, refusing\n");
 			return 0;
@@ -641,9 +641,12 @@ DWORD SR_HijackThread(HANDLE hTargetProc, f_Routine pRoutine, void * pArg, DWORD
 	// (not adjusted by +pad). Fail-closed: never let the assembled 68H
 	// placeholder reach the target when the offset was not resolved.
 	{
+		// Acquire before reading the field: pairs with the producer's release
+		// store so the offset read below cannot be observed stale.
+		const bool dyno_ready = g_DynamicOffsetsReady.load(std::memory_order_acquire);
 		const DWORD teb_last_error = g_DynamicOffsets.TebLastErrorValue;
 		bool last_error_patched = false;
-		if (g_DynamicOffsets.Ready && teb_last_error)
+		if (dyno_ready && teb_last_error)
 		{
 			for (size_t i = 0; i + 9 <= code_size; ++i)
 			{

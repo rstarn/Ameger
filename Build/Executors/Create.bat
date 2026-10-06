@@ -38,7 +38,9 @@ set "CONFIG_MASTER=%BUILD_DIR%\Configuration.ini"
 set "PAYLOAD_ASSET=%ROOT%\Assets\DLL\Jlov.dll"
 rem Optional pre-protected payload drop point. If this file exists (or
 rem AMEGER_PAYLOAD points somewhere) it is deployed instead of the pristine
-rem asset and the PayloadSha256 pin is re-pinned to match it.
+rem asset. The master PayloadSha256 pin is NEVER rewritten: it stays the
+rem pristine asset pin, and the shipped config is pinned to the deployed digest
+rem instead (see :deploy_payload and :protect_config).
 set "PAYLOAD_PROTECTED=%ROOT%\Assets\DLL\Jlov.protected.dll"
 set "PAYLOAD_DEST=%DLL_DIR%\Jlov.dll"
 rem Stock runtime build output name (the runtime vcxproj TargetName). Referenced
@@ -91,7 +93,11 @@ echo.
 
 echo [%C_GREEN%4%C_RESET%/%C_GREEN%6%C_RESET%] Building Injector...
 set "MUTATE_ARGS="
-if /i "%AMEGER_SKIP_TIMESTAMP%"=="1" goto :seeds_ready
+rem AMEGER_REFUSE_UNMUTATED=1 is a refusal opt-out, not a skip: it suppresses
+rem the seed, timestamp and mutation stages only so the run reaches the explicit
+rem refusal at :refuse_unmutated. It always aborts and never ships an unmutated
+rem binary, so the name states the actual behavior.
+if /i "%AMEGER_REFUSE_UNMUTATED%"=="1" goto :seeds_ready
 where powershell.exe >nul 2>&1
 if errorlevel 1 goto :seeds_missing
 if not exist "%SEED_SCRIPT%" goto :seeds_missing
@@ -125,7 +131,7 @@ goto :failure
 call :build_project "%LIBRARY_PROJ%" x64 "%DEPS_RELEASE%" "%LIBRARY64_OBJ%" "%TOOLSET_ARG%" "%SDK_ARG%" "%MUTATE_ARGS%"
 if errorlevel 1 goto :build_error
 echo.
-if /i "%AMEGER_SKIP_TIMESTAMP%"=="1" goto :runtime_timestamp_ready
+if /i "%AMEGER_REFUSE_UNMUTATED%"=="1" goto :runtime_timestamp_ready
 if not exist "%TIMESTAMP_SCRIPT%" goto :runtime_timestamp_missing
 where powershell.exe >nul 2>&1
 if errorlevel 1 goto :hash_error
@@ -138,7 +144,7 @@ echo   %C_RED%ERROR: AddPE.ps1 was not found; refusing to continue with an untim
 goto :failure
 
 :runtime_timestamp_ready
-if /i "%AMEGER_SKIP_TIMESTAMP%"=="1" goto :runtime_mutate_ready
+if /i "%AMEGER_REFUSE_UNMUTATED%"=="1" goto :runtime_mutate_ready
 if not exist "%MUTATE_SCRIPT%" goto :runtime_mutate_missing
 powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%MUTATE_SCRIPT%" "%RUNTIME_STOCK_DLL%"
 if errorlevel 1 goto :mutate_fatal
@@ -187,10 +193,13 @@ echo.
 echo [%C_GREEN%5%C_RESET%/%C_GREEN%6%C_RESET%] Deploying release binaries...
 echo.
 echo   %C_GREEN%[+]%C_RESET% Runtime binaries are in %C_GREEN%%OUT_ROOT%%C_RESET%.
-call :protect_config
-if errorlevel 1 goto :config_error
+rem Deploy the payload first: :protect_config pins the shipped config to the
+rem digest of the file actually deployed, so the payload must already be in
+rem place when the config is encrypted.
 call :deploy_payload
 if errorlevel 1 goto :payload_error
+call :protect_config
+if errorlevel 1 goto :config_error
 echo.
 echo.
 
@@ -204,6 +213,8 @@ if /i not "%AMEGER_ENCRYPT_CONFIG%"=="0" (
   call :verify_config_magic
   if errorlevel 1 goto :verify_content_error
 )
+call :verify_deployed_pin
+if errorlevel 1 goto :verify_content_error
 call :verify "%RUNTIME_DLL%" "x64 runtime"
 if errorlevel 1 goto :verify_error
 call :remove_import_artifacts "%DEPS_RELEASE%"
@@ -217,7 +228,7 @@ echo   %C_GREEN%[+]%C_RESET% Cache groups: Runtime, Injector.
 echo.
 echo.
 
-if /i "%AMEGER_SKIP_TIMESTAMP%"=="1" goto :success_without_timestamp
+if /i "%AMEGER_REFUSE_UNMUTATED%"=="1" goto :refuse_unmutated
 if not exist "%TIMESTAMP_SCRIPT%" goto :timestamp_missing
 where powershell.exe >nul 2>&1
 if errorlevel 1 goto :timestamp_missing
@@ -328,6 +339,14 @@ rem Encryption is on, so the deployed config must carry the SYSCFG01 marker.
 powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%VERIFY_SCRIPT%" -Check Magic -Path "%OUT_ROOT%\Configuration.ini" -Magic SYSCFG01
 exit /b %ERRORLEVEL%
 
+:verify_deployed_pin
+rem Fail closed: the shipped config must pin the digest of the payload actually
+rem deployed. A stale pin would make the launcher abort its startup hash check.
+rem The verifier decrypts the deployed config (or reads it plaintext under the
+rem explicit opt-out) and compares its PayloadSha256 to %DEPLOYED_SHA%.
+powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%VERIFY_SCRIPT%" -Check DeployedPin -Path "%OUT_ROOT%\Configuration.ini" -ExpectPin "%DEPLOYED_SHA%"
+exit /b %ERRORLEVEL%
+
 :remove_import_artifacts
 rem Fail closed: a leftover .lib/.exp in the release folder is a build fingerprint,
 rem so a failed delete must abort the build rather than silently ship it.
@@ -344,7 +363,11 @@ for %%F in ("%DEPS_RELEASE%\Ameger Injector - *.pdb") do if exist "%%~F" (
   move "%%~F" "%CACHE_RUNTIME%\" >nul
   if exist "%%~F" exit /b 1
 )
-for %%F in ("%OUT64%\Injector - x64.pdb") do if exist "%%~F" (
+rem Sweep every remaining PDB in the release root rather than a hardcoded name:
+rem the interface TargetName is "Host - $(PlatformShortName)" (Host - x64), and
+rem the previous "Injector - x64.pdb" name never matched it, so the interface
+rem PDB was left in the shipped folder.
+for %%F in ("%OUT64%\*.pdb") do if exist "%%~F" (
   move "%%~F" "%CACHE_INTERFACE%\" >nul
   if exist "%%~F" exit /b 1
 )
@@ -355,12 +378,33 @@ rem Ship a DPAPI-encrypted copy of the config next to the EXE so the deployed
 rem folder exposes no readable target name or stealth toggles. The plaintext
 rem master in Build\ stays the editable source of truth.
 rem
+rem The master's PayloadSha256 is the pristine asset pin and is never rewritten
+rem (see :deploy_payload). The shipped config must instead pin the payload file
+rem actually deployed, so ProtectConfig.ps1 derives the pin by hashing
+rem %PAYLOAD_DEST% (-PinPayload); :verify_deployed_pin then decrypts the result
+rem and proves it carries that digest.
+rem
 rem Fail closed: unless encryption is explicitly disabled, never ship a
 rem plaintext or absent config. The runtime requires Configuration.ini next to
 rem the EXE, so a silent miss here would produce a broken release.
+if not defined DEPLOYED_SHA (
+  echo   %C_RED%ERROR: deployed payload SHA-256 unavailable; refusing to ship an unpinned config.%C_RESET%
+  exit /b 1
+)
 if /i "%AMEGER_ENCRYPT_CONFIG%"=="0" (
-  if exist "%CONFIG_MASTER%" copy /y "%CONFIG_MASTER%" "%OUT_ROOT%\Configuration.ini" >nul
-  echo   %C_YELLOW%Config encryption disabled ^(AMEGER_ENCRYPT_CONFIG=0^); shipping plaintext.%C_RESET%
+  rem Explicit opt-out only. Still pin the deployed payload so the shipped
+  rem plaintext config and the shipped DLL agree; this is not a silent fallback
+  rem to plaintext, which the encrypted path below never performs.
+  if not exist "%CONFIG_MASTER%" (
+    echo   %C_RED%ERROR: master config not found: %CONFIG_MASTER%%C_RESET%
+    exit /b 1
+  )
+  powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -Command "$c=[IO.File]::ReadAllText('%CONFIG_MASTER%'); $c=[regex]::Replace($c,'(?m)^PayloadSha256\s*=.*$','PayloadSha256 = '+('%DEPLOYED_SHA%')); [IO.File]::WriteAllText('%OUT_ROOT%\Configuration.ini',$c,(New-Object Text.UTF8Encoding($false)))"
+  if errorlevel 1 (
+    echo   %C_RED%ERROR: unable to write the plaintext config.%C_RESET%
+    exit /b 1
+  )
+  echo   %C_YELLOW%Config encryption disabled ^(AMEGER_ENCRYPT_CONFIG=0^); shipping plaintext pinned to the deployed payload.%C_RESET%
   exit /b 0
 )
 if not exist "%CONFIG_MASTER%" (
@@ -376,7 +420,7 @@ if errorlevel 1 (
   echo   %C_RED%ERROR: PowerShell unavailable; refusing to ship a plaintext config.%C_RESET%
   exit /b 1
 )
-powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%CONFIG_SCRIPT%" -Source "%CONFIG_MASTER%" -Destination "%OUT_ROOT%\Configuration.ini"
+powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%CONFIG_SCRIPT%" -Source "%CONFIG_MASTER%" -Destination "%OUT_ROOT%\Configuration.ini" -PinPayload "%PAYLOAD_DEST%"
 if errorlevel 1 (
   echo   %C_RED%ERROR: config encryption failed; refusing to ship a plaintext config.%C_RESET%
   exit /b 1
@@ -394,10 +438,11 @@ rem   1. %AMEGER_PAYLOAD%          explicit path to a prepared DLL
 rem   2. Assets\DLL\Jlov.protected.dll   conventional drop point
 rem   3. Assets\DLL\Jlov.dll       the pristine asset (default)
 rem Option 1/2 exist so an already VMProtect'd payload can be shipped without
-rem hand-editing anything. When the source is not the pristine asset its digest
-rem no longer matches the PayloadSha256 pin, so the master is re-pinned to
-rem whatever was actually deployed; otherwise the verification below would
-rem reject the build.
+rem hand-editing anything. The master PayloadSha256 is NEVER rewritten: it
+rem stays the pristine asset pin. When the pristine asset is deployed it is
+rem verified against that pin here; when a prepared DLL is deployed the shipped
+rem config is pinned to the deployed digest instead (:protect_config), leaving
+rem the master untouched.
 set "PAYLOAD_SRC=%PAYLOAD_ASSET%"
 set "PAYLOAD_IS_PREPARED="
 if defined AMEGER_PAYLOAD (
@@ -417,36 +462,30 @@ if errorlevel 1 (
   echo   %C_RED%ERROR: failed to copy payload to %PAYLOAD_DEST%%C_RESET%
   exit /b 1
 )
-if defined PAYLOAD_IS_PREPARED call :repin_payload
-if errorlevel 1 goto :payload_pin_error
-rem Fail closed: the deployed DLL must match the PayloadSha256 pin in the
-rem plaintext master. A stale or substituted payload would silently defeat the
-rem injector's pinned-hash startup check, so verify now and abort on mismatch.
-powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%VERIFY_SCRIPT%" -Check PayloadHash -Path "%PAYLOAD_DEST%" -Config "%CONFIG_MASTER%"
-if errorlevel 1 (
-  echo   %C_RED%ERROR: deployed payload failed hash verification.%C_RESET%
-  exit /b 1
-)
-echo   %C_GREEN%[+]%C_RESET% Payload deployed: %C_GREEN%%PAYLOAD_DEST%%C_RESET%
-powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -Command "Set-Clipboard -Value '%PAYLOAD_DEST%'" >nul 2>&1
-exit /b 0
-
-:repin_payload
-rem Point PayloadSha256 at the payload actually deployed. Only reached when a
-rem prepared/protected DLL was substituted, because that digest cannot equal
-rem the pristine pin committed in the master.
+rem Digest of the file actually deployed. :protect_config pins the shipped
+rem config to this value, so failing to compute it must abort.
 set "DEPLOYED_SHA="
 for /f "usebackq tokens=1,2 delims==" %%A in (`powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -Command "$h=([BitConverter]::ToString([Security.Cryptography.SHA256]::Create().ComputeHash([IO.File]::ReadAllBytes('%PAYLOAD_DEST%'))) -replace '-',''); Write-Output ('DEPLOYED_SHA=' + $h)"`) do set "%%A=%%B"
 if not defined DEPLOYED_SHA (
-  echo   %C_RED%ERROR: unable to hash the prepared payload for re-pinning.%C_RESET%
+  echo   %C_RED%ERROR: unable to hash the deployed payload.%C_RESET%
   exit /b 1
 )
-powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -Command "$c=[IO.File]::ReadAllText('%CONFIG_MASTER%'); $c=[regex]::Replace($c,'(?m)^PayloadSha256\s*=.*$','PayloadSha256 = '+('%DEPLOYED_SHA%')); [IO.File]::WriteAllText('%CONFIG_MASTER%',$c,[Text.Encoding]::ASCII)"
-if errorlevel 1 (
-  echo   %C_RED%ERROR: unable to re-pin PayloadSha256 for the prepared payload.%C_RESET%
-  exit /b 1
+if not defined PAYLOAD_IS_PREPARED (
+  rem Pristine asset: the deployed copy must match the reviewed master pin. A
+  rem stale or substituted asset would silently defeat the injector's
+  rem pinned-hash startup check, so verify now and abort on mismatch.
+  powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%VERIFY_SCRIPT%" -Check PayloadHash -Path "%PAYLOAD_DEST%" -Config "%CONFIG_MASTER%"
+  if errorlevel 1 (
+    echo   %C_RED%ERROR: deployed payload failed hash verification.%C_RESET%
+    exit /b 1
+  )
+) else (
+  rem Prepared payload: its digest cannot equal the pristine pin, so the
+  rem shipped config is pinned to it instead and the master is left alone.
+  echo   %C_YELLOW%[+]%C_RESET% Prepared payload deployed; master pin left pristine.%C_RESET%
 )
-echo   %C_GREEN%[+]%C_RESET% PayloadSha256 re-pinned to %C_GREEN%%DEPLOYED_SHA%%C_RESET%
+echo   %C_GREEN%[+]%C_RESET% Payload deployed: %C_GREEN%%PAYLOAD_DEST%%C_RESET%
+powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -Command "Set-Clipboard -Value '%PAYLOAD_DEST%'" >nul 2>&1
 exit /b 0
 
 :write_section_manifest
@@ -547,7 +586,7 @@ echo %C_RED%ERROR: one or more expected binaries are missing.%C_RESET%
 goto :failure
 
 :verify_content_error
-echo %C_RED%ERROR: embedded runtime hash or config magic verification failed.%C_RESET%
+echo %C_RED%ERROR: embedded runtime hash, config magic or deployed pin verification failed.%C_RESET%
 goto :failure
 
 :cleanup_error
@@ -560,10 +599,6 @@ goto :failure
 
 :payload_error
 echo %C_RED%ERROR: unable to deploy the target payload.%C_RESET%
-goto :failure
-
-:payload_pin_error
-echo %C_RED%ERROR: unable to re-pin PayloadSha256 for the prepared payload.%C_RESET%
 goto :failure
 
 :timestamp_missing
@@ -586,9 +621,9 @@ goto :failure
 echo %C_RED%ERROR: retimestamping the interface EXE failed; refusing to continue with an inconsistent build.%C_RESET%
 goto :failure
 
-:success_without_timestamp
+:refuse_unmutated
 echo.
-echo %C_RED%ERROR: AMEGER_SKIP_TIMESTAMP=1 ships unmutated binaries (stable timestamps, MSVC Rich fingerprint, standard section names, PDB debug directory). Refusing: rebuild without the bypass for any shipped build.%C_RESET%
+echo %C_RED%ERROR: AMEGER_REFUSE_UNMUTATED=1 would ship unmutated binaries (stable timestamps, MSVC Rich fingerprint, standard section names, PDB debug directory). Refusing: rebuild without the bypass for any shipped build.%C_RESET%
 goto :failure
 
 :failure

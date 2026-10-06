@@ -206,7 +206,7 @@ DWORD MMAP_NATIVE::ManualMap(const INJECTION_SOURCE & Source, HANDLE hTargetProc
 	// Downloaded layouts for the remote shell. Fail-closed when the PDB
 	// resolve did not complete: the target has no DbgHelp, so stale static
 	// LDR/TLS/inverted/KUSER guesses must never be sent.
-	if (!g_DynamicOffsets.Ready)
+	if (!g_DynamicOffsetsReady.load(std::memory_order_acquire))
 	{
 		INIT_ERROR_DATA(error_data, INJ_ERR_ADVANCED_NOT_DEFINED);
 
@@ -953,7 +953,8 @@ DWORD __declspec(code_seg(".mmap_sec$01")) __stdcall ManualMapping_Shell(MANUAL_
 	// cleanup routines can safely write to .rdata/.reloc/.tls (still RW).
 	// This gives us truly read-only permissions on non-runtime data sections
 	// (matching the real Windows loader's final state) while keeping
-	// .data and .tls writable via the name-based fixup in MMI_MapSections.
+	// writable data (e.g. .data/.tls) writable via the characteristics-based
+	// fixup in MMI_MapSections.
 	ret = f->MMIP_CleanDataDirectories(pData);
 	if (ret != INJ_ERR_SUCCESS)
 	{
@@ -1073,45 +1074,51 @@ DWORD __declspec(code_seg(".mmap_sec$02")) __stdcall MMI_MapSections(MANUAL_MAPP
 	pData->pOptionalHeader	= &pData->pNtHeaders->OptionalHeader;
 	pData->pFileHeader		= &pData->pNtHeaders->FileHeader;
 
-	// Fix section characteristics for compatibility with packed DLLs.
-	// Packers strip IMAGE_SCN_MEM_WRITE from ALL data sections (.data, .rdata,
-	// .tls, .reloc, .pdata). When SetPageProtections is enabled and runs AFTER
-	// CleanDataDirectories (reordered pipeline), these sections would be set
-	// to PAGE_READONLY. However:
-	//   - .data and .tls MUST remain PAGE_READWRITE (the DLL writes to globals
-	//     and TLS at runtime during normal operation)
-	//   - .rdata, .reloc, .pdata should remain PAGE_READONLY (truly read-only)
-	// This fixup restores MEM_WRITE ONLY to .data and .tls sections by name,
-	// keeping all other data sections genuinely read-only for maximum stealth.
+	// Keep runtime-writable data sections writable. MMI_SetPageProtections
+	// (called later in the pipeline, after CleanDataDirectories) derives the
+	// final page protection from Characteristics alone: MEM_WRITE and not
+	// MEM_EXECUTE becomes PAGE_READWRITE. This pass therefore re-asserts
+	// MEM_WRITE on exactly the sections that must end up RW, expressed in the
+	// same terms the protection pass uses.
+	//
+	// The test is characteristics-based, not name-based, deliberately. A
+	// section is runtime-writable data iff it is initialized data, is not
+	// executable, and carries MEM_WRITE:
+	//     (INITIALIZED_DATA) && (MEM_WRITE) && !(MEM_EXECUTE)
+	// On the shipped payload this selects exactly .data and .tls
+	// (Characteristics 0xC0000040 = INITIALIZED_DATA|READ|WRITE) and leaves
+	// .rdata/.pdata (0x40000040) and .reloc (0x42000040) untouched, so mapped
+	// behavior is identical to the previous .data/.tls name comparison (the
+	// |= is idempotent - those sections already carry MEM_WRITE).
+	//
+	// Rationale: the outcome must depend only on Characteristics, which is
+	// what SetPageProtections actually honors. Matching on ".data"/".tls"
+	// made the outcome name-dependent - a protector that renames a writable
+	// data section could flip it to read-only even though its Characteristics
+	// still said writable, and a read-only section that happened to be named
+	// ".data" could be made writable. With the test above, renaming a section
+	// can no longer change its final protection.
+	//
+	// Documented limitation: if a protector strips MEM_WRITE from a data
+	// section, the intent is no longer recoverable from Characteristics alone
+	// (a stripped .data and .rdata are byte-identical), so such a section
+	// still ends up read-only. The payload contract is that writable data
+	// keeps MEM_WRITE; the current payload satisfies it.
 	if (pData->Flags & INJ_MM_SET_PAGE_PROTECTIONS)
 	{
 		auto * pSec = IMAGE_FIRST_SECTION(pData->pNtHeaders);
 		for (UINT i = 0; i < pData->pFileHeader->NumberOfSections; ++i, ++pSec)
 		{
-			// Check section name manually (avoid CRT dependency in remote shell)
-			const char *name = ReCa<const char *>(pSec->Name);
+			const DWORD characteristics = pSec->Characteristics;
 
-			bool is_data_section = (pSec->Characteristics & IMAGE_SCN_MEM_EXECUTE) == 0
-				&& (pSec->Characteristics & IMAGE_SCN_MEM_WRITE) == 0
-				&& (pSec->Characteristics & IMAGE_SCN_MEM_READ);
+			const bool is_writable_data =
+				(characteristics & IMAGE_SCN_CNT_INITIALIZED_DATA) != 0 &&
+				(characteristics & IMAGE_SCN_MEM_WRITE) != 0 &&
+				(characteristics & IMAGE_SCN_MEM_EXECUTE) == 0;
 
-			if (is_data_section)
+			if (is_writable_data)
 			{
-				// Only .data and .tls need to stay writable at runtime
-				// (the DLL writes to globals and TLS during normal operation).
-				// Manual byte comparison avoids CRT function calls (this code
-				// runs in the remote process where CRT is not available).
-				bool is_data_name = (name[0] == '.' && name[1] == 'd' &&
-					name[2] == 'a' && name[3] == 't' && name[4] == 'a');
-				bool is_tls_name = (name[0] == '.' && name[1] == 't' &&
-					name[2] == 'l' && name[3] == 's');
-
-				if (is_data_name || is_tls_name)
-				{
-					pSec->Characteristics |= IMAGE_SCN_MEM_WRITE;
-				}
-				// All other read-only data sections (.rdata, .reloc, .pdata)
-				// remain without MEM_WRITE → PAGE_READONLY (maximum stealth)
+				pSec->Characteristics |= IMAGE_SCN_MEM_WRITE;
 			}
 		}
 	}

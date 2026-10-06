@@ -43,18 +43,25 @@ namespace
 // the values behind them, counted at the only place a native name is built.
 static STRING_STATS g_string_stats{};
 
+// CountDeclaration is false only for the retry half of the
+// LdrpInvertedFunctionTable plural/singular fallback (see ResolveImports):
+// the two spellings name one logical symbol, so the pair must count once.
+// Every other call site takes the default and counts its own symbol.
 template <typename T>
-DWORD LoadSymbolNative(T & Function, const encrypted_symbol_name & name)
+DWORD LoadSymbolNative(T & Function, const encrypted_symbol_name & name, bool CountDeclaration = true)
 {
-	// Attempted is bumped before the lookup, so a hard failure still shows the
-	// host how far resolution got instead of reporting a bare zero.
-	++g_string_stats.SymbolsDeclared;
+	if (CountDeclaration)
+	{
+		// Attempted is bumped before the lookup, so a hard failure still shows
+		// the host how far resolution got instead of reporting a bare zero.
+		++g_string_stats.SymbolsDeclared;
 
-	// The name is materialised from ciphertext for this call only and dies
-	// with it; nothing keeps a static table of decoded names alive. Count it
-	// here, before the lookup can fail: HookNamesBuilt means "hook names
-	// built from ciphertext", not "symbols resolved" (that is SymbolsResolved).
-	++g_string_stats.HookNamesBuilt;
+		// The name is materialised from ciphertext for this call only and dies
+		// with it; nothing keeps a static table of decoded names alive. Count it
+		// here, before the lookup can fail: HookNamesBuilt means "hook names
+		// built from ciphertext", not "symbols resolved" (that is SymbolsResolved).
+		++g_string_stats.HookNamesBuilt;
+	}
 
 	DWORD RVA = 0;
 	DWORD sym_ret = sym_parser.GetSymbolAddress(name.c_str(), RVA);
@@ -233,7 +240,11 @@ DWORD ResolveImports(ERROR_DATA & error_data)
 			if (table_ret != INJ_ERR_SUCCESS)
 			{
 				LOG(1, "Plural entry missing, trying singular\n");
-				table_ret = LoadSymbolNative(S_FUNC(LdrpInvertedFunctionTable));
+				// Same declared symbol under its other spelling: count it
+				// once. Counting the retry again made SymbolsResolved <
+				// SymbolsDeclared on a fully successful resolve, which the
+				// interface printed as (import PARTIAL).
+				table_ret = LoadSymbolNative(S_FUNC(LdrpInvertedFunctionTable), false);
 			}
 		}
 		else
@@ -242,7 +253,7 @@ DWORD ResolveImports(ERROR_DATA & error_data)
 			if (table_ret != INJ_ERR_SUCCESS)
 			{
 				LOG(1, "Singular entry missing, trying plural\n");
-				table_ret = LoadSymbolNative(S_FUNC_AS(LdrpInvertedFunctionTable, "LdrpInvertedFunctionTables"));
+				table_ret = LoadSymbolNative(S_FUNC_AS(LdrpInvertedFunctionTable, "LdrpInvertedFunctionTables"), false);
 			}
 		}
 		if (table_ret != INJ_ERR_SUCCESS)

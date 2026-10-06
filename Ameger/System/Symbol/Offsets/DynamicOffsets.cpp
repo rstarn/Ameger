@@ -75,7 +75,7 @@ static DWORD ResolveFieldEither(const char * const * types, size_t typeCount, co
 
 DWORD ResolveDynamicOffsets()
 {
-	if (g_DynamicOffsets.Ready)
+	if (g_DynamicOffsetsReady.load(std::memory_order_acquire))
 	{
 		return SYMBOL_ERR_SUCCESS;
 	}
@@ -380,6 +380,11 @@ DWORD ResolveDynamicOffsets()
 
 	tmp.Ready = 1;
 	g_DynamicOffsets = tmp;
+	// Publish only after every field is written: release-store the flag so a
+	// consumer's acquire-load of g_DynamicOffsetsReady observes the full
+	// struct. Ready is also set in tmp for the MANUAL_MAPPING_DATA copy, but
+	// this atomic store is the synchronization primitive.
+	g_DynamicOffsetsReady.store(1, std::memory_order_release);
 	LOG(1, "DynamicOffsets ready: t0=0x%X t1=0x%X t2=0x%X p0=0x%X p1=0x%X k0=0x%X l0=0x%X sz=%lu i0=0x%X i1=0x%X\n",
 		tmp.TebSameTebFlags, tmp.TebLastErrorValue, tmp.TebProcessEnvironmentBlock,
 		tmp.PebOsBuildNumber, tmp.PebLdr, tmp.KuserCookie, tmp.LdrEntryDllBase, tmp.LdrEntrySize,

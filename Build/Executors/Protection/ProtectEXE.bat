@@ -80,7 +80,7 @@ echo   %C_GREEN%[+]%C_RESET% Target:  %C_GREEN%%TARGET%%C_RESET%
 if defined RUNTIME_DLL (
   echo   %C_GREEN%[+]%C_RESET% Runtime: %C_GREEN%%RUNTIME_DLL%%C_RESET% ^(left unvirtualized^)
 ) else (
-  echo   %C_YELLOW%[+]%C_RESET% Runtime DLL not found; embedded-hash check will be skipped.
+  echo   %C_YELLOW%[+]%C_RESET% Runtime DLL not found; embedded-hash verification will fail closed unless AMEGER_ALLOW_SKIP_EMBED=1.
 )
 call :check_already_protected
 if defined VMP_PRESENT if /i not "%AMEGER_FORCE_VMP%"=="1" (
@@ -145,6 +145,12 @@ if errorlevel 2 goto :fc_error
 if errorlevel 1 goto :output_invalid
 echo.
 echo   %C_GREEN%OK%C_RESET% Protected output validated.
+rem Confirm the output really carries the VMProtect segment we asked for before
+rem the bytes are deployed. Verification only: the binary is never renamed or
+rem patched here.
+call :verify_segment "%WORK_DIR%\out.exe"
+if errorlevel 1 goto :segment_error
+echo   %C_GREEN%[+]%C_RESET% VM segment: %C_GREEN%%VM_SEG%%C_RESET% (verified)
 echo.
 copy /y "%WORK_DIR%\out.exe" "%TARGET%" > nul
 if errorlevel 1 goto :deploy_error
@@ -157,9 +163,11 @@ echo.
 echo [%C_GREEN%5%C_RESET%/%C_GREEN%6%C_RESET%] Verifying embedded runtime hash...
 echo.
 rem The launcher will abort at startup if these eight dwords stop matching the
-rem runtime DLL, so confirm virtualization did not disturb them.
-if not defined RUNTIME_DLL goto :embed_skipped
-if not exist "%VERIFY_SCRIPT%" goto :embed_skipped
+rem runtime DLL, so confirm virtualization did not disturb them. A missing
+rem runtime DLL or verifier is not a reason to skip silently: that would ship a
+rem launcher whose embedded hash was never re-checked after virtualization.
+if not defined RUNTIME_DLL goto :embed_unavailable
+if not exist "%VERIFY_SCRIPT%" goto :embed_unavailable
 call :runtime_hash_words
 if errorlevel 1 goto :embed_error
 powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%VERIFY_SCRIPT%" -Check Embed -Path "%TARGET%" -Words "%H0%,%H1%,%H2%,%H3%,%H4%,%H5%,%H6%,%H7%"
@@ -167,8 +175,17 @@ if errorlevel 1 goto :embed_error
 echo   %C_GREEN%[+]%C_RESET% Embedded runtime hash intact after virtualization.
 goto :embed_ok
 
-:embed_skipped
-echo   %C_YELLOW%[+]%C_RESET% Skipped; nothing to verify against.
+:embed_unavailable
+rem Hard failure by default. The only way past this gate is the loud explicit
+rem opt-out below, which never applies to a shipped build.
+if /i "%AMEGER_ALLOW_SKIP_EMBED%"=="1" (
+  echo   %C_YELLOW%[!]%C_RESET% Embedded-hash verification skipped ^(AMEGER_ALLOW_SKIP_EMBED=1^); launcher is unverified.
+  goto :embed_ok
+)
+echo   %C_RED%ERROR: cannot verify the embedded runtime hash after virtualization.%C_RESET%
+echo   %C_RED%       The runtime DLL or %VERIFY_SCRIPT% was not found; refusing to ship an unverified launcher.%C_RESET%
+echo   %C_YELLOW%       Set AMEGER_ALLOW_SKIP_EMBED=1 to bypass (never for a shipped build).%C_RESET%
+goto :failure
 
 :embed_ok
 call :write_state
@@ -226,6 +243,7 @@ echo   %C_GREEN%[+]%C_RESET% No VMProtect traces in %C_GREEN%%OUT_ROOT%%C_RESET%
 echo.
 echo Launcher already protected; release unchanged.
 echo.
+if defined VMSEG echo VM segment: %C_GREEN%%VMSEG%%C_RESET% (recorded)
 echo Interface x64: %C_GREEN%%TARGET%%C_RESET%
 echo.
 if "%NO_PAUSE%"=="0" pause
@@ -334,7 +352,6 @@ exit /b 0
 
 :read_state
 set "STATE_MATCH=unknown"
-set "STATE_HASH="
 if not exist "%STATE_FILE%" exit /b 0
 set "SRC="
 set "OUT="
@@ -348,7 +365,6 @@ if /i "%CUR%"=="%OUT%" (
 )
 if defined SRC if /i "%CUR%"=="%SRC%" (
   set "STATE_MATCH=source"
-  set "STATE_HASH=%CUR%"
   exit /b 0
 )
 exit /b 0
@@ -390,10 +406,35 @@ if errorlevel 2 exit /b 2
 if not errorlevel 1 exit /b 1
 exit /b 0
 
+rem Usage: call :verify_segment <protected PE>
+rem Confirms the output carries a section whose name is the generated SEG_NAME
+rem with an optional trailing digit run. VMProtect appends a numeric suffix, so
+rem the project's ".XXXX" lands in the section table as ".XXXX0". Any other
+rem name means protection did not run with our generated project, so fail
+rem closed rather than deploy the artifact. Verification only: the binary is
+rem never renamed or patched.
+:verify_segment
+set "VM_SEG="
+set "VM_SEG_STATUS="
+rem A status token is parsed instead of relying on the child's exit code:
+rem for /f does not propagate a command's errorlevel reliably, and the value
+rem would be silently lost. PowerShell always exits 0 and reports via stdout.
+for /f "usebackq tokens=1,* delims==" %%A in (`powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -Command "$seg='%SEG_NAME%'; $b=[IO.File]::ReadAllBytes('%~1'); $e=[BitConverter]::ToInt32($b,0x3C); $c=$e+4; $n=[BitConverter]::ToUInt16($b,$c+2); $z=[BitConverter]::ToUInt16($b,$c+16); $s=$c+20+$z; $found=$null; for($i=0;$i -lt $n;$i++){ $o=$s+40*$i; $nm=[Text.Encoding]::ASCII.GetString($b,$o,8).Trim([char]0); if($nm.StartsWith($seg)){ $found=$nm; break } }; if($null -eq $found){ Write-Output 'VM_SEG_STATUS=missing'; Write-Output 'VM_SEG='; exit 0 }; Write-Output ('VM_SEG=' + $found); if($found -match ('^' + [regex]::Escape($seg) + '[0-9]*$')){ Write-Output 'VM_SEG_STATUS=ok' } else { Write-Output 'VM_SEG_STATUS=mismatch' }; exit 0"`) do set "%%A=%%B"
+if /i "%VM_SEG_STATUS%"=="ok" exit /b 0
+if /i "%VM_SEG_STATUS%"=="missing" (
+  echo   %C_RED%ERROR: no VMProtect segment found in the protected output.%C_RESET%
+) else (
+  echo   %C_RED%ERROR: VMProtect segment name mismatch in the protected output.%C_RESET%
+)
+echo   %C_RED%       expected: %SEG_NAME% (optionally followed by digits)%C_RESET%
+echo   %C_RED%       observed: %VM_SEG%%C_RESET%
+exit /b 1
+
 :write_state
 if not exist "%RELEASE_CACHE%" mkdir "%RELEASE_CACHE%"
 >"%STATE_FILE%" echo SRC=%SRC_SHA%
 >>"%STATE_FILE%" echo OUT=%OUT_SHA%
+>>"%STATE_FILE%" echo VMSEG=%VM_SEG%
 exit /b 0
 
 :tail_log
@@ -454,6 +495,11 @@ goto :failure
 
 :output_invalid
 echo   %C_RED%ERROR: VMProtect output failed validation; release left untouched.%C_RESET%
+goto :failure
+
+:segment_error
+echo   %C_RED%ERROR: the protected launcher does not carry the generated VMProtect segment.%C_RESET%
+echo   %C_RED%       Release left untouched; the output was not deployed.%C_RESET%
 goto :failure
 
 :fc_error

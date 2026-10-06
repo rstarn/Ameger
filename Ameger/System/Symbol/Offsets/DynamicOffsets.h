@@ -84,6 +84,20 @@ struct DYNAMIC_NT_OFFSETS
 
 inline DYNAMIC_NT_OFFSETS g_DynamicOffsets{};
 
+// Publication flag for g_DynamicOffsets.
+//
+// The struct must stay plain DWORDs: it is copied wholesale into
+// MANUAL_MAPPING_DATA for the remote shell, which has no DbgHelp/PDB access.
+// That copy only works while every member is trivially copyable, so readiness
+// cannot be an atomic member - it is carried by this separate flag instead.
+// The producer fills g_DynamicOffsets (Ready included, for the copied value)
+// and then release-stores 1 here; a consumer acquire-loads here before reading
+// any field. On x64 both compile to a plain mov (TSO already orders loads
+// after loads), but the explicit release/acquire pair is what guarantees the
+// ordering on any target/toolchain instead of relying on the incidental fact
+// that the fields happen to be written before the flag.
+inline std::atomic<DWORD> g_DynamicOffsetsReady{ 0 };
+
 // Resolves every field above from the already-loaded ntdll.pdb (sym_parser
 // must be Initialize()d) plus in-memory ntdll disassembly for NtWait stubs.
 // Returns SYMBOL_ERR_SUCCESS when the STRICT subset is complete; the struct's

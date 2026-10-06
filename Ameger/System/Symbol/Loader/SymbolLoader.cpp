@@ -343,8 +343,6 @@ DWORD SYMBOL_LOADER::Initialize(const std::wstring & szModulePath, const std::ws
 	BYTE * pRawData = new(std::nothrow) BYTE[static_cast<size_t>(FileSize)];
 	if (!pRawData)
 	{
-		delete[] pRawData;
-
 		File.close();
 
 		LOG(1, "SYMBOL_LOADER: can't allocate memory\n");
