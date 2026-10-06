@@ -322,6 +322,17 @@ namespace
         ULONGLONG creation_time = 0;
     };
 
+    // One <oldName>=<newName> pair from the deployed ExportMap. The build
+    // worker rewrites every export name in the runtime DLL in place (V-32), so
+    // each new name is exactly as long as the original it replaces and both
+    // sides are plain ASCII - the width GetProcAddress and the PE export name
+    // table use. Kept narrow because GetProcAddress takes a char*.
+    struct ExportNameMap
+    {
+        std::string old_name;
+        std::string new_name;
+    };
+
     struct WizardConfig
     {
         int schema_version = 0;
@@ -348,6 +359,13 @@ namespace
         int timeout = 60000;
         std::wstring target_name;
         std::wstring expected_payload_sha256;
+        // Per-build deployment identity, present only in the deployed
+        // (DPAPI-encrypted) config: the payload and runtime DLL file names
+        // inside the DLLs folder, and the runtime export-rename map. Required,
+        // with no fallback to a fixed Jlov.dll / rtdll_ / Core* name.
+        std::wstring payload_name;
+        std::wstring runtime_name;
+        std::vector<ExportNameMap> export_map;
     };
 
     // Console and process output helpers.
@@ -475,6 +493,56 @@ namespace
         }
     }
 
+    // Outcome of the pre-detection confirmation gate. Only Proceed lets the
+    // wizard start waiting for the target; Cancelled is a clean operator exit
+    // and Unavailable is the fail-closed refusal when stdin cannot be read.
+    enum class ConfirmationResult
+    {
+        Proceed,
+        Cancelled,
+        Unavailable,
+    };
+
+    // The single operator gate before the point of no return. The launcher must
+    // never begin target detection and injection on its own, so this runs once,
+    // after every startup check (config, runtime, payload) and immediately
+    // before the wait for the target - keeping the detection->injection latency
+    // at ~ms once the operator commits. An empty line (Enter) proceeds; q/Q
+    // cancels. A console whose input cannot be read is refused rather than
+    // assumed, so a redirected or closed stdin can never confirm on the
+    // operator's behalf. Ctrl+C and console close need no handling here: no
+    // target handle exists yet and there is no state to release, so the default
+    // termination is already clean.
+    ConfirmationResult ConfirmBeforeDetection()
+    {
+        HANDLE input = GetStdHandle(STD_INPUT_HANDLE);
+        DWORD console_mode = 0;
+        if (!input || input == INVALID_HANDLE_VALUE || !GetConsoleMode(input, &console_mode))
+        {
+            PrintError(L"Console input is unavailable; refusing to load without an explicit confirmation.");
+            return ConfirmationResult::Unavailable;
+        }
+
+        wprintf(L"%ls[+]%ls Press Enter to begin, or Q to quit: ", kGreen, kReset);
+        fflush(stdout);
+
+        std::wstring entered;
+        if (!std::getline(std::wcin, entered))
+        {
+            // EOF on a console that exists but is closed/redirected is still
+            // not a confirmation.
+            PrintError(L"Console input ended before confirmation; refusing to load.");
+            return ConfirmationResult::Unavailable;
+        }
+
+        const std::wstring answer = TrimText(entered);
+        if (answer == L"q" || answer == L"Q")
+        {
+            return ConfirmationResult::Cancelled;
+        }
+        return ConfirmationResult::Proceed;
+    }
+
     // Resolves paths relative to the Interface executable.
     std::wstring ExecutableDirectory()
     {
@@ -490,28 +558,19 @@ namespace
         return slash == std::wstring::npos ? std::wstring() : path.substr(0, slash + 1);
     }
 
-    // Runtime DLL file name is derived from the embedded SHA-256, matching the
-    // name Create.bat deploys into Release\DLLs (rtdll_<first 8 hex>). No fixed
-    // on-disk name is baked in, so a shipped folder exposes no stable file
-    // fingerprint. A stock checkout leaves the hash at zero, so the name
-    // resolves to a file that does not exist and the missing-DLL path refuses
-    // to run.
-    std::wstring RuntimeFileName()
-    {
-        constexpr wchar_t hex[] = L"0123456789ABCDEF";
-        std::wstring name = L"rtdll_";
-        for (int shift = 28; shift >= 0; shift -= 4)
-        {
-            name.push_back(hex[(AMEGER_RUNTIME_DLL_HASH0 >> shift) & 0x0F]);
-        }
-        name += L".dll";
-        return name;
-    }
-
-    std::wstring RuntimePath()
+    // Runtime DLL file name comes from the deployed config (RuntimeName), so a
+    // shipped folder exposes no stable on-disk name. There is no fixed
+    // rtdll_/hash-derived name any more: a config without RuntimeName is
+    // refused before this is ever called, so the missing-DLL path cannot be
+    // reached with a guessed name.
+    std::wstring RuntimePath(const std::wstring & runtime_name)
     {
         const std::wstring directory = ExecutableDirectory();
-        return directory.empty() ? std::wstring() : directory + L"DLLs\\" + RuntimeFileName();
+        if (directory.empty() || runtime_name.empty())
+        {
+            return std::wstring();
+        }
+        return directory + L"DLLs\\" + runtime_name;
     }
 
     bool FileExists(const std::wstring & path)
@@ -925,6 +984,142 @@ namespace
         return default_value;
     }
 
+    // A deployed file name is a bare file name inside DLLs\: no separators, no
+    // drive/stream colon, no parent traversal, no control characters, bounded
+    // length. The value comes from the DPAPI-encrypted config, but the launcher
+    // still refuses anything that could escape the DLLs folder.
+    bool IsValidDeployedFileName(const std::wstring & name)
+    {
+        if (name.empty() || name.size() > 64)
+        {
+            return false;
+        }
+        if (name.find(L'\\') != std::wstring::npos || name.find(L'/') != std::wstring::npos ||
+            name.find(L':') != std::wstring::npos || name.find(L"..") != std::wstring::npos)
+        {
+            return false;
+        }
+        for (wchar_t c : name)
+        {
+            if (c < 0x20 || c == 0x7F)
+            {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    // Splits a deployed ExportMap ("old=new,old=new,...") into ASCII pairs.
+    // Fail-closed: any pair without '=', an empty side, a length mismatch
+    // (RenameExports.ps1 rewrites names in place, so old and new are the same
+    // length), a non-ASCII byte, or a duplicate old/new name refuses the whole
+    // map. An empty token (a stray comma) is ignored; at least one pair is
+    // required.
+    bool ParseExportMap(const std::wstring & value, std::vector<ExportNameMap> & map)
+    {
+        map.clear();
+        if (value.empty())
+        {
+            return false;
+        }
+
+        size_t start = 0;
+        for (;;)
+        {
+            const size_t comma = value.find(L',', start);
+            const size_t length = comma == std::wstring::npos ? std::wstring::npos : comma - start;
+            const std::wstring token = TrimText(value.substr(start, length));
+            if (!token.empty())
+            {
+                const size_t equals = token.find(L'=');
+                if (equals == std::wstring::npos)
+                {
+                    return false;
+                }
+                const std::wstring old_name = TrimText(token.substr(0, equals));
+                const std::wstring new_name = TrimText(token.substr(equals + 1));
+                if (old_name.empty() || new_name.empty() || old_name.size() != new_name.size())
+                {
+                    return false;
+                }
+
+                ExportNameMap entry;
+                for (wchar_t c : old_name)
+                {
+                    if (c <= 0 || c > 0x7F)
+                    {
+                        return false;
+                    }
+                    entry.old_name.push_back(static_cast<char>(c));
+                }
+                for (wchar_t c : new_name)
+                {
+                    if (c <= 0 || c > 0x7F)
+                    {
+                        return false;
+                    }
+                    entry.new_name.push_back(static_cast<char>(c));
+                }
+
+                for (const ExportNameMap & existing : map)
+                {
+                    if (existing.old_name == entry.old_name || existing.new_name == entry.new_name)
+                    {
+                        return false;
+                    }
+                }
+                map.push_back(entry);
+            }
+
+            if (comma == std::wstring::npos)
+            {
+                break;
+            }
+            start = comma + 1;
+        }
+
+        return !map.empty();
+    }
+
+    // Maps an original runtime export name (a decrypted XOR literal) to the
+    // per-build renamed name the built DLL actually carries. Returns nullptr
+    // when the map has no entry, which the caller treats as fail-closed.
+    const std::string * FindMappedExportName(const std::vector<ExportNameMap> & map, const char * old_name)
+    {
+        if (!old_name)
+        {
+            return nullptr;
+        }
+        for (const ExportNameMap & entry : map)
+        {
+            if (entry.old_name == old_name)
+            {
+                return &entry.new_name;
+            }
+        }
+        return nullptr;
+    }
+
+    // True when the given export name is one of the ORIGINAL runtime export
+    // names the build worker renamed in place (V-32). The deployed ExportMap
+    // carries every original name, so a verbatim reappearance in the shipped
+    // DLL's export table is a rename regression, not a neutral leftover.
+    bool IsOriginalExportName(const std::vector<ExportNameMap> & map, const char * name)
+    {
+        if (!name)
+        {
+            return false;
+        }
+        for (const ExportNameMap & entry : map)
+        {
+            if (entry.old_name == name)
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
     // Encrypted-config marker. A DPAPI blob has no intrinsic signature, so the
     // file carries this 8-byte prefix; a config without it is refused outright,
     // because there is deliberately no plaintext fallback.
@@ -1106,6 +1301,26 @@ namespace
                 config.expected_payload_sha256 = value;
                 std::transform(config.expected_payload_sha256.begin(), config.expected_payload_sha256.end(), config.expected_payload_sha256.begin(), towupper);
             }
+            // Per-build deployment keys. The names are compared through the
+            // encrypted-string tier so the shipped launcher carries no new
+            // plaintext literals; only the deployed config holds the values.
+            else if (general && EqualsNoCase(key, XOR_STR_W(L"PayloadName").get()))
+            {
+                config.payload_name = value;
+            }
+            else if (general && EqualsNoCase(key, XOR_STR_W(L"RuntimeName").get()))
+            {
+                config.runtime_name = value;
+            }
+            else if (general && EqualsNoCase(key, XOR_STR_W(L"ExportMap").get()))
+            {
+                if (!ParseExportMap(value, config.export_map))
+                {
+                    config = WizardConfig{};
+                    invalid = true;
+                    return false;
+                }
+            }
             else if (general && EqualsNoCase(key, L"LoadCopy"))
             {
                 config.load_copy = ParseConfigBool(value, config.load_copy);
@@ -1213,6 +1428,18 @@ namespace
         }
 
         if (config.target_name.empty())
+        {
+            config = WizardConfig{};
+            invalid = true;
+            return false;
+        }
+
+        // Per-build deployment identity is required. There is deliberately no
+        // fallback to Jlov.dll / rtdll_ / Core* names: a deployed config that
+        // lacks any of these is refused outright.
+        if (!IsValidDeployedFileName(config.payload_name) ||
+            !IsValidDeployedFileName(config.runtime_name) ||
+            config.export_map.empty())
         {
             config = WizardConfig{};
             invalid = true;
@@ -1384,14 +1611,16 @@ namespace
         return true;
     }
 
-    // Loads the runtime DLL and resolves its exported functions.
-    bool LoadRuntime(Runtime & runtime)
+    // Loads the runtime DLL and resolves its exported functions. The path and
+    // the export names both come from the deployed config (RuntimeName and
+    // ExportMap), so a shipped build carries no fixed runtime name and no
+    // plaintext Core* export literals.
+    bool LoadRuntime(Runtime & runtime, const WizardConfig & config)
     {
-        const std::wstring path = RuntimePath();
+        const std::wstring path = RuntimePath(config.runtime_name);
         if (path.empty() || !FileExists(path))
         {
-            const std::wstring expected = RuntimeFileName();
-            PrintError((L"The runtime DLL (" + expected + L") is missing in DLLs\\ next to the executable.").c_str());
+            PrintError((L"The runtime DLL (" + config.runtime_name + L") is missing in DLLs\\ next to the executable.").c_str());
             return false;
         }
 
@@ -1411,35 +1640,51 @@ namespace
         }
 
         DWORD load_error = ERROR_SUCCESS;
+        bool export_map_complete = true;
         {
             StdoutParkGuard park;
             runtime.module = LoadLibraryExW(path.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
             load_error = GetLastError();
             if (runtime.module)
             {
-                // Runtime export names are compile-time XORed (see KcStrings/Core/XorString.h).
+                // Export names are per-build renamed (V-32); the deployed
+                // ExportMap is the only source of the names this build carries.
+                // The original Core* names stay compile-time XORed (see
+                // KcStrings/Core/XorString.h) and are used only as map keys -
+                // there is no plaintext Core* literal and no Core* fallback.
+                auto resolve_export = [&](const char * old_name) -> FARPROC
+                {
+                    const std::string * mapped = FindMappedExportName(config.export_map, old_name);
+                    if (!mapped)
+                    {
+                        export_map_complete = false;
+                        return nullptr;
+                    }
+                    return GetProcAddress(runtime.module, mapped->c_str());
+                };
+
                 auto exp_mem = XOR_STR_A("CoreExecute");
-                runtime.memory_inject = reinterpret_cast<f_Memory_Inject>(GetProcAddress(runtime.module, exp_mem.get()));
+                runtime.memory_inject = reinterpret_cast<f_Memory_Inject>(resolve_export(exp_mem.get()));
                 auto exp_sym = XOR_STR_A("CoreSymbolState");
-                runtime.get_symbol_state = reinterpret_cast<f_GetSymbolState>(GetProcAddress(runtime.module, exp_sym.get()));
+                runtime.get_symbol_state = reinterpret_cast<f_GetSymbolState>(resolve_export(exp_sym.get()));
                 auto exp_imp = XOR_STR_A("CoreImportState");
-                runtime.get_import_state = reinterpret_cast<f_GetImportState>(GetProcAddress(runtime.module, exp_imp.get()));
+                runtime.get_import_state = reinterpret_cast<f_GetImportState>(resolve_export(exp_imp.get()));
                 auto exp_init = XOR_STR_A("CoreStart");
-                runtime.initialize_runtime = reinterpret_cast<f_InitializeRuntime>(GetProcAddress(runtime.module, exp_init.get()));
+                runtime.initialize_runtime = reinterpret_cast<f_InitializeRuntime>(resolve_export(exp_init.get()));
                 auto exp_shut = XOR_STR_A("CoreStop");
-                runtime.shutdown_runtime = reinterpret_cast<f_ShutdownRuntime>(GetProcAddress(runtime.module, exp_shut.get()));
+                runtime.shutdown_runtime = reinterpret_cast<f_ShutdownRuntime>(resolve_export(exp_shut.get()));
                 auto exp_dl = XOR_STR_A("CoreFetch");
-                runtime.start_download = reinterpret_cast<f_StartDownload>(GetProcAddress(runtime.module, exp_dl.get()));
+                runtime.start_download = reinterpret_cast<f_StartDownload>(resolve_export(exp_dl.get()));
                 auto exp_cb = XOR_STR_A("CoreSetTrace");
-                runtime.set_raw_print_callback = reinterpret_cast<f_SetRawPrintCallback>(GetProcAddress(runtime.module, exp_cb.get()));
+                runtime.set_raw_print_callback = reinterpret_cast<f_SetRawPrintCallback>(resolve_export(exp_cb.get()));
                 auto exp_hij = XOR_STR_A("CoreAcqStats");
-                runtime.get_last_hijack_stats = reinterpret_cast<f_GetLastHijackStats>(GetProcAddress(runtime.module, exp_hij.get()));
+                runtime.get_last_hijack_stats = reinterpret_cast<f_GetLastHijackStats>(resolve_export(exp_hij.get()));
                 auto exp_map = XOR_STR_A("CoreLoadStats");
-                runtime.get_last_map_stats = reinterpret_cast<f_GetLastMapStats>(GetProcAddress(runtime.module, exp_map.get()));
+                runtime.get_last_map_stats = reinterpret_cast<f_GetLastMapStats>(resolve_export(exp_map.get()));
                 auto exp_str = XOR_STR_A("CoreStrStats");
-                runtime.get_last_string_stats = reinterpret_cast<f_GetLastStringStats>(GetProcAddress(runtime.module, exp_str.get()));
+                runtime.get_last_string_stats = reinterpret_cast<f_GetLastStringStats>(resolve_export(exp_str.get()));
                 auto exp_tec = XOR_STR_A("CoreExecStats");
-                runtime.get_last_thread_exec_stats = reinterpret_cast<f_GetLastThreadExecStats>(GetProcAddress(runtime.module, exp_tec.get()));
+                runtime.get_last_thread_exec_stats = reinterpret_cast<f_GetLastThreadExecStats>(resolve_export(exp_tec.get()));
                 if (runtime.set_raw_print_callback)
                 {
                     runtime.set_raw_print_callback(QuietPrint);
@@ -1450,6 +1695,14 @@ namespace
         if (!runtime.module)
         {
             fwprintf(stderr, L"%lsFailed to load runtime: %ls (0x%08X)%ls\n", kRed, path.c_str(), load_error, kReset);
+            return false;
+        }
+
+        // A map that omits a required export is a configuration/deploy fault,
+        // not a missing DLL export; say which, and fail closed either way.
+        if (!export_map_complete)
+        {
+            PrintError(L"The runtime export map does not cover every export this launcher needs.");
             return false;
         }
 
@@ -1877,56 +2130,6 @@ namespace
         }
     }
 
-    bool IsAbsolutePath(const std::wstring & path)
-    {
-        if (path.empty())
-        {
-            return false;
-        }
-
-        if (path.size() >= 3 &&
-            ((path[0] >= L'A' && path[0] <= L'Z') || (path[0] >= L'a' && path[0] <= L'z')) &&
-            path[1] == L':' && (path[2] == L'\\' || path[2] == L'/'))
-        {
-            return true;
-        }
-
-        if (path.size() >= 2 && path[0] == L'\\' && path[1] == L'\\')
-        {
-            return true;
-        }
-
-        return false;
-    }
-
-    bool ResolveDllPath(std::wstring & path)
-    {
-        if (path.empty() || path == L"q" || path == L"Q")
-        {
-            return false;
-        }
-
-        if (!IsAbsolutePath(path))
-        {
-            const std::wstring directory = ExecutableDirectory();
-            if (directory.empty())
-            {
-                return false;
-            }
-            path = directory + path;
-        }
-
-        std::vector<wchar_t> buffer(MAX_PATH * 4);
-        const DWORD length = GetFullPathNameW(path.c_str(), static_cast<DWORD>(buffer.size()), buffer.data(), nullptr);
-        if (!length || length >= buffer.size())
-        {
-            return false;
-        }
-
-        path.assign(buffer.data(), length);
-        return FileExists(path);
-    }
-
     const wchar_t * ArchitectureName(Architecture architecture)
     {
         switch (architecture)
@@ -1942,79 +2145,65 @@ namespace
 
     DWORD BuildFlags(const WizardConfig & config);
 
-    bool SelectDll(TargetSelection & target, DWORD flags, const std::wstring & expected_sha256, std::wstring & path, FileInformation & info, std::vector<BYTE> & bytes, std::wstring & sha256, bool & cancelled)
+    // Resolves the deployed payload from the config PayloadName inside the
+    // DLLs folder next to the executable, then runs the same PE validation and
+    // SHA-256 pin check the old interactive picker used. There is no prompt and
+    // no fallback file name: a missing PayloadName, a missing file, a failed
+    // PE validation or a pin mismatch is a hard failure.
+    bool ResolveConfiguredPayload(const std::wstring & payload_name, const std::wstring & expected_sha256,
+        DWORD flags, std::wstring & path, FileInformation & info, std::vector<BYTE> & bytes, std::wstring & sha256)
     {
-        cancelled = false;
-        for (;;)
+        bytes.clear();
+        sha256.clear();
+
+        const std::wstring directory = ExecutableDirectory();
+        if (directory.empty() || payload_name.empty())
         {
-            std::wstring input;
-            if (!ReadLine(L"DLL Path (Q to cancel): ", input))
-            {
-                cancelled = true;
-                return false;
-            }
-            if (input == L"q" || input == L"Q")
-            {
-                cancelled = true;
-                return false;
-            }
-            path = input;
-            if (!ResolveDllPath(path))
-            {
-                PrintWarning(L"File doesn't exist, try again.");
-                continue;
-            }
-
-            DWORD validation_code = FILE_ERR_SUCCESS;
-            if (!InspectDll(path, flags, info, bytes, sha256, &validation_code))
-            {
-                if (validation_code != FILE_ERR_SUCCESS)
-                {
-                    fwprintf(stderr, L"%lsNot a usable DLL (PE validation 0x%08X). Need x64 DLL with relocations, no .NET.%ls\n",
-                        kYellow, validation_code, kReset);
-                }
-                else
-                {
-                    PrintWarning(L"Not a usable DLL, try again.");
-                }
-                continue;
-            }
-
-            if (!expected_sha256.empty() && _wcsicmp(expected_sha256.c_str(), sha256.c_str()) != 0)
-            {
-                fwprintf(stderr, L"%lsPayload SHA-256 mismatch. Expected %ls, got %ls%ls\n", kRed, expected_sha256.c_str(), sha256.c_str(), kReset);
-                continue;
-            }
-
-            if (target.architecture != Architecture::Unknown && info.architecture != target.architecture)
-            {
-                wprintf(L"Warning: DLL is %ls but target is %ls.\n", ArchitectureName(info.architecture), ArchitectureName(target.architecture));
-                bool proceed = false;
-                if (!ReadYesNo(L"Continue anyway?", false, proceed))
-                {
-                    cancelled = true;
-                    return false;
-                }
-                if (!proceed)
-                {
-                    continue;
-                }
-            }
-
-            if (info.dotnet)
-            {
-                PrintError(L".NET assemblies are not supported in this memory-loading build.");
-                continue;
-            }
-            if (info.architecture == Architecture::X86)
-            {
-                PrintError(L"x86 DLLs are not supported in this x64-only build.");
-                continue;
-            }
-
-            if (VerboseOutputEnabled()) { wprintf(L"Verified SHA-256: %ls%ls%ls\n", kGreen, sha256.c_str(), kReset); }
-            return true;
+            PrintError(L"The payload is not configured (the deployment payload name is empty).");
+            return false;
         }
+
+        path = directory + L"DLLs\\" + payload_name;
+        if (!FileExists(path))
+        {
+            PrintError((L"The payload DLL (" + payload_name + L") is missing in DLLs\\ next to the executable.").c_str());
+            return false;
+        }
+
+        DWORD validation_code = FILE_ERR_SUCCESS;
+        if (!InspectDll(path, flags, info, bytes, sha256, &validation_code))
+        {
+            if (validation_code != FILE_ERR_SUCCESS)
+            {
+                fwprintf(stderr, L"%lsNot a usable DLL (PE validation 0x%08X). Need x64 DLL with relocations, no .NET.%ls\n",
+                    kYellow, validation_code, kReset);
+            }
+            else
+            {
+                PrintWarning(L"Not a usable DLL.");
+            }
+            return false;
+        }
+
+        if (!expected_sha256.empty() && _wcsicmp(expected_sha256.c_str(), sha256.c_str()) != 0)
+        {
+            fwprintf(stderr, L"%lsPayload SHA-256 mismatch. Expected %ls, got %ls%ls\n", kRed, expected_sha256.c_str(), sha256.c_str(), kReset);
+            return false;
+        }
+
+        if (info.dotnet)
+        {
+            PrintError(L".NET assemblies are not supported in this memory-loading build.");
+            return false;
+        }
+        if (info.architecture == Architecture::X86)
+        {
+            PrintError(L"x86 DLLs are not supported in this x64-only build.");
+            return false;
+        }
+
+        if (VerboseOutputEnabled()) { wprintf(L"Verified SHA-256: %ls%ls%ls\n", kGreen, sha256.c_str(), kReset); }
+        return true;
     }
 
     DWORD BuildFlags(const WizardConfig & config)
@@ -2435,7 +2624,7 @@ namespace
     bool DebugAndVerifyStealth(HANDLE process, HINSTANCE hRemoteBase, DWORD flags,
         const BYTE * local_pe, size_t local_pe_size, const HijackStats * ProcessHijack, const HijackStats * ThreadHijack,
         const HijackContext * Context, const MAP_STATS * MapStats, f_GetLastStringStats get_string_stats,
-        bool survey_game_traps, DWORD survey_pid, bool * wx_violated)
+        bool survey_game_traps, DWORD survey_pid, bool * wx_violated, const WizardConfig & config)
     {
         if (wx_violated)
         {
@@ -3372,7 +3561,7 @@ namespace
         {
             ++step;
             wprintf(L"\n\n[%ls%d%ls/%ls%d%ls] Verify string encryption...\n\n", kGreen, step, kReset, kGreen, total, kReset);
-            const std::wstring rt_path = RuntimePath();
+            const std::wstring rt_path = RuntimePath(config.runtime_name);
             // Every entry is a literal that must not survive anywhere in the
             // shipped runtime DLL. Keep this list in step with the string tiers:
             // add a marker whenever a new sensitive name is introduced as a
@@ -3414,11 +3603,13 @@ namespace
             // - bare "ntdll" is NOT gated: the linker's import/ApiSet table
             //   unavoidably carries it (every kernel32-linked binary does).
             //   "ntdll.dll" (m3) remains the gated form and is absent.
-            // - "SYMBOL_LOADER" is NOT gated: std::async member-pointer
-            //   instantiations bake the C++ class name into mangled symbols
-            //   (Fake_no_copy_callable_adapter@P8SYMBOL_LOADER@@...), which
-            //   no LOG hygiene can remove short of renaming the class.
+            // - "SYMBOL_LOADER" IS gated (m31): the runtime starts its symbol
+            //   worker through a lambda, not &SYMBOL_LOADER::Initialize, so no
+            //   std::async member-pointer instantiation bakes the class name
+            //   into the image (V-33). A reappearance means that regression
+            //   came back.
             auto m30 = XOR_STR_A("HandleAcq");
+            auto m31 = XOR_STR_A("SYMBOL_LOADER");
             auto m32 = XOR_STR_A("SYMBOL_PARSER");
             auto m33 = XOR_STR_A("DownloadManager");
             auto m34 = XOR_STR_A("TLS_ENTRY");
@@ -3430,7 +3621,7 @@ namespace
                 m12.get(), m13.get(), m14.get(), m15.get(), m16.get(), m17.get(),
                 m18.get(), m19.get(), m20.get(), m21.get(), m22.get(), m23.get(),
                 m24.get(), m25.get(), m26.get(), m27.get(), m28.get(),
-                m30.get(), m32.get(), m33.get(), m34.get(), m35.get(),
+                m30.get(), m31.get(), m32.get(), m33.get(), m34.get(), m35.get(),
             };
             const size_t marker_count = sizeof(markers) / sizeof(markers[0]);
             // Read the runtime DLL once; every marker (narrow and wide) is
@@ -3528,9 +3719,11 @@ namespace
             ++step;
             wprintf(L"\n\n[%ls%d%ls/%ls%d%ls] Verify forensic posture...\n\n", kGreen, step, kReset, kGreen, total, kReset);
             // Every value below is measured from the shipped runtime file,
-            // never asserted from build scripts: neutral export names only,
-            // zero standard section names, zeroed debug directory.
-            const std::wstring posture_path = RuntimePath();
+            // never asserted from build scripts: every export name must be the
+            // per-build rename the deployed ExportMap records (no original
+            // Core*/g_LibraryState name survives), zero standard section names,
+            // zeroed debug directory.
+            const std::wstring posture_path = RuntimePath(config.runtime_name);
             std::vector<BYTE> posture_bytes;
             const bool posture_read = !posture_path.empty() && ReadFileBytes(posture_path, posture_bytes);
             size_t export_neutral = 0;
@@ -3641,13 +3834,18 @@ namespace
                                                 break;
                                             }
                                             const char * nm = ReCa<const char *>(posture_bytes.data() + name_off);
-                                            if (strncmp(nm, "Core", 4) == 0 || strcmp(nm, "g_LibraryState") == 0)
+                                            // Neutral unless it is one of the original
+                                            // export names the build worker renamed in
+                                            // place (V-32). The deployed ExportMap
+                                            // carries every original name, so a verbatim
+                                            // reappearance is a rename regression.
+                                            if (IsOriginalExportName(config.export_map, nm))
                                             {
-                                                ++export_neutral;
+                                                ++export_foreign;
                                             }
                                             else
                                             {
-                                                ++export_foreign;
+                                                ++export_neutral;
                                             }
                                         }
                                     }
@@ -3897,11 +4095,11 @@ namespace
     bool SafeDebugAndVerifyStealth(HANDLE process, HINSTANCE hRemoteBase, DWORD flags,
         const BYTE * local_pe, size_t local_pe_size, const HijackStats * ProcessHijack, const HijackStats * ThreadHijack,
         const HijackContext * Context, const MAP_STATS * MapStats, f_GetLastStringStats get_string_stats,
-        bool survey_game_traps, DWORD survey_pid, bool * wx_violated)
+        bool survey_game_traps, DWORD survey_pid, bool * wx_violated, const WizardConfig & config)
     {
         __try
         {
-            return DebugAndVerifyStealth(process, hRemoteBase, flags, local_pe, local_pe_size, ProcessHijack, ThreadHijack, Context, MapStats, get_string_stats, survey_game_traps, survey_pid, wx_violated);
+            return DebugAndVerifyStealth(process, hRemoteBase, flags, local_pe, local_pe_size, ProcessHijack, ThreadHijack, Context, MapStats, get_string_stats, survey_game_traps, survey_pid, wx_violated, config);
         }
         __except (EXCEPTION_EXECUTE_HANDLER)
         {
@@ -5037,16 +5235,10 @@ namespace
             swprintf_s(title, L"Host-%08X", static_cast<unsigned int>(tick & 0xFFFFFFFFu));
             SetConsoleTitleW(title);
         }
-        if (!LoadRuntime(runtime))
-        {
-            PauseBeforeExit();
-            return 1;
-        }
-
-        wprintf(L"Runtime module base = %ls%p%ls\n", kGreen, reinterpret_cast<void *>(runtime.module), kReset);
-        wprintf(L"Execution: %lsThreadDonor%ls\n", kGreen, kReset);
-        wprintf(L"Mode: %lsMemoryLoading%ls\n\n", kGreen, kReset);
-
+        // The deployed config carries the per-build RuntimeName and ExportMap,
+        // so it must be parsed before the runtime DLL is located. It is loaded
+        // silently here; the "Configuration loaded" line still prints at its
+        // original place below, so the success-path output is unchanged.
         WizardConfig config;
         std::wstring config_path;
         bool config_invalid = false;
@@ -5059,11 +5251,22 @@ namespace
             }
             else
             {
-                PrintError(L"Configuration.ini is invalid; fix SchemaVersion/ProcessName/PayloadSha256 or restore the file.");
+                PrintError(L"Configuration.ini is invalid; fix the schema, target or per-build deployment keys, or restore the file.");
             }
             PauseBeforeExit();
             return 1;
         }
+
+        if (!LoadRuntime(runtime, config))
+        {
+            PauseBeforeExit();
+            return 1;
+        }
+
+        wprintf(L"Runtime module base = %ls%p%ls\n", kGreen, reinterpret_cast<void *>(runtime.module), kReset);
+        wprintf(L"Execution: %lsThreadDonor%ls\n", kGreen, kReset);
+        wprintf(L"Mode: %lsMemoryLoading%ls\n\n", kGreen, kReset);
+
         wprintf(L"%ls[+]%ls Configuration loaded: %ls\n", kGreen, kReset, config_path.c_str());
 
         wprintf(L"\n");
@@ -5071,11 +5274,11 @@ namespace
             kGreen, config.target_name.c_str(), kReset, kGreen, config.timeout, kReset);
         if (VerboseOutputEnabled()) { wprintf(L"Load flags: %ls0x%08X%ls\n", kGreen, BuildFlags(config), kReset); }
 
-        // Fixed order: prompt for the payload BEFORE waiting for the target.
-        // The old order (wait for target -> prompt for DLL -> inject) left a
+        // Fixed order: resolve the payload BEFORE waiting for the target. The
+        // old order (wait for target -> pick DLL -> inject) left a
         // human-length gap during which Eidolon/Warden progressed from early
         // boot to active, which is the #1 trigger for the payload's DllMain
-        // refusing with 00400013. Selecting the DLL first means detection is
+        // refusing with 00400013. Resolving the payload first means detection is
         // followed immediately by RefreshTarget + sponsor + inject (~ms).
         if (!config.from_memory)
         {
@@ -5089,22 +5292,11 @@ namespace
         std::wstring payload_sha256;
         std::vector<BYTE> raw_data;
         FileInformation fileInformation;
+        if (!ResolveConfiguredPayload(config.payload_name, config.expected_payload_sha256,
+            BuildFlags(config), dll_path, fileInformation, raw_data, payload_sha256))
         {
-            // No target yet, so pass a dummy Unknown-arch selection: SelectDll
-            // skips its target-vs-payload check in that case and the check is
-            // done explicitly after detection below.
-            TargetSelection no_target;
-            bool dll_cancelled = false;
-            if (!SelectDll(no_target, BuildFlags(config), config.expected_payload_sha256,
-                dll_path, fileInformation, raw_data, payload_sha256, dll_cancelled))
-            {
-                if (dll_cancelled)
-                {
-                    wprintf(L"Cancelled.\n");
-                    return 0;
-                }
-                return 2;
-            }
+            PauseBeforeExit();
+            return 1;
         }
 
         wprintf(L"\n%ls[+]%ls Downloading Windows symbols...\n", kGreen, kReset);
@@ -5117,6 +5309,25 @@ namespace
             return 1;
         }
         wprintf(L"%ls[+]%ls Download completed.\n\n", kGreen, kReset);
+
+        // The operator's single gate before the point of no return. Every
+        // startup check has already passed (config loaded, runtime resolved,
+        // payload resolved/validated), so this sits immediately before target
+        // detection: once the operator commits, detection is followed by
+        // RefreshTarget + sponsor + inject in ~ms. An unreadable console is
+        // refused, never assumed (fail-closed).
+        const ConfirmationResult confirmation = ConfirmBeforeDetection();
+        if (confirmation == ConfirmationResult::Cancelled)
+        {
+            wprintf(L"Cancelled.\n");
+            return 0;
+        }
+        if (confirmation == ConfirmationResult::Unavailable)
+        {
+            // No console to pause on; the loud error is already printed and the
+            // fail-closed exit must not be delayed by PauseBeforeExit.
+            return 1;
+        }
 
         TargetSelection target;
         bool cancelled = false;
@@ -5137,8 +5348,9 @@ namespace
             return 1;
         }
 
-        // Deferred architecture cross-check (SelectDll could not do it without
-        // a target). Matches the old interactive behavior: warn + confirm.
+        // Deferred architecture cross-check (the payload is resolved before a
+        // target exists, so the check runs here). Matches the old interactive
+        // behavior: warn + confirm.
         if (target.architecture != Architecture::Unknown &&
             fileInformation.architecture != target.architecture)
         {
@@ -5488,7 +5700,7 @@ namespace
         if (targetHandle)
         {
             stealth_gate_ok = SafeDebugAndVerifyStealth(targetHandle, data.hDllOut, flags, raw_data.data(), raw_data.size(),
-                &ProcessHijackStats, &ThreadHijackStats, &Context, &MapStats, runtime.get_last_string_stats, true, target.pid, &wx_violated);
+                &ProcessHijackStats, &ThreadHijackStats, &Context, &MapStats, runtime.get_last_string_stats, true, target.pid, &wx_violated, config);
         }
         else
         {

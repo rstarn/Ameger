@@ -173,6 +173,15 @@ bool DownloadManager::TimedOut() const
     return m_bTimedOut.load();
 }
 
+void DownloadManager::TouchDeadline()
+{
+    const DWORD timeout = m_dwTimeoutMs.load();
+    if (timeout)
+    {
+        m_ullDeadline.store(GetTickCount64() + timeout);
+    }
+}
+
 HRESULT __stdcall DownloadManager::QueryInterface(const IID & riid, void ** ppvObject)
 {
     if (!ppvObject)

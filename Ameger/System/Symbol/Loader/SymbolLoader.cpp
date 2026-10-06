@@ -6,6 +6,109 @@
 
 #include "System/Symbol/Loader/SymbolLoader.h"
 
+namespace
+{
+	// Streams a URL straight into a local file with no WinINet cache
+	// involvement. The old URLDownloadToCacheFileW path routed the body through
+	// the shared %LOCALAPPDATA%\...\INetCache store and then copied it into
+	// place, leaving a cache residue that named the fetched PDB;
+	// InternetOpenUrlW with NO_CACHE_WRITE|RELOAD writes the bytes only to the
+	// caller's own cache path. Returns S_OK on a complete transfer, E_ABORT on
+	// interrupt/timeout, E_FAIL on any network or file error. WinINet's own
+	// connect/send/receive timeouts bound each call so a stalled server cannot
+	// block a read forever; the caller's watchdog flag is checked between
+	// reads.
+	HRESULT DownloadUrlToFile(const std::wstring & url, const std::wstring & dest,
+		const std::atomic<bool> & interrupt, DownloadManager & mgr)
+	{
+		// A neutral user agent, kept as ciphertext in .rdata. WinINet sends it
+		// as the HTTP User-Agent; the symbol server serves any caller, so a
+		// generic value avoids naming the tool in the request.
+		auto agent = XOR_STR_W(L"Windows-Update-Agent");
+
+		HINTERNET session = InternetOpenW(agent.get(), INTERNET_OPEN_TYPE_PRECONFIG, nullptr, nullptr, 0);
+		if (!session)
+		{
+			LOG(1, "SYMBOL_LOADER: InternetOpen failed: 0x%08X\n", GetLastError());
+
+			return E_FAIL;
+		}
+
+		// Per-call inactivity bounds, mirroring the caller's 60 s watchdog.
+		DWORD timeout = 60000;
+		InternetSetOptionW(session, INTERNET_OPTION_CONNECT_TIMEOUT, &timeout, sizeof(timeout));
+		InternetSetOptionW(session, INTERNET_OPTION_SEND_TIMEOUT, &timeout, sizeof(timeout));
+		InternetSetOptionW(session, INTERNET_OPTION_RECEIVE_TIMEOUT, &timeout, sizeof(timeout));
+		InternetSetOptionW(session, INTERNET_OPTION_DATA_RECEIVE_TIMEOUT, &timeout, sizeof(timeout));
+
+		HINTERNET request = InternetOpenUrlW(session, url.c_str(), nullptr, 0,
+			INTERNET_FLAG_NO_CACHE_WRITE | INTERNET_FLAG_NO_UI | INTERNET_FLAG_RELOAD | INTERNET_FLAG_SECURE,
+			0);
+		if (!request)
+		{
+			LOG(1, "SYMBOL_LOADER: InternetOpenUrl failed: 0x%08X\n", GetLastError());
+
+			InternetCloseHandle(session);
+
+			return E_FAIL;
+		}
+
+		HRESULT result = E_FAIL;
+		HANDLE file = CreateFileW(dest.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+		if (file == INVALID_HANDLE_VALUE)
+		{
+			LOG(1, "SYMBOL_LOADER: can't create PDB file: 0x%08X\n", GetLastError());
+		}
+		else
+		{
+			BYTE buffer[0x8000];
+			for (;;)
+			{
+				if (interrupt.load() || mgr.TimedOut())
+				{
+					result = E_ABORT;
+
+					break;
+				}
+
+				DWORD read = 0;
+				if (!InternetReadFile(request, buffer, sizeof(buffer), &read))
+				{
+					LOG(1, "SYMBOL_LOADER: InternetReadFile failed: 0x%08X\n", GetLastError());
+
+					break;
+				}
+				if (!read)
+				{
+					// Zero bytes means the whole body has been received.
+					result = S_OK;
+
+					break;
+				}
+
+				DWORD written = 0;
+				if (!WriteFile(file, buffer, read, &written, nullptr) || written != read)
+				{
+					LOG(1, "SYMBOL_LOADER: write failed: 0x%08X\n", GetLastError());
+
+					break;
+				}
+
+				// Progress: slide the inactivity deadline so a slow-but-alive
+				// transfer is never cut off.
+				mgr.TouchDeadline();
+			}
+
+			CloseHandle(file);
+		}
+
+		InternetCloseHandle(request);
+		InternetCloseHandle(session);
+
+		return result;
+	}
+}
+
 SYMBOL_LOADER::SYMBOL_LOADER()
 {
 	m_hInterruptEvent = CreateEvent(nullptr, TRUE, FALSE, nullptr);
@@ -571,40 +674,11 @@ DWORD SYMBOL_LOADER::Initialize(const std::wstring & szModulePath, const std::ws
 
 		LOG(1, "SYMBOL_LOADER: URL = %ls\n", url.c_str());
 
-		if (WaitForConnection)
-		{
-			LOG(1, "SYMBOL_LOADER: checking internet connection\n");
-
-			const ULONGLONG connection_deadline = GetTickCount64() + 60000;
-			while (InternetCheckConnectionW(XOR_STR_W(L"https://msdl.microsoft.com").get(), FLAG_ICC_FORCE_CONNECTION, NULL) == FALSE)
-			{
-				if (GetLastError() == ERROR_INTERNET_CANNOT_CONNECT || GetTickCount64() >= connection_deadline)
-				{
-					VirtualFree(pLocalImageBase, 0, MEM_RELEASE);
-
-					delete[] pRawData;
-
-					LOG(1, "SYMBOL_LOADER: cannot connect to Microsoft Symbol Server\n");
-
-					return SYMBOL_ERR_CANNOT_CONNECT;
-				}
-
-				Sleep(25);
-
-				if (m_bInterruptEvent)
-				{
-					VirtualFree(pLocalImageBase, 0, MEM_RELEASE);
-
-					delete[] pRawData;
-
-					LOG(1, "SYMBOL_LOADER: interrupt event triggered\n");
-
-					return SYMBOL_ERR_INTERRUPT;
-				}
-			}
-
-			LOG(1, "SYMBOL_LOADER: connection verified\n");
-		}
+		// The connection pre-check (InternetCheckConnectionW) is gone: the
+		// download attempt itself is the connection test, and a failed attempt
+		// is retried below. WaitForConnection is kept for call compatibility
+		// only - it no longer gates a separate reachability probe.
+		UNREFERENCED_PARAMETER(WaitForConnection);
 
 		if (m_hInterruptEvent)
 		{
@@ -634,11 +708,10 @@ DWORD SYMBOL_LOADER::Initialize(const std::wstring & szModulePath, const std::ws
 
 		LOG(1, "SYMBOL_LOADER: downloading PDB\n");
 
-		// URLDownloadToCacheFileW has no timeout of its own, so a stalled symbol
-		// server would block runtime initialization forever. Bound the download
-		// with an inactivity deadline enforced by the bind callback's watchdog;
-		// if it cannot be armed, fail closed rather than download unbounded.
-		// 60s matches the connection check above.
+		// Bound the download with the same inactivity watchdog; if it cannot be
+		// armed, fail closed rather than download unbounded. The body is
+		// streamed straight into m_szPdbPath (no WinINet cache, no CopyFileW),
+		// so a partial file is ours and is removed on failure.
 		constexpr DWORD kDownloadInactivityTimeoutMs = 60000;
 		if (!m_DlMgr.SetTimeout(kDownloadInactivityTimeoutMs))
 		{
@@ -651,14 +724,12 @@ DWORD SYMBOL_LOADER::Initialize(const std::wstring & szModulePath, const std::ws
 			return SYMBOL_ERR_DOWNLOAD_FAILED;
 		}
 
-		// Transient network / CDN failures are common on msdl; a single
-		// URLDownloadToCacheFileW attempt turned every blip into a fatal
-		// SYMBOL_ERR_DOWNLOAD_FAILED. Retry 3x with 1s spacing, honoring
-		// the interrupt event between attempts. E_ABORT stays sticky, and a
-		// timeout stops the retry loop so a stalled server cannot burn the
-		// remaining attempts.
+		// Transient network / CDN failures are common on msdl; a single attempt
+		// turned every blip into a fatal SYMBOL_ERR_DOWNLOAD_FAILED. Retry 3x
+		// with 1s spacing, honoring the interrupt event between attempts.
+		// E_ABORT stays sticky, and a timeout stops the retry loop so a stalled
+		// server cannot burn the remaining attempts.
 		HRESULT dl_hr = E_FAIL;
-		wchar_t szCacheFile[MAX_PATH]{ 0 };
 		bool dl_aborted = false;
 		for (int attempt = 1; attempt <= 3; ++attempt)
 		{
@@ -668,8 +739,12 @@ DWORD SYMBOL_LOADER::Initialize(const std::wstring & szModulePath, const std::ws
 				break;
 			}
 
-			szCacheFile[0] = L'\0';
-			dl_hr = URLDownloadToCacheFileW(nullptr, url.c_str(), szCacheFile, sizeof(szCacheFile) / sizeof(szCacheFile[0]), NULL, &m_DlMgr);
+			// Remove any partial file from the previous attempt before
+			// rewriting it; a short write would otherwise be verified as a
+			// truncated PDB.
+			DeleteFileW(m_szPdbPath.c_str());
+
+			dl_hr = DownloadUrlToFile(url, m_szPdbPath, m_bInterruptEvent, m_DlMgr);
 			if (SUCCEEDED(dl_hr))
 			{
 				break;
@@ -702,21 +777,17 @@ DWORD SYMBOL_LOADER::Initialize(const std::wstring & szModulePath, const std::ws
 
 		m_DlMgr.StopTimeout();
 
-		auto hr = dl_hr;
-		if (FAILED(hr))
+		if (FAILED(dl_hr))
 		{
-			// A timed-out or aborted URLDownloadToCacheFileW can leave a partial
-			// cache file behind; drop it so failures do not accumulate artifacts.
-			if (szCacheFile[0])
-			{
-				DeleteFileW(szCacheFile);
-			}
+			// A failed attempt can leave a partial file; drop it so failures do
+			// not accumulate artifacts.
+			DeleteFileW(m_szPdbPath.c_str());
 
 			VirtualFree(pLocalImageBase, 0, MEM_RELEASE);
 
 			delete[] pRawData;
 
-			LOG(1, "SYMBOL_LOADER: failed to download file: 0x%08X\n", hr);
+			LOG(1, "SYMBOL_LOADER: failed to download file: 0x%08X\n", dl_hr);
 
 			if (dl_timed_out)
 			{
@@ -725,29 +796,10 @@ DWORD SYMBOL_LOADER::Initialize(const std::wstring & szModulePath, const std::ws
 				return SYMBOL_ERR_DOWNLOAD_FAILED;
 			}
 
-			return (hr == E_ABORT || dl_aborted) ? SYMBOL_ERR_INTERRUPT : SYMBOL_ERR_DOWNLOAD_FAILED;
+			return (dl_hr == E_ABORT || dl_aborted) ? SYMBOL_ERR_INTERRUPT : SYMBOL_ERR_DOWNLOAD_FAILED;
 		}
 
 		LOG(1, "SYMBOL_LOADER: download finished\n");
-
-		if (!CopyFileW(szCacheFile, m_szPdbPath.c_str(), FALSE))
-		{
-			VirtualFree(pLocalImageBase, 0, MEM_RELEASE);
-
-			delete[] pRawData;
-
-			LOG(1, "SYMBOL_LOADER: failed to copy file into working directory: 0x%08X\n", GetLastError());
-
-			DeleteFileW(szCacheFile);
-
-			// CopyFileW is not atomic: a partial destination is ours (any
-			// pre-existing PDB was removed above), so remove it too.
-			DeleteFileW(m_szPdbPath.c_str());
-
-			return SYMBOL_ERR_COPYFILE_FAILED;
-		}
-
-		DeleteFileW(szCacheFile);
 
 		if (!VerifyExistingPdb(pdbInformation->Guid, pdbInformation->Age))
 		{

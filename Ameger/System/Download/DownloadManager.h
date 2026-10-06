@@ -11,14 +11,15 @@ class DownloadManager : public IBindStatusCallback
     bool                m_bForceRedownload  = false;
     LONG                m_RefCount          = 1;
 
-    // Bounded download. URLDownloadToCacheFileW carries no timeout of its own,
-    // so a stalled symbol server would block runtime initialization forever.
-    // A watchdog thread aborts the live IBinding once m_ullDeadline passes;
-    // OnProgress/OnStartBinding slide that deadline forward on every sign of
-    // liveness, making it an inactivity bound rather than a total-duration cap,
-    // so a slow-but-alive transfer is never cut off. OnProgress also fails the
-    // bind directly when the deadline is already past, covering a callback that
-    // fires between watchdog ticks.
+    // Bounded download. WinINet's per-call timeouts bound each read, but a
+    // stalled symbol server must not block runtime initialization, so a
+    // watchdog thread marks m_bTimedOut once m_ullDeadline passes. The
+    // deadline is slid forward on every sign of liveness - TouchDeadline from
+    // the direct download loop (and, on the legacy IBindStatusCallback path,
+    // OnProgress/OnStartBinding) - making it an inactivity bound rather than a
+    // total-duration cap, so a slow-but-alive transfer is never cut off.
+    // OnProgress also fails the bind directly when the deadline is already
+    // past, covering a callback that fires between watchdog ticks.
     std::atomic<IBinding *> m_pBinding{nullptr};
     std::atomic<ULONGLONG>  m_ullDeadline{0};
     std::atomic<DWORD>      m_dwTimeoutMs{0};
@@ -54,6 +55,12 @@ public:
     bool SetTimeout(DWORD milliseconds);
     void StopTimeout();
     bool TimedOut() const;
+
+    // Slides the inactivity deadline forward on a sign of liveness. The direct
+    // WinINet download path has no IBindStatusCallback OnProgress to do this,
+    // so it calls this after each successful read; without it the watchdog
+    // would degrade from an inactivity bound into a total-duration cap.
+    void TouchDeadline();
 
     HRESULT __stdcall QueryInterface(const IID & riid, void ** ppvObject);
 

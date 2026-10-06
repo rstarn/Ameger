@@ -5,8 +5,10 @@ rem ---------------------------------------------------------------------------
 rem ProtectDLL.bat - VMProtect stage for the deployed payload DLL.
 rem
 rem Runs against the *release* copy (Build\Release\DLLs\*.dll), never the
-rem source asset. The runtime DLL (rtdll_*.dll) is explicitly skipped: it is
-rem manual-mapped and must stay a plain, unvirtualized PE.
+rem source asset. The runtime DLL is explicitly skipped by the name Create.bat
+rem recorded in Cache\BuildNames.state: it is manual-mapped and must stay a
+rem plain, unvirtualized PE. No rtdll_* prefix is assumed any more - the
+rem deployed runtime name is random per build (V-03).
 rem
 rem Two consequences of protecting the payload are handled here and would
 rem otherwise silently break the release:
@@ -62,6 +64,18 @@ set "CONFIG_MASTER=%BUILD_DIR%\Configuration.ini"
 set "PAYLOAD_ASSET=%ROOT%\Assets\DLL\Jlov.dll"
 set "CONFIG_SCRIPT=%BUILD_DIR%\Scripts\ProtectConfig.ps1"
 set "DEPLOYED_CONFIG=%OUT_ROOT%\Configuration.ini"
+rem Per-build deployed names (V-02/V-03). Create.bat records these before the
+rem Protect stages run; they name the payload and runtime DLL on disk. Fail
+rem closed if missing: the runtime DLL's random name cannot be guessed, so
+rem without this the payload cannot be told apart from the runtime DLL.
+set "NAMES_STATE=%RELEASE_CACHE%\BuildNames.state"
+rem The .vmp project is matched against the ORIGINAL asset name, never the
+rem random deployed name: Assets\Template holds both Jlov.dll.vmp and
+rem "Host - x64.exe.vmp", and a plain scan can hand this stage the wrong project.
+set "PAYLOAD_ORIGINAL_NAME=Jlov.dll"
+set "PAYLOAD_NAME="
+set "RUNTIME_NAME="
+set "EXPORT_MAP="
 set "VMP_PROJECT="
 set "TARGET_NAME="
 set "VMP_CON="
@@ -77,6 +91,8 @@ echo.
 
 echo [%C_GREEN%2%C_RESET%/%C_GREEN%6%C_RESET%] Resolving payload target...
 echo.
+call :read_names_state
+if errorlevel 1 goto :names_missing
 if not exist "%DLL_DIR%" (
   echo   %C_RED%ERROR: release DLL folder not found: %DLL_DIR%%C_RESET%
   goto :failure
@@ -87,7 +103,7 @@ if not defined TARGET goto :target_missing
 if not exist "%TARGET%" goto :target_missing
 for %%N in ("%TARGET%") do set "TARGET_NAME=%%~nxN"
 echo   %C_GREEN%[+]%C_RESET% Target:  %C_GREEN%%TARGET%%C_RESET%
-echo   %C_GREEN%[+]%C_RESET% Skipped: %C_YELLOW%rtdll_*.dll (manual-mapped, never virtualized)%C_RESET%
+echo   %C_GREEN%[+]%C_RESET% Skipped: %C_YELLOW%%RUNTIME_NAME% (manual-mapped, never virtualized)%C_RESET%
 call :check_already_protected
 if defined VMP_PRESENT if /i not "%AMEGER_FORCE_VMP%"=="1" (
   echo   %C_GREEN%[+]%C_RESET% Already protected ^(segment %C_YELLOW%%VMP_PRESENT%%C_RESET%^); skipping.
@@ -192,13 +208,18 @@ echo   %C_GREEN%[+]%C_RESET% PayloadSha256 = %C_GREEN%%OUT_SHA%%C_RESET% %C_YELL
 if not exist "%CONFIG_SCRIPT%" goto :pin_error
 if /i "%AMEGER_ENCRYPT_CONFIG%"=="0" goto :pin_plaintext
 if not exist "%DEPLOYED_CONFIG%" goto :pin_error
+rem No PayloadName/RuntimeName/ExportMap arguments here: ProtectConfig.ps1
+rem preserves them from the existing deployed config, so the per-build
+rem anti-detection values (V-02/V-03/V-32) survive the re-encryption exactly.
 powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%CONFIG_SCRIPT%" -Source "%PIN_SRC%" -Destination "%DEPLOYED_CONFIG%"
 if errorlevel 1 goto :pin_error
 echo   %C_GREEN%[+]%C_RESET% Deployed config re-encrypted.
 goto :pin_done
 
 :pin_plaintext
-copy /y "%PIN_SRC%" "%DEPLOYED_CONFIG%" > nul
+rem Route through ProtectConfig.ps1 even in plaintext mode so the per-build
+rem keys are carried over; a bare copy would drop them.
+powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%CONFIG_SCRIPT%" -Source "%PIN_SRC%" -Destination "%DEPLOYED_CONFIG%" -Plaintext
 if errorlevel 1 goto :pin_error
 
 :pin_done
@@ -265,12 +286,13 @@ echo Payload: %C_GREEN%%TARGET%%C_RESET%
 if "%NO_PAUSE%"=="0" pause
 exit /b 0
 
-rem Reject every runtime DLL. The check is on the file name only because the
-rem release folder holds exactly one virtualizable DLL, the payload.
+rem Reject the runtime DLL by the exact per-build name Create.bat recorded. The
+rem release folder holds exactly two DLLs (the payload and the runtime), so
+rem skipping the recorded runtime name leaves the payload.
 :consider_dll
 set "CANDIDATE=%~1"
 if not defined CANDIDATE exit /b 0
-echo "%~nx1" | findstr /i /b /c:"rtdll_" > nul && exit /b 0
+if /i "%~nx1"=="%RUNTIME_NAME%" exit /b 0
 if defined TARGET exit /b 0
 set "TARGET=%CANDIDATE%"
 exit /b 0
@@ -339,22 +361,23 @@ for /d %%D in ("%~1\VMProtect*") do if not defined VMP_CON for %%E in ("%%~fD\VM
 exit /b 0
 
 rem Project resolution order: explicit override, then the shared template in
-rem Assets\Template named after the resolved target, then a copy beside this
+rem Assets\Template named after the ORIGINAL asset, then a copy beside this
 rem script, then any project in either folder. Assets\Template is the canonical
 rem home so the build tree stays free of .vmp files. The name-matched step is
 rem load-bearing: two templates exist and a plain alphabetical scan can hand
-rem this stage the wrong binary's project.
+rem this stage the wrong binary's project. The deployed payload name is random
+rem per build (V-02), so the match uses the original asset name instead.
 :find_project
 if defined AMEGER_VMP_PROJECT_DLL if exist "%AMEGER_VMP_PROJECT_DLL%" (
   set "VMP_PROJECT=%AMEGER_VMP_PROJECT_DLL%"
   exit /b 0
 )
-if exist "%ASSET_TPL%\%TARGET_NAME%.vmp" (
-  set "VMP_PROJECT=%ASSET_TPL%\%TARGET_NAME%.vmp"
+if exist "%ASSET_TPL%\%PAYLOAD_ORIGINAL_NAME%.vmp" (
+  set "VMP_PROJECT=%ASSET_TPL%\%PAYLOAD_ORIGINAL_NAME%.vmp"
   exit /b 0
 )
-if exist "%~dp0%TARGET_NAME%.vmp" (
-  set "VMP_PROJECT=%~dp0%TARGET_NAME%.vmp"
+if exist "%~dp0%PAYLOAD_ORIGINAL_NAME%.vmp" (
+  set "VMP_PROJECT=%~dp0%PAYLOAD_ORIGINAL_NAME%.vmp"
   exit /b 0
 )
 for %%F in ("%ASSET_TPL%\*.vmp") do if not defined VMP_PROJECT set "VMP_PROJECT=%%~fF"
@@ -366,9 +389,10 @@ exit /b 1
 
 rem Refuse a project whose InputFileName names a different binary. This is the
 rem cheap guard against the two templates being crossed, which would otherwise
-rem only show up as VMProtect protecting the wrong entry points.
+rem only show up as VMProtect protecting the wrong entry points. The project
+rem still targets the original asset name, not the random deployed name.
 :check_project_input
-powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -Command "$x=[xml][IO.File]::ReadAllText('%VMP_PROJECT%'); $i=[string]$x.Document.Protection.InputFileName; if($i -eq '%TARGET_NAME%'){exit 0}; Write-Host ('    project targets: ' + $i); exit 1"
+powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -Command "$x=[xml][IO.File]::ReadAllText('%VMP_PROJECT%'); $i=[string]$x.Document.Protection.InputFileName; if($i -eq '%PAYLOAD_ORIGINAL_NAME%'){exit 0}; Write-Host ('    project targets: ' + $i); exit 1"
 exit /b %ERRORLEVEL%
 
 :vmp_settings
@@ -468,6 +492,20 @@ if not exist "%RELEASE_CACHE%" exit /b 1
 >>"%STATE_FILE%" echo VMSEG=%VM_SEG%
 exit /b 0
 
+:read_names_state
+rem Load the per-build deployed names Create.bat recorded (V-02/V-03/V-32).
+rem Fail closed when the state is missing or malformed: the runtime DLL's
+rem random name cannot be guessed, so without it the payload cannot be told
+rem apart from the runtime DLL and the wrong file could be virtualized.
+set "PAYLOAD_NAME="
+set "RUNTIME_NAME="
+set "EXPORT_MAP="
+if not exist "%NAMES_STATE%" exit /b 1
+for /f "usebackq tokens=1,* delims==" %%A in ("%NAMES_STATE%") do set "%%A=%%B"
+if not defined PAYLOAD_NAME exit /b 1
+if not defined RUNTIME_NAME exit /b 1
+exit /b 0
+
 :tail_log
 if exist "%WORK_DIR%\vmp.log" for /f "usebackq delims=" %%L in ("%WORK_DIR%\vmp.log") do echo     %%L
 exit /b 0
@@ -503,6 +541,11 @@ echo   %C_YELLOW%       Fix: set AMEGER_VMP_CON to the full path, with no surrou
 echo   %C_YELLOW%             e.g. set AMEGER_VMP_CON=C:\Program Files\VMProtect Ultimate\VMProtect_Con.exe%C_RESET%
 echo   %C_YELLOW%       Leaving it unset is fine if VMProtect is installed normally.%C_RESET%
 echo   %C_YELLOW%       Note: the console build is not included in the Lite edition.%C_RESET%
+goto :failure
+
+:names_missing
+echo   %C_RED%ERROR: per-build name state not found or incomplete: %NAMES_STATE%%C_RESET%
+echo   %C_RED%       Run Create.bat first; the deployed payload and runtime DLL cannot be resolved.%C_RESET%
 goto :failure
 
 :target_missing

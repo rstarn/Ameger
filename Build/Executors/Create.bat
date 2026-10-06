@@ -34,6 +34,13 @@ set "MUTATE_SCRIPT=%SCRIPTS_DIR%\BuildPE.ps1"
 set "SEED_SCRIPT=%SCRIPTS_DIR%\CreateSeeds.ps1"
 set "CONFIG_SCRIPT=%SCRIPTS_DIR%\ProtectConfig.ps1"
 set "VERIFY_SCRIPT=%SCRIPTS_DIR%\VerifyEmbedMagic.ps1"
+set "NAMES_SCRIPT=%SCRIPTS_DIR%\GenerateNames.ps1"
+set "RENAME_SCRIPT=%SCRIPTS_DIR%\RenameExports.ps1"
+rem Per-build deployed file names and the runtime export-rename map. Written
+rem here, consumed by :protect_config, and kept in Cache so the Protect stages
+rem that run after this script can resolve the deployed runtime DLL. It is
+rem never shipped and is swept with the rest of the build residue.
+set "NAMES_STATE=%RELEASE_CACHE%\BuildNames.state"
 set "CONFIG_MASTER=%BUILD_DIR%\Configuration.ini"
 set "PAYLOAD_ASSET=%ROOT%\Assets\DLL\Jlov.dll"
 rem Optional pre-protected payload drop point. If this file exists (or
@@ -42,10 +49,12 @@ rem asset. The master PayloadSha256 pin is NEVER rewritten: it stays the
 rem pristine asset pin, and the shipped config is pinned to the deployed digest
 rem instead (see :deploy_payload and :protect_config).
 set "PAYLOAD_PROTECTED=%ROOT%\Assets\DLL\Jlov.protected.dll"
-set "PAYLOAD_DEST=%DLL_DIR%\Jlov.dll"
+rem The deployed payload path is resolved from the per-build name drawn by
+rem :generate_names (V-02): no stable Jlov.dll is ever shipped.
+set "PAYLOAD_DEST="
 rem Stock runtime build output name (the runtime vcxproj TargetName). Referenced
-rem only before the hash-derived rename below; after the rename the release
-rem folder carries no file by this name.
+rem only before the per-build rename below; after the rename the release folder
+rem carries no file by this name.
 set "RUNTIME_STOCK_DLL=%DEPS_RELEASE%\Ameger Injector - x64.dll"
 rem The Interface embeds the runtime DLL's SHA-256 and refuses a mismatched DLL.
 set "LIBRARY_PROJ=%ROOT%\Interface\Template\AmegerInjector.vcxproj"
@@ -88,6 +97,16 @@ if errorlevel 1 goto :clean_error
 call :prepare_cache
 if errorlevel 1 goto :clean_error
 echo   %C_GREEN%[+]%C_RESET% Clean layout prepared in %C_GREEN%%RELEASE_CACHE%%C_RESET%.
+echo.
+echo.
+rem Per-build deployed file names (V-02/V-03). Drawn before anything is built
+rem or deployed so the runtime rename below and the payload copy use the same
+rem names for the whole run.
+call :generate_names
+if errorlevel 1 goto :names_error
+set "PAYLOAD_DEST=%DLL_DIR%\%PAYLOAD_NAME%"
+echo   %C_GREEN%[+]%C_RESET% Deployed payload name: %C_GREEN%%PAYLOAD_NAME%%C_RESET%
+echo   %C_GREEN%[+]%C_RESET% Deployed runtime name: %C_GREEN%%RUNTIME_NAME%%C_RESET%
 echo.
 echo.
 
@@ -155,6 +174,13 @@ echo   %C_RED%ERROR: BuildPE.ps1 was not found; refusing to continue with an unm
 goto :failure
 
 :runtime_mutate_ready
+rem V-32: rename the runtime DLL's exported function names in place, per build,
+rem before the SHA-256 below is taken so the launcher embeds the digest of the
+rem renamed DLL. The map is captured for the deployed config and the name state.
+call :rename_exports
+if errorlevel 1 goto :rename_export_error
+call :write_names_state
+if errorlevel 1 goto :names_state_error
 where powershell.exe >nul 2>&1
 if errorlevel 1 goto :hash_error
 set "RUNTIME_SHA256="
@@ -169,12 +195,12 @@ if not defined H5 goto :hash_error
 if not defined H6 goto :hash_error
 if not defined H7 goto :hash_error
 set "RUNTIME_HASH_ARGS=/p:AmegerRuntimeHash0=%H0% /p:AmegerRuntimeHash1=%H1% /p:AmegerRuntimeHash2=%H2% /p:AmegerRuntimeHash3=%H3% /p:AmegerRuntimeHash4=%H4% /p:AmegerRuntimeHash5=%H5% /p:AmegerRuntimeHash6=%H6% /p:AmegerRuntimeHash7=%H7% /p:AmegerStringSeed=%AmegerStringSeed%"
-rem Rename the runtime DLL to the hash-derived name the Interface computes
-rem (RuntimePath() in Main.cpp: DLLs\rtdll_<first 8 hex of H0>.dll). The hash
-rem above was taken from the stock path, and AddPE/BuildPE already ran on it, so
-rem this is the last step that touches the stock name. A failed move must abort
-rem rather than ship a folder whose runtime DLL is missing or misnamed.
-set "RUNTIME_DLL_NAME=rtdll_%H0:~2%.dll"
+rem Rename the runtime DLL to the per-build random name drawn by
+rem :generate_names (V-03). The hash above was taken from the stock path after
+rem the export rename, and AddPE/BuildPE already ran on it, so this is the last
+rem step that touches the stock name. A failed move must abort rather than ship
+rem a folder whose runtime DLL is missing or misnamed.
+set "RUNTIME_DLL_NAME=%RUNTIME_NAME%"
 set "RUNTIME_DLL=%DLL_DIR%\%RUNTIME_DLL_NAME%"
 if not exist "%DLL_DIR%" mkdir "%DLL_DIR%"
 move /y "%RUNTIME_STOCK_DLL%" "%RUNTIME_DLL%" >nul
@@ -305,6 +331,67 @@ if not exist "%CACHE_RUNTIME%" exit /b 1
 if not exist "%CACHE_INTERFACE%" exit /b 1
 exit /b 0
 
+:generate_names
+rem Draw the per-build deployed file names (V-02/V-03). Fail closed: a missing
+rem script, missing PowerShell or malformed output must abort rather than ship
+rem a stable name.
+if not exist "%NAMES_SCRIPT%" (
+  echo   %C_RED%ERROR: GenerateNames.ps1 not found; refusing to deploy stable names.%C_RESET%
+  exit /b 1
+)
+where powershell.exe >nul 2>&1
+if errorlevel 1 (
+  echo   %C_RED%ERROR: PowerShell unavailable; refusing to deploy stable names.%C_RESET%
+  exit /b 1
+)
+set "PAYLOAD_NAME="
+set "RUNTIME_NAME="
+for /f "usebackq tokens=1,2 delims==" %%A in (`powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%NAMES_SCRIPT%"`) do set "%%A=%%B"
+if not defined PAYLOAD_NAME exit /b 1
+if not defined RUNTIME_NAME exit /b 1
+if /i "%PAYLOAD_NAME%"=="%RUNTIME_NAME%" exit /b 1
+exit /b 0
+
+:rename_exports
+rem V-32: overwrite the runtime DLL's exported names with same-length random
+rem replacements, in place, and capture the rename map. Fail closed on a missing
+rem script or a script-reported failure: a stable export name on disk is exactly
+rem what this stage exists to remove.
+if not exist "%RENAME_SCRIPT%" (
+  echo   %C_RED%ERROR: RenameExports.ps1 not found; refusing to ship stable export names.%C_RESET%
+  exit /b 1
+)
+where powershell.exe >nul 2>&1
+if errorlevel 1 (
+  echo   %C_RED%ERROR: PowerShell unavailable; refusing to ship stable export names.%C_RESET%
+  exit /b 1
+)
+set "RENAME_STATUS="
+set "EXPORT_MAP="
+for /f "usebackq tokens=1,* delims==" %%A in (`powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%RENAME_SCRIPT%" -Path "%RUNTIME_STOCK_DLL%"`) do set "%%A=%%B"
+if /i not "%RENAME_STATUS%"=="ok" (
+  echo   %C_RED%ERROR: runtime export rename failed; refusing to ship stable export names.%C_RESET%
+  exit /b 1
+)
+if not defined EXPORT_MAP (
+  echo   %C_RED%ERROR: runtime export rename produced no map; refusing to ship stable export names.%C_RESET%
+  exit /b 1
+)
+echo   %C_GREEN%[+]%C_RESET% Runtime exports renamed (map captured).
+exit /b 0
+
+:write_names_state
+rem Persist the per-build names and export map for :protect_config and for the
+rem Protect stages that run after this script. Fail closed: a failed write would
+rem leave ProtectDLL/ProtectEXE unable to resolve the deployed runtime DLL.
+if not exist "%RELEASE_CACHE%" mkdir "%RELEASE_CACHE%"
+if not exist "%RELEASE_CACHE%" exit /b 1
+>"%NAMES_STATE%" echo PAYLOAD_NAME=%PAYLOAD_NAME%
+>>"%NAMES_STATE%" echo RUNTIME_NAME=%RUNTIME_NAME%
+>>"%NAMES_STATE%" echo EXPORT_MAP=%EXPORT_MAP%
+if not exist "%NAMES_STATE%" exit /b 1
+exit /b 0
+
 :build_project
 set "PROJECT=%~1"
 set "ARCH=%~2"
@@ -387,19 +474,42 @@ rem
 rem Fail closed: unless encryption is explicitly disabled, never ship a
 rem plaintext or absent config. The runtime requires Configuration.ini next to
 rem the EXE, so a silent miss here would produce a broken release.
+rem
+rem The deployed config also carries the per-build PayloadName, RuntimeName and
+rem ExportMap (V-02/V-03/V-32) so the launcher resolves the renamed runtime DLL
+rem and its renamed exports. They are passed explicitly here because the
+rem destination does not exist yet; ProtectDLL.bat's later re-encryption
+rem preserves them from the existing destination instead.
 if not defined DEPLOYED_SHA (
   echo   %C_RED%ERROR: deployed payload SHA-256 unavailable; refusing to ship an unpinned config.%C_RESET%
   exit /b 1
 )
+if not defined PAYLOAD_NAME (
+  echo   %C_RED%ERROR: deployed payload name unavailable; refusing to ship an unstamped config.%C_RESET%
+  exit /b 1
+)
+if not defined RUNTIME_NAME (
+  echo   %C_RED%ERROR: deployed runtime name unavailable; refusing to ship an unstamped config.%C_RESET%
+  exit /b 1
+)
+if not defined EXPORT_MAP (
+  echo   %C_RED%ERROR: runtime export map unavailable; refusing to ship an unstamped config.%C_RESET%
+  exit /b 1
+)
 if /i "%AMEGER_ENCRYPT_CONFIG%"=="0" (
-  rem Explicit opt-out only. Still pin the deployed payload so the shipped
-  rem plaintext config and the shipped DLL agree; this is not a silent fallback
-  rem to plaintext, which the encrypted path below never performs.
+  rem Explicit opt-out only. Still pin the deployed payload and carry the
+  rem per-build names so the shipped plaintext config and the shipped DLLs
+  rem agree; this is not a silent fallback to plaintext, which the encrypted
+  rem path below never performs.
   if not exist "%CONFIG_MASTER%" (
     echo   %C_RED%ERROR: master config not found: %CONFIG_MASTER%%C_RESET%
     exit /b 1
   )
-  powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -Command "$c=[IO.File]::ReadAllText('%CONFIG_MASTER%'); $c=[regex]::Replace($c,'(?m)^PayloadSha256\s*=.*$','PayloadSha256 = '+('%DEPLOYED_SHA%')); [IO.File]::WriteAllText('%OUT_ROOT%\Configuration.ini',$c,(New-Object Text.UTF8Encoding($false)))"
+  if not exist "%CONFIG_SCRIPT%" (
+    echo   %C_RED%ERROR: ProtectConfig.ps1 not found; refusing to ship an unstamped config.%C_RESET%
+    exit /b 1
+  )
+  powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%CONFIG_SCRIPT%" -Source "%CONFIG_MASTER%" -Destination "%OUT_ROOT%\Configuration.ini" -PinPayload "%PAYLOAD_DEST%" -PayloadName "%PAYLOAD_NAME%" -RuntimeName "%RUNTIME_NAME%" -ExportMap "%EXPORT_MAP%" -Plaintext
   if errorlevel 1 (
     echo   %C_RED%ERROR: unable to write the plaintext config.%C_RESET%
     exit /b 1
@@ -420,7 +530,7 @@ if errorlevel 1 (
   echo   %C_RED%ERROR: PowerShell unavailable; refusing to ship a plaintext config.%C_RESET%
   exit /b 1
 )
-powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%CONFIG_SCRIPT%" -Source "%CONFIG_MASTER%" -Destination "%OUT_ROOT%\Configuration.ini" -PinPayload "%PAYLOAD_DEST%"
+powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%CONFIG_SCRIPT%" -Source "%CONFIG_MASTER%" -Destination "%OUT_ROOT%\Configuration.ini" -PinPayload "%PAYLOAD_DEST%" -PayloadName "%PAYLOAD_NAME%" -RuntimeName "%RUNTIME_NAME%" -ExportMap "%EXPORT_MAP%"
 if errorlevel 1 (
   echo   %C_RED%ERROR: config encryption failed; refusing to ship a plaintext config.%C_RESET%
   exit /b 1
@@ -515,8 +625,9 @@ rem build machine.
 rem
 rem Everything directly under Cache is removed except the artifacts the
 rem protection stages consume: pe-sections.txt (the ProtectDLL/ProtectEXE
-rem section baseline) and the Protect.*.state idempotency records. Default is
-rem scrub; set AMEGER_KEEP_BUILD_CACHE=1 to retain the residue for debugging.
+rem section baseline), BuildNames.state (the per-build deployed names + export
+rem map) and the Protect.*.state idempotency records. Default is scrub; set
+rem AMEGER_KEEP_BUILD_CACHE=1 to retain the residue for debugging.
 if /i "%AMEGER_KEEP_BUILD_CACHE%"=="1" (
   echo   %C_YELLOW%[!]%C_RESET% Build-cache scrub skipped ^(AMEGER_KEEP_BUILD_CACHE=1^); residue retained.
   exit /b 0
@@ -547,6 +658,9 @@ rem Consumed by later stages and kept across runs. Exit 0 to preserve, 1 to scru
 if /i "%~1"=="pe-sections.txt" exit /b 0
 if /i "%~1"=="Protect.payload.state" exit /b 0
 if /i "%~1"=="Protect.exe.state" exit /b 0
+rem The per-build names + export map the Protect stages read to resolve the
+rem deployed payload/runtime DLLs. Kept for the same reason as pe-sections.txt.
+if /i "%~1"=="BuildNames.state" exit /b 0
 exit /b 1
 
 :manifest_error
@@ -578,7 +692,19 @@ echo %C_RED%ERROR: unable to calculate the runtime DLL SHA-256.%C_RESET%
 goto :failure
 
 :runtime_rename_error
-echo %C_RED%ERROR: unable to rename the runtime DLL to its hash-derived name.%C_RESET%
+echo %C_RED%ERROR: unable to rename the runtime DLL to its per-build name.%C_RESET%
+goto :failure
+
+:names_error
+echo %C_RED%ERROR: unable to generate the per-build deployed file names.%C_RESET%
+goto :failure
+
+:rename_export_error
+echo %C_RED%ERROR: unable to rename the runtime DLL exports.%C_RESET%
+goto :failure
+
+:names_state_error
+echo %C_RED%ERROR: unable to record the per-build name state.%C_RESET%
 goto :failure
 
 :verify_error

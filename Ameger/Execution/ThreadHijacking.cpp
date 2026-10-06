@@ -842,6 +842,14 @@ DWORD SR_HijackThread(HANDLE hTargetProc, f_Routine pRoutine, void * pArg, DWORD
 	StoreThreadExecStat(g_ThreadExecStats.Resumed, 1);
 	StoreThreadExecStat(g_ThreadExecStats.SuspendCount, sr_resume);
 
+	// Wake the resumed victim. The hijack accepts a thread that is either
+	// Running or in an alertable wait (the sponsor/search gate). A Running
+	// thread runs the redirected RIP as soon as it is scheduled, but a thread
+	// parked in an alertable/message wait is still inside its kernel wait after
+	// ResumeThread and will not execute the stub until that wait is satisfied.
+	// WM_NULL is that wake, posted only after ResumeThread succeeded and before
+	// the completion poll, so it cannot mask a failed hijack; without it an
+	// alertable victim would stay Pending until the full timeout.
 	(void)PostThreadMessageW(ThreadID, WM_NULL, 0, 0);
 
 	Sleep(SR_REMOTE_DELAY);
@@ -927,9 +935,17 @@ DWORD SR_HijackThread(HANDLE hTargetProc, f_Routine pRoutine, void * pArg, DWORD
 
 	auto Timer = GetTickCount64();
 	DWORD consecutive_read_failures = 0;
+	// Adaptive poll cadence: 1 ms while completion is still plausible, then
+	// 5 ms, then a 25 ms cap, so a long stub run costs far fewer wakeups than
+	// a fixed 1 ms spin. The overall deadline (the loop bound below) is
+	// unchanged, the interrupt event is still waited on every iteration so an
+	// interrupt is noticed within one poll interval, and a completed stub
+	// breaks out immediately.
+	DWORD poll_wait_ms = 1;
 	while (GetTickCount64() - Timer < Timeout)
 	{
-		auto dwWaitRet = WaitForSingleObject(g_hInterruptEvent, 1);
+		auto dwWaitRet = WaitForSingleObject(g_hInterruptEvent, poll_wait_ms);
+		poll_wait_ms = poll_wait_ms < 5 ? 5 : 25;
 
 		BOOL bRet = ReadProcessMemory(hTargetProc, pState, &data, sizeof(data), nullptr);
 		if (bRet)

@@ -44,6 +44,10 @@ set "DLL_DIR=%OUT_ROOT%\DLLs"
 set "STAGE_DIR=%BUILD_DIR%\Executors\Protection"
 set "PROTECT_DLL=%STAGE_DIR%\ProtectDLL.bat"
 set "PROTECT_EXE=%STAGE_DIR%\ProtectEXE.bat"
+rem Per-build deployed payload name (V-02), for the closing summary only. Read
+rem best effort: the stages themselves fail closed if the state is missing.
+set "NAMES_STATE=%OUT_ROOT%\Cache\BuildNames.state"
+set "PAYLOAD_NAME="
 
 set "STAGE=%~1"
 if /i "%STAGE%"=="/nopause" set "STAGE="
@@ -102,6 +106,7 @@ if errorlevel 1 (
 set "EXE_RESULT=ok"
 
 :summarize
+if not defined PAYLOAD_NAME if exist "%NAMES_STATE%" for /f "usebackq tokens=1,* delims==" %%A in ("%NAMES_STATE%") do if /i "%%A"=="PAYLOAD_NAME" set "PAYLOAD_NAME=%%B"
 echo.
 echo [%C_GREEN%3%C_RESET%/%C_GREEN%3%C_RESET%] Summary...
 echo.
@@ -112,7 +117,7 @@ if /i "%DLL_RESULT%"=="failed" goto :stage_failed
 if /i "%EXE_RESULT%"=="failed" goto :stage_failed
 echo Protection completed successfully.
 echo.
-echo Payload:     %C_GREEN%%DLL_DIR%\Jlov.dll%C_RESET%
+echo Payload:     %C_GREEN%%DLL_DIR%\%PAYLOAD_NAME%%C_RESET%
 echo Interface x64: %C_GREEN%%OUT_ROOT%\Host - x64.exe%C_RESET%
 echo.
 if "%NO_PAUSE%"=="0" pause

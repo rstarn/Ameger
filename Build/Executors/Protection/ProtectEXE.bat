@@ -52,6 +52,12 @@ set "STRIP_SCRIPT=%SCRIPTS_DIR%\StripExporting.ps1"
 rem Kept outside WORK_DIR so the idempotency record survives the cleanup.
 set "STATE_FILE=%RELEASE_CACHE%\Protect.exe.state"
 set "VERIFY_SCRIPT=%BUILD_DIR%\Scripts\VerifyEmbedMagic.ps1"
+rem Per-build deployed runtime DLL name (V-03). Create.bat records it before
+rem the Protect stages run. Absent state is not fatal here: the launcher can
+rem still be virtualized, and the embedded-hash gate below fails closed unless
+rem the explicit AMEGER_ALLOW_SKIP_EMBED opt-out is set.
+set "NAMES_STATE=%RELEASE_CACHE%\BuildNames.state"
+set "RUNTIME_NAME="
 set "VMP_PROJECT=%AMEGER_VMP_PROJECT_EXE%"
 set "VMP_CON="
 
@@ -76,6 +82,10 @@ for %%F in ("%OUT_ROOT%\*.exe") do call :consider_exe "%%~fF"
 if not defined TARGET goto :target_missing
 if not exist "%TARGET%" goto :target_missing
 for %%N in ("%TARGET%") do set "TARGET_NAME=%%~nxN"
+rem The runtime DLL name is random per build (V-03): resolve it from the name
+rem state Create.bat recorded instead of assuming an rtdll_* prefix.
+call :read_runtime_name
+if defined RUNTIME_NAME if exist "%DLL_DIR%\%RUNTIME_NAME%" set "RUNTIME_DLL=%DLL_DIR%\%RUNTIME_NAME%"
 echo   %C_GREEN%[+]%C_RESET% Target:  %C_GREEN%%TARGET%%C_RESET%
 if defined RUNTIME_DLL (
   echo   %C_GREEN%[+]%C_RESET% Runtime: %C_GREEN%%RUNTIME_DLL%%C_RESET% ^(left unvirtualized^)
@@ -254,7 +264,6 @@ set "CANDIDATE=%~1"
 if not defined CANDIDATE exit /b 0
 if defined TARGET exit /b 0
 set "TARGET=%CANDIDATE%"
-for %%F in ("%DLL_DIR%\rtdll_*.dll") do if not defined RUNTIME_DLL set "RUNTIME_DLL=%%~fF"
 exit /b 0
 
 :prepare_project
@@ -348,6 +357,15 @@ rem (VMProtectBeginMutation / VMProtectBeginVirtualization /
 rem VMProtectBeginUltra), so the numeric values are not a bitmask and this
 rem script must not guess which one means what.
 powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -Command "$x=[xml][IO.File]::ReadAllText('%VMP_PROJECT%'); $p=$x.Document.Protection; Write-Host ('    Input         : ' + $p.InputFileName); Write-Host ('    VM complexity : ' + $p.VMComplexity); Write-Host ('    VM instances  : ' + $p.VMInstances); Write-Host ('    Options       : ' + $p.Options); Write-Host '    Procedures    :'; foreach($q in $p.Procedures.Procedure){ Write-Host ('      - ' + $q.MapAddress + '  CompilationType=' + $q.CompilationType + '  Complexity=' + $q.Complexity) }"
+exit /b 0
+
+:read_runtime_name
+rem Read the per-build deployed runtime DLL name from the state Create.bat
+rem recorded. Best effort: an absent or malformed state leaves RUNTIME_NAME
+rem empty, which routes to the embedded-hash gate's fail-closed warn path.
+set "RUNTIME_NAME="
+if not exist "%NAMES_STATE%" exit /b 0
+for /f "usebackq tokens=1,* delims==" %%A in ("%NAMES_STATE%") do set "%%A=%%B"
 exit /b 0
 
 :read_state
