@@ -10,14 +10,12 @@ class SYMBOL_LOADER
 {
 	HANDLE			m_hPdbFile		= NULL;
 	std::wstring	m_szPdbPath		= std::wstring();
-	std::wstring	m_szModulePath	= std::wstring();
 	DWORD			m_Filesize		= 0;
 
 	HANDLE				m_hInterruptEvent = NULL;
 	std::atomic<bool>	m_bInterruptEvent{false};
 
-	DownloadManager m_DlMgr{false};
-	float	m_fProgress			= 0.0f;
+	DownloadManager m_DlMgr;
 	std::atomic<bool>	m_bStartDownload{false};
 	
 	bool m_bReady = false;

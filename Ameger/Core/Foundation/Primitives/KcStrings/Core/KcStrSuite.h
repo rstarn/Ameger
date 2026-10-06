@@ -34,10 +34,10 @@
 //
 // Usage rules (violations broke the build before; see KcStack.h dispatch):
 //  - Single-expression temporaries only: GetProcAddress(h, KC_STR("x"))
-//  - Named hoisted form for anything else: KC_STR_DECL(name, "...")
+//  - Named hoisted wide form for anything else: KC_WSTR_DECL(name, L"...")
 //  - Static tables must NEVER store .c_str() from a temporary; heap-copy
 //    once (see hook-table handling).
-//  - KC_STACK_* / DECL macros are statements, never call arguments.
+//  - KC_WSTR_DECL / KC_SC_* / KC_SWC_* macros are statements, never call arguments.
 #include "../KcNarrow.h"
 #include "../KcWide.h"
 #include "../KcStack.h"

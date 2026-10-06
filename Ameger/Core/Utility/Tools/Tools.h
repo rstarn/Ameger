@@ -7,10 +7,29 @@
 #include "NT/NTDefinitions.h"
 
 #include "NT/NTFunctions.h"
+#include "Injection.h"
 
 #define ALIGN_UP(X, A) ((((ULONG_PTR)(X)) + ((ULONG_PTR)(A) - 1)) & (~(((ULONG_PTR)(A)) - 1)))
 
 #define MAXPATH_IN_TCHAR	(MAX_PATH)
+
+// Single source of truth for the PE-validation options implied by the INJ_MM_*
+// flags. Both the host (ValidateDllFile*) and the in-target map shell
+// (MMI_MapSections) derive their options from the same flags; sharing this
+// keeps the two from drifting. Header-inline so it folds into the shell
+// section, which cannot call host code.
+__forceinline PE_IMAGE::OPTIONS BuildPeValidationOptions(DWORD flags)
+{
+	PE_IMAGE::OPTIONS options;
+	options.RequireDll = true;
+	options.RequireRelocations = true;
+	options.ResolveImports = (flags & (INJ_MM_RESOLVE_IMPORTS | INJ_MM_RUN_DLL_MAIN)) != 0;
+	options.ResolveDelayImports = (flags & INJ_MM_RESOLVE_DELAY_IMPORTS) != 0;
+	options.EnableExceptions = (flags & INJ_MM_ENABLE_EXCEPTIONS) != 0;
+	options.InitializeSecurityCookie = (flags & INJ_MM_INIT_SECURITY_COOKIE) != 0;
+	options.ExecuteTls = (flags & INJ_MM_EXECUTE_TLS) != 0;
+	return options;
+}
 
 inline HINSTANCE g_hInjMod = NULL;
 

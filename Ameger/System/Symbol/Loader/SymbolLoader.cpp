@@ -593,7 +593,32 @@ DWORD SYMBOL_LOADER::Initialize(const std::wstring & szModulePath, const std::ws
 		return SYMBOL_ERR_CANT_CREATE_DIRECTORY;
 	}
 
-	auto PdbFileName = CharArrayToStdWstring(pdbInformation->PdbFileName);
+	// PdbFileName is a variable-length C string inside the CodeView record,
+	// not a fixed array: CharArrayToStdWstring scans for a NUL. Bound that
+	// scan by the debug directory's own payload (and by the mapped image) and
+	// only convert when a NUL provably sits inside it, so a record that is not
+	// terminated within its SizeOfData cannot read past the mapping. An
+	// out-of-bounds or unterminated record yields an empty name, which the
+	// existing unsafe-name check below rejects.
+	const size_t pdb_name_offset = offsetof(PdbInformation, PdbFileName);
+	const bool record_bounded = pDebugDir->SizeOfData > pdb_name_offset
+		&& pDebugDir->AddressOfRawData <= pOpt64->SizeOfImage
+		&& pdb_name_offset <= pOpt64->SizeOfImage - pDebugDir->AddressOfRawData;
+
+	size_t pdb_name_capacity = 0;
+	if (record_bounded)
+	{
+		pdb_name_capacity = pDebugDir->SizeOfData - pdb_name_offset;
+		const size_t image_remaining = pOpt64->SizeOfImage - pDebugDir->AddressOfRawData - pdb_name_offset;
+		if (pdb_name_capacity > image_remaining)
+		{
+			pdb_name_capacity = image_remaining;
+		}
+	}
+
+	auto PdbFileName = (record_bounded && memchr(pdbInformation->PdbFileName, '\0', pdb_name_capacity) != nullptr)
+		? CharArrayToStdWstring(pdbInformation->PdbFileName)
+		: std::wstring();
 	if (PdbFileName.empty() || PdbFileName.size() > 64 ||
 		PdbFileName.find_first_of(L"\\/") != std::wstring::npos ||
 		PdbFileName.find(L"..") != std::wstring::npos ||
@@ -679,11 +704,6 @@ DWORD SYMBOL_LOADER::Initialize(const std::wstring & szModulePath, const std::ws
 		// is retried below. WaitForConnection is kept for call compatibility
 		// only - it no longer gates a separate reachability probe.
 		UNREFERENCED_PARAMETER(WaitForConnection);
-
-		if (m_hInterruptEvent)
-		{
-			m_DlMgr.SetInterruptEvent(m_hInterruptEvent);
-		}
 
 		if (!m_bStartDownload)
 		{
@@ -816,8 +836,6 @@ DWORD SYMBOL_LOADER::Initialize(const std::wstring & szModulePath, const std::ws
 
 		m_Filesize = 0;
 	}
-
-	m_fProgress = 1.0f;
 
 	VirtualFree(pLocalImageBase, 0, MEM_RELEASE);
 

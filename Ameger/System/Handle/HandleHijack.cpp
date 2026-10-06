@@ -399,7 +399,6 @@ namespace
 		// here once wiped Attempted to 0 on every scan, which made the UI
 		// report "no telemetry" while real counters arrived intact.
 		Detail.Examined = 0;
-		Detail.Duplicated = 0;
 		Detail.DonorPid = 0;
 		Detail.GrantedAccess = 0;
 		Detail.OwnersOpened = 0;
@@ -674,7 +673,6 @@ namespace
 				if (TryCandidate(Entry.OwnerPid, Entry.HandleValue, Entry.Object))
 				{
 					Detail.Examined = static_cast<DWORD>(Examined);
-					Detail.Duplicated = static_cast<DWORD>(Duplicated);
 					Detail.DonorPid = FoundDonorPid;
 					Detail.GrantedAccess = FoundGranted;
 					Detail.DonorHandle = FoundDonorHandle;
@@ -702,7 +700,6 @@ namespace
 			BudgetHit ? 1 : 0);
 
 		Detail.Examined = static_cast<DWORD>(Examined);
-		Detail.Duplicated = static_cast<DWORD>(Duplicated);
 		Detail.OwnersOpened = static_cast<DWORD>(Owners.size());
 		Detail.DupDenied = static_cast<DWORD>(DupDenied);
 		Detail.VerifyRejected = static_cast<DWORD>(VerifyRejected);

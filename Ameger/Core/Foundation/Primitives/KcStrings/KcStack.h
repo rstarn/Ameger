@@ -78,11 +78,3 @@ struct KcObfuscatedChar
 #define KC_SWC_18(n, k, c0, c1, c2, c3, c4, c5, c6, c7, c8, c9, c10, c11, c12, c13, c14, c15, c16, c17) KC_SWC_17(n,k,c0,c1,c2,c3,c4,c5,c6,c7,c8,c9,c10,c11,c12,c13,c14,c15,c16); KC_SWC_(n,k,17,c17)
 #define KC_SWC_19(n, k, c0, c1, c2, c3, c4, c5, c6, c7, c8, c9, c10, c11, c12, c13, c14, c15, c16, c17, c18) KC_SWC_18(n,k,c0,c1,c2,c3,c4,c5,c6,c7,c8,c9,c10,c11,c12,c13,c14,c15,c16,c17); KC_SWC_(n,k,18,c18)
 #define KC_SWC_20(n, k, c0, c1, c2, c3, c4, c5, c6, c7, c8, c9, c10, c11, c12, c13, c14, c15, c16, c17, c18, c19) KC_SWC_19(n,k,c0,c1,c2,c3,c4,c5,c6,c7,c8,c9,c10,c11,c12,c13,c14,c15,c16,c17,c18); KC_SWC_(n,k,19,c19)
-
-#define KC_SC_COUNT_(_1,_2,_3,_4,_5,_6,_7,_8,_9,_10,_11,_12,_13,_14,_15,_16,_17,_18,_19,_20,N,...) N
-#define KC_SC_COUNT(...) KC_SC_COUNT_(__VA_ARGS__,20,19,18,17,16,15,14,13,12,11,10,9,8,7,6,5,4,3,2,1)
-#define KC_SC_PASTE_(a, b) a##b
-#define KC_SC_PASTE(a, b) KC_SC_PASTE_(a, b)
-
-#define KC_STACK_STR(name, ...) char name[KC_SC_COUNT(__VA_ARGS__)]; do { constexpr auto kc_key = KC_STACK_KEY_; KC_SC_PASTE(KC_SC_, KC_SC_COUNT(__VA_ARGS__))(name, kc_key, __VA_ARGS__); } while (0)
-#define KC_STACK_WSTR(name, ...) wchar_t name[KC_SC_COUNT(__VA_ARGS__)]; do { constexpr auto kc_key = KC_STACK_KEY_; KC_SC_PASTE(KC_SWC_, KC_SC_COUNT(__VA_ARGS__))(name, kc_key, __VA_ARGS__); } while (0)

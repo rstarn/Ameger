@@ -21,7 +21,10 @@ rem ---------------------------------------------------------------------------
 
 set "NO_PAUSE=0"
 if defined CREATE_NO_PAUSE set "NO_PAUSE=%CREATE_NO_PAUSE%"
-if /i "%~1"=="/nopause" set "NO_PAUSE=1"
+rem Honor /nopause in any argument position, not only the first: a caller may
+rem pass the stage selector first ("Protect.bat dll /nopause"). STAGE below
+rem still reads %~1 exactly as before, so the stage semantics are unchanged.
+for %%A in (%*) do if /i "%%A"=="/nopause" set "NO_PAUSE=1"
 
 set "C_RESET="
 set "C_GREEN="

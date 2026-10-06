@@ -20,7 +20,6 @@
 #include <string>
 #include <vector>
 #include <memory>
-#include <utility>
 
 #include "../../Ameger/Injection.h"
 #include "../../Ameger/Core/Foundation/Error.h"
@@ -314,12 +313,6 @@ namespace
         std::wstring name;
         Architecture architecture = Architecture::Unknown;
         bool by_name = false;
-        // Raw FILETIME creation stamp of the target, captured while
-        // QueryProcess already held a query handle (no extra OpenProcess).
-        // Used only to warn when injection lands late in the game's boot, the
-        // suspected trigger for a payload DllMain that refuses to initialize.
-        // 0 means "unknown".
-        ULONGLONG creation_time = 0;
     };
 
     // One <oldName>=<newName> pair from the deployed ExportMap. The build
@@ -950,23 +943,15 @@ namespace
             return std::wstring();
         }
 
-        // Order matters: the deployed (DPAPI-encrypted) copy next to the EXE is
-        // preferred over the plaintext master in Build\, so a shipped folder
-        // exposes no readable configuration. The plaintext path remains as the
-        // development fallback.
-        const wchar_t * candidates[] =
+        // The only source is the deployed (DPAPI-encrypted) copy next to the
+        // EXE. There is deliberately no plaintext fallback: DecryptConfigBlob
+        // refuses anything that is not a SYSCFG01 blob, so the plaintext master
+        // in Build\ (or any other plaintext path) could never load even if it
+        // were selected here.
+        const std::wstring path = CanonicalPath(directory + L"Configuration.ini");
+        if (!path.empty() && FileExists(path))
         {
-            L"Configuration.ini",
-            L"..\\Configuration.ini",
-            L"..\\..\\Build\\Configuration.ini"
-        };
-        for (const wchar_t * candidate : candidates)
-        {
-            const std::wstring path = CanonicalPath(directory + candidate);
-            if (!path.empty() && FileExists(path))
-            {
-                return path;
-            }
+            return path;
         }
         return std::wstring();
     }
@@ -1011,7 +996,7 @@ namespace
 
     // Splits a deployed ExportMap ("old=new,old=new,...") into ASCII pairs.
     // Fail-closed: any pair without '=', an empty side, a length mismatch
-    // (RenameExports.ps1 rewrites names in place, so old and new are the same
+    // (ShuffleExports.ps1 rewrites names in place, so old and new are the same
     // length), a non-ASCII byte, or a duplicate old/new name refuses the whole
     // map. An empty token (a stray comma) is ignored; at least one pair is
     // required.
@@ -1153,7 +1138,9 @@ namespace
         return true;
     }
 
-    // Loads defaults and overrides from Build\\Configuration.ini.
+    // Loads the DPAPI-encrypted Configuration.ini next to the executable.
+    // There is no plaintext fallback: DecryptConfigBlob refuses any input that
+    // is not a SYSCFG01 blob, so a plaintext file can never be parsed here.
     bool LoadWizardConfig(WizardConfig & config, std::wstring & path, bool & invalid)
     {
         config = WizardConfig{};
@@ -1586,7 +1573,7 @@ namespace
         }
         if (!has_embedded_hash)
         {
-            PrintError(L"The runtime has no embedded SHA-256. Build it with Build\\Create.bat.");
+            PrintError(L"The runtime has no embedded SHA-256. Build it with Build\\Executors\\Create.bat.");
             return false;
         }
 
@@ -1730,14 +1717,19 @@ namespace
         return true;
     }
 
-    // Waits for symbol download and import resolution to complete.
-    bool WaitForRuntime(const Runtime & runtime, DWORD & symbol_state, DWORD & import_state)
+    // Waits for symbol download and import resolution to complete. On a
+    // CoreStart (InitializeRuntime) failure the code is also returned through
+    // init_state, so the reporter can name the real stage instead of guessing
+    // from the symbol/import states.
+    bool WaitForRuntime(const Runtime & runtime, DWORD & symbol_state, DWORD & import_state, DWORD & init_state)
     {
         constexpr ULONGLONG timeout = 120000;
+        init_state = INJ_ERR_SUCCESS;
 
         const DWORD initialization_state = runtime.initialize_runtime();
         if (initialization_state != INJ_ERR_SUCCESS)
         {
+            init_state = initialization_state;
             symbol_state = initialization_state;
             import_state = initialization_state;
 
@@ -1960,8 +1952,7 @@ namespace
         return system_info.wProcessorArchitecture == PROCESSOR_ARCHITECTURE_AMD64 ? Architecture::X64 : Architecture::X86;
     }
 
-    bool QueryProcess(DWORD pid, std::wstring & name, Architecture & architecture,
-        ULONGLONG * creation_time = nullptr)
+    bool QueryProcess(DWORD pid, std::wstring & name, Architecture & architecture)
     {
         HANDLE process = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
         if (!process)
@@ -1977,22 +1968,6 @@ namespace
         DWORD length = static_cast<DWORD>(std::size(path));
         const BOOL queried = QueryFullProcessImageNameW(process, 0, path, &length);
         architecture = ProcessArchitecture(process);
-        // Reuse the handle already held for the name query: reading the
-        // creation stamp costs no extra OpenProcess (the project deliberately
-        // minimizes handle telemetry). The other three FILETIME outputs are
-        // required by the API but unused here.
-        if (creation_time)
-        {
-            FILETIME creation_ft{};
-            FILETIME exit_ft{};
-            FILETIME kernel_ft{};
-            FILETIME user_ft{};
-            if (GetProcessTimes(process, &creation_ft, &exit_ft, &kernel_ft, &user_ft))
-            {
-                *creation_time = (static_cast<ULONGLONG>(creation_ft.dwHighDateTime) << 32) |
-                    creation_ft.dwLowDateTime;
-            }
-        }
         CloseHandle(process);
         if (!queried)
         {
@@ -2057,10 +2032,10 @@ namespace
                 return false;
             }
             target.pid = pid;
-            return QueryProcess(pid, target.name, target.architecture, &target.creation_time);
+            return QueryProcess(pid, target.name, target.architecture);
         }
 
-        return QueryProcess(target.pid, target.name, target.architecture, &target.creation_time);
+        return QueryProcess(target.pid, target.name, target.architecture);
     }
 
     bool SelectTarget(const std::wstring & configured_name, TargetSelection & target, bool & cancelled)
@@ -2080,7 +2055,7 @@ namespace
         for (;;)
         {
             const DWORD found = FindProcess(target.requested_name);
-            if (found && QueryProcess(found, target.name, target.architecture, &target.creation_time))
+            if (found && QueryProcess(found, target.name, target.architecture))
             {
                 target.pid = found;
                 wprintf(L"%ls[+]%ls %ls detected | PID: %ls%lu%ls\n", kGreen, kReset, target.name.c_str(), kGreen, static_cast<unsigned long>(found), kReset);
@@ -2151,10 +2126,9 @@ namespace
     // no fallback file name: a missing PayloadName, a missing file, a failed
     // PE validation or a pin mismatch is a hard failure.
     bool ResolveConfiguredPayload(const std::wstring & payload_name, const std::wstring & expected_sha256,
-        DWORD flags, std::wstring & path, FileInformation & info, std::vector<BYTE> & bytes, std::wstring & sha256)
+        DWORD flags, FileInformation & info, std::vector<BYTE> & bytes)
     {
         bytes.clear();
-        sha256.clear();
 
         const std::wstring directory = ExecutableDirectory();
         if (directory.empty() || payload_name.empty())
@@ -2163,7 +2137,7 @@ namespace
             return false;
         }
 
-        path = directory + L"DLLs\\" + payload_name;
+        const std::wstring path = directory + L"DLLs\\" + payload_name;
         if (!FileExists(path))
         {
             PrintError((L"The payload DLL (" + payload_name + L") is missing in DLLs\\ next to the executable.").c_str());
@@ -2171,6 +2145,7 @@ namespace
         }
 
         DWORD validation_code = FILE_ERR_SUCCESS;
+        std::wstring sha256;
         if (!InspectDll(path, flags, info, bytes, sha256, &validation_code))
         {
             if (validation_code != FILE_ERR_SUCCESS)
@@ -3258,7 +3233,7 @@ namespace
                 BYTE * current = ReCa<BYTE *>(hRemoteBase);
                 while (true)
                 {
-                    if (!VirtualQueryEx(process, current, &mbi, sizeof(mbi)))
+                    if (!VirtualQueryEx(process, current, &mbi, sizeof(mbi)) || !mbi.RegionSize)
                         break;
                     if (total_image_size > 0 &&
                         (ReCa<ULONG_PTR>(mbi.BaseAddress) - ReCa<ULONG_PTR>(hRemoteBase)) >= total_image_size)
@@ -3270,7 +3245,12 @@ namespace
                         else if (mbi.Protect == PAGE_READWRITE)     ++rw_count;
                         else if (mbi.Protect == PAGE_EXECUTE_READ || mbi.Protect == PAGE_EXECUTE) ++rx_count;
                     }
-                    current = ReCa<BYTE *>(mbi.BaseAddress) + mbi.RegionSize;
+                    // Progress guard, matching the W^X and trap-survey walks: a
+                    // zero-length or non-advancing region must not spin forever.
+                    BYTE * next = ReCa<BYTE *>(mbi.BaseAddress) + mbi.RegionSize;
+                    if (next <= current)
+                        break;
+                    current = next;
                 }
                 wprintf(L"  %ls[+]%ls %ls = %ls%d%ls  %ls = %ls%d%ls  %ls = %ls%d%ls  %ls = %ls%d%ls\n",
                     kGreen, kReset,
@@ -4254,6 +4234,18 @@ namespace
             return 0;
         }
 
+        // Bounds-check the local read the same way IsSafeCodePage guards the
+        // remote one: the whole scan window must sit inside a committed,
+        // non-guard, non-no-access page. Reading past the region (or touching a
+        // guard page) is refused rather than faulted.
+        if (local_info.State != MEM_COMMIT ||
+            (local_info.Protect & (PAGE_GUARD | PAGE_NOACCESS)) ||
+            reinterpret_cast<ULONG_PTR>(local_function) + kHookScanBytes >
+                reinterpret_cast<ULONG_PTR>(local_info.BaseAddress) + local_info.RegionSize)
+        {
+            return 0;
+        }
+
         ULONG_PTR remote_base = 0;
         if (!GetRemoteModuleBase(process, target.module.c_str(), remote_base))
         {
@@ -4557,16 +4549,6 @@ namespace
                     break;
                 }
 
-                // A region wholly below the image base cannot happen once the
-                // cursor starts at base, but guard anyway so a misreported
-                // BaseAddress can never walk backwards.
-                if (reinterpret_cast<ULONG_PTR>(next) <= base)
-                {
-                    cursor = next;
-                    ++regions;
-                    continue;
-                }
-
                 if (has_eid)
                 {
                     const ULONG_PTR r_start = reinterpret_cast<ULONG_PTR>(mbi.BaseAddress);
@@ -4796,8 +4778,9 @@ namespace
         size_t resolved = 0;  // module and function both found in the process
         size_t clean = 0;     // resolved and byte-identical to the local image
         size_t hooked = 0;    // differed, so a restore was attempted
-        size_t skipped = 0;   // differed but deliberately left alone
+        size_t skipped = 0;   // differed but deliberately left alone (or unreadable)
         bool scanned = false; // 0 when there was no process handle
+        bool patch_blocked = false; // the patch gate refused before any inspection
     };
 
     // Hook restoring rewrites executable code inside the target, so it is
@@ -4821,6 +4804,12 @@ namespace
         remaining.clear();
         stats = HookScanStats{};
 
+        // Survey list is heap-owned, built once from XOR literals above. Counted
+        // before the patch gate below so the "nothing was inspected" line names
+        // the real list size even when the gate refuses the whole pass.
+        const std::vector<HookTarget> & targets = GetHookTargets();
+        stats.targets = targets.size();
+
         // Hard gate. This path WRITES executable code in the target. That is a
         // categorically different act from reading it: a target that integrity-
         // hashes its own text sees the bytes change, and the write also forces
@@ -4829,13 +4818,9 @@ namespace
         // so it can never be switched on by config alone.
         if (!HookPatchExplicitlyAllowed())
         {
-            stats.skipped = stats.targets;
+            stats.patch_blocked = true;
             return;
         }
-
-        // Survey list is heap-owned, built once from XOR literals above.
-        const std::vector<HookTarget> & targets = GetHookTargets();
-        stats.targets = targets.size();
 
         if (!process)
         {
@@ -4854,18 +4839,32 @@ namespace
             ++stats.resolved;
 
             const size_t first_diff = FindHookDifference(process, remote_function, local_bytes);
-            if (first_diff == static_cast<size_t>(-1) || first_diff == sizeof(local_bytes))
+            if (first_diff == static_cast<size_t>(-1))
+            {
+                // The page was unreadable (guard/no-access, or the read failed),
+                // so "identical" and "hooked" cannot be told apart. Count it as
+                // skipped, never as clean: an unreadable target is not a proven
+                // match.
+                ++stats.skipped;
+                continue;
+            }
+            if (first_diff == sizeof(local_bytes))
             {
                 ++stats.clean;
                 continue;
             }
 
+            // Differed: attempt the guarded, W^X-preserving restore. Any skip
+            // below records the target as still-differing, so the pass captures
+            // the final outcome directly instead of re-resolving every target a
+            // second time.
             // Re-check guard immediately before the write: a page that
             // became guarded since the read must not be forced open - the
             // guard exception itself is the tripwire.
             if (!IsSafeCodePage(process, remote_function, sizeof(local_bytes)))
             {
                 ++stats.skipped;
+                remaining.push_back(HookDisplayName(target));
                 continue;
             }
 
@@ -4879,6 +4878,7 @@ namespace
             if (!VirtualQueryEx(process, reinterpret_cast<void *>(remote_function), &patch_mbi, sizeof(patch_mbi)))
             {
                 ++stats.skipped;
+                remaining.push_back(HookDisplayName(target));
                 continue;
             }
 
@@ -4897,6 +4897,7 @@ namespace
             if (!VirtualProtectEx(process, reinterpret_cast<void *>(remote_function), sizeof(local_bytes), staged_protection, &discard_protection))
             {
                 ++stats.skipped;
+                remaining.push_back(HookDisplayName(target));
                 continue;
             }
 
@@ -4914,6 +4915,7 @@ namespace
             if (!write_ok || !protection_ok)
             {
                 ++stats.skipped;
+                remaining.push_back(HookDisplayName(target));
                 continue;
             }
 
@@ -4927,6 +4929,7 @@ namespace
                 memcmp(verify_bytes, local_bytes, sizeof(verify_bytes)) != 0)
             {
                 ++stats.skipped;
+                remaining.push_back(HookDisplayName(target));
                 continue;
             }
 
@@ -4935,22 +4938,6 @@ namespace
             entry.name = HookDisplayName(target);
             entry.offset = static_cast<unsigned int>(first_diff);
             restored.push_back(entry);
-        }
-
-        for (const HookTarget & target : targets)
-        {
-            BYTE local_bytes[kHookScanBytes]{};
-            const ULONG_PTR remote_function = ResolveHookTarget(process, target, local_bytes);
-            if (!remote_function)
-            {
-                continue;
-            }
-
-            const size_t still_diff = FindHookDifference(process, remote_function, local_bytes);
-            if (still_diff != static_cast<size_t>(-1) && still_diff != sizeof(local_bytes))
-            {
-                remaining.push_back(HookDisplayName(target));
-            }
         }
     }
 
@@ -4965,8 +4952,19 @@ namespace
 
         if (!stats.scanned)
         {
-            wprintf(L"    %ls%zu%s in list, no process handle - nothing was inspected\n",
-                StageField(L"Targets").c_str(), stats.targets, kReset);
+            // Two distinct reasons reach here, and they must not read the same:
+            // the patch gate refusing the whole pass (AMEGER_ALLOW_HOOK_PATCH
+            // unset) is not the same as having no process handle to inspect.
+            if (stats.patch_blocked)
+            {
+                wprintf(L"    %ls%zu%s in list, hook patch not enabled - nothing was inspected\n",
+                    StageField(L"Targets").c_str(), stats.targets, kReset);
+            }
+            else
+            {
+                wprintf(L"    %ls%zu%s in list, no process handle - nothing was inspected\n",
+                    StageField(L"Targets").c_str(), stats.targets, kReset);
+            }
             return;
         }
 
@@ -5144,14 +5142,13 @@ namespace
         std::getline(std::wcin, ignored);
     }
 
-    void PrintRuntimeFailure(DWORD symbol_state, DWORD import_state)
+    void PrintRuntimeFailure(DWORD symbol_state, DWORD import_state, DWORD init_state)
     {
-        // CoreStart (InitializeRuntime) failures are propagated through symbol_state /
-        // import_state by WaitForRuntime. Report them as init failures, not
-        // as symbol-download failures: 0x4E (BUILD_UNSUPPORTED) previously
-        // printed as "Failed to load symbols", sending operators down the
-        // wrong path (network/symbols) when the real cause was the OS gate.
-        const DWORD init_state = symbol_state != INJ_ERR_SUCCESS ? symbol_state : import_state;
+        // init_state is the CoreStart (InitializeRuntime) result from
+        // WaitForRuntime. It is reported as an init failure, never as a
+        // symbol-download failure: the OS gate (0x4E/0x40) previously printed
+        // as "Failed to load symbols", and so did every other non-success
+        // CoreStart code (module path, event allocation, ...).
         if (init_state == INJ_ERR_WINDOWS_BUILD_UNSUPPORTED || init_state == INJ_ERR_WINDOWS_VERSION)
         {
             DWORD local_build = 0;
@@ -5206,7 +5203,16 @@ namespace
         }
         else if (symbol_state != INJ_ERR_SUCCESS)
         {
-            fwprintf(stderr, L"%lsFailed to load symbols: 0x%08X%ls\n", kRed, symbol_state, kReset);
+            if (init_state != INJ_ERR_SUCCESS)
+            {
+                // CoreStart failed before the download stage: name the real
+                // stage instead of blaming the symbol download.
+                fwprintf(stderr, L"%lsFailed to initialize the runtime: 0x%08X%ls\n", kRed, init_state, kReset);
+            }
+            else
+            {
+                fwprintf(stderr, L"%lsFailed to load symbols: 0x%08X%ls\n", kRed, symbol_state, kReset);
+            }
         }
         else if (import_state == INJ_ERR_IMPORT_HANDLER_NOT_DONE)
         {
@@ -5247,7 +5253,7 @@ namespace
         {
             if (config_path.empty())
             {
-                PrintError(L"Configuration.ini is required but was not found. Place it next to the executable or in Build\\.");
+                PrintError(L"Configuration.ini is required but was not found. Place it next to the executable.");
             }
             else
             {
@@ -5288,12 +5294,10 @@ namespace
         }
 
         wprintf(L"\n");
-        std::wstring dll_path;
-        std::wstring payload_sha256;
         std::vector<BYTE> raw_data;
         FileInformation fileInformation;
         if (!ResolveConfiguredPayload(config.payload_name, config.expected_payload_sha256,
-            BuildFlags(config), dll_path, fileInformation, raw_data, payload_sha256))
+            BuildFlags(config), fileInformation, raw_data))
         {
             PauseBeforeExit();
             return 1;
@@ -5302,9 +5306,10 @@ namespace
         wprintf(L"\n%ls[+]%ls Downloading Windows symbols...\n", kGreen, kReset);
         DWORD symbol_state = INJ_ERR_SYMBOL_INIT_NOT_DONE;
         DWORD import_state = INJ_ERR_IMPORT_HANDLER_NOT_DONE;
-        if (!WaitForRuntime(runtime, symbol_state, import_state))
+        DWORD init_state = INJ_ERR_SUCCESS;
+        if (!WaitForRuntime(runtime, symbol_state, import_state, init_state))
         {
-            PrintRuntimeFailure(symbol_state, import_state);
+            PrintRuntimeFailure(symbol_state, import_state, init_state);
             PauseBeforeExit();
             return 1;
         }
@@ -5365,11 +5370,6 @@ namespace
             }
         }
 
-        // Note: late boot only warns (see SelectTarget). A hard refuse here
-        // would have blocked your 25s success: late DllMain is probabilistic
-        // (thread/state lottery), not guaranteed failure, so never abort on
-        // age alone.
-
         const int timeout_value = config.timeout;
 
         wprintf(L"\n");
@@ -5403,6 +5403,7 @@ namespace
         Context.SponsorAccess = PROCESS_VM_OPERATION | PROCESS_VM_READ | PROCESS_VM_WRITE |
             PROCESS_QUERY_INFORMATION | PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_DUP_HANDLE;
         HANDLE sponsorRaw = nullptr;
+        DWORD sponsor_err = ERROR_SUCCESS;
         if (config.handle_hijacking)
         {
             // Least privilege first: most targets open without it, and an
@@ -5417,13 +5418,20 @@ namespace
                 {
                     sponsorRaw = OpenProcess(Context.SponsorAccess, FALSE, target.pid);
                 }
+                // Capture the failure while it is still the thread's last error:
+                // DisableSeDebugPrivilege below resets it to ERROR_SUCCESS on
+                // success, which previously made a denied re-open print as
+                // 0x00000000.
+                if (!sponsorRaw)
+                {
+                    sponsor_err = GetLastError();
+                }
                 // Revoke immediately: the privilege is only needed for this one
                 // open, and leaving it enabled is a lasting, enumerable trace on
                 // our own token.
                 DisableSeDebugPrivilege();
             }
-            DWORD sponsor_err = ERROR_SUCCESS;
-            if (!sponsorRaw)
+            if (!sponsorRaw && sponsor_err == ERROR_SUCCESS)
             {
                 sponsor_err = GetLastError();
             }
@@ -5611,7 +5619,12 @@ namespace
             // (inverted-function-table entry, TLS index/block and the loader
             // lock cookie all point into the freed image or stay held). Say so
             // explicitly: retrying into the same process is not safe.
-            if (result >= 0x00400000u)
+            // Only the INJ_MM_* family (0x00400000..0x004FFFFF, see Error.h)
+            // means the mapping shell ran: a bare >= 0x00400000 also matches
+            // SR_HT_ERR_* (0x102xxxxx), SR_ERR_* (0x100xxxxx), FILE_ERR_*
+            // (0x200xxxxx) and SYMBOL_ERR_* (0x400xxxxx), which are all
+            // pre-shell failures and must not claim the shell was reached.
+            if (result >= 0x00400000u && result < 0x00500000u)
             {
                 wprintf(L"  %ls[!]%ls Remote mapping reached the shell; unreclaimable loader state may remain.\n",
                     kYellow, kReset);

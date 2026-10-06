@@ -42,22 +42,6 @@ namespace
 		}
 	}
 
-	PE_IMAGE::OPTIONS GetMappingOptions(DWORD flags)
-	{
-		PE_IMAGE::OPTIONS options;
-		options.RequireDll = true;
-		// The image is always allocated at an arbitrary base (the shell hands
-		// NtAllocateVirtualMemory a null hint), so relocations are mandatory
-		// regardless of any flag.
-		options.RequireRelocations = true;
-		options.ResolveImports = (flags & (INJ_MM_RESOLVE_IMPORTS | INJ_MM_RUN_DLL_MAIN)) != 0;
-		options.ResolveDelayImports = (flags & INJ_MM_RESOLVE_DELAY_IMPORTS) != 0;
-		options.EnableExceptions = (flags & INJ_MM_ENABLE_EXCEPTIONS) != 0;
-		options.InitializeSecurityCookie = (flags & INJ_MM_INIT_SECURITY_COOKIE) != 0;
-		options.ExecuteTls = (flags & INJ_MM_EXECUTE_TLS) != 0;
-		return options;
-	}
-
 	bool ReadFileForMapping(const std::wstring & path, std::vector<BYTE> & data)
 	{
 		std::ifstream file(path, std::ios::binary | std::ios::ate);
@@ -165,7 +149,7 @@ DWORD MMAP_NATIVE::ManualMap(const INJECTION_SOURCE & Source, HANDLE hTargetProc
 	{
 		if (source.FromMemory)
 		{
-			validation_result = PE_IMAGE::Validate(source.RawData, source.RawSize, IMAGE_FILE_MACHINE_AMD64, GetMappingOptions(remote_flags), source_view);
+			validation_result = PE_IMAGE::Validate(source.RawData, source.RawSize, IMAGE_FILE_MACHINE_AMD64, BuildPeValidationOptions(remote_flags), source_view);
 		}
 		else
 		{
@@ -176,7 +160,7 @@ DWORD MMAP_NATIVE::ManualMap(const INJECTION_SOURCE & Source, HANDLE hTargetProc
 			return FILE_ERR_CANT_OPEN_FILE;
 		}
 
-			validation_result = PE_IMAGE::Validate(file_data.data(), file_data.size(), IMAGE_FILE_MACHINE_AMD64, GetMappingOptions(remote_flags), source_view);
+			validation_result = PE_IMAGE::Validate(file_data.data(), file_data.size(), IMAGE_FILE_MACHINE_AMD64, BuildPeValidationOptions(remote_flags), source_view);
 			source.FromMemory = true;
 			source.RawData = file_data.data();
 			source.RawSize = static_cast<DWORD>(file_data.size());
@@ -201,8 +185,6 @@ DWORD MMAP_NATIVE::ManualMap(const INJECTION_SOURCE & Source, HANDLE hTargetProc
 	MANUAL_MAPPING_DATA data{ 0 };
 	data.Flags = remote_flags;
 	data.RawSize = source.RawSize;
-	data.OSVersion = GetOSVersion();
-	data.OSBuildNumber = GetOSBuildVersion();
 	// Downloaded layouts for the remote shell. Fail-closed when the PDB
 	// resolve did not complete: the target has no DbgHelp, so stale static
 	// LDR/TLS/inverted/KUSER guesses must never be sent.
@@ -215,25 +197,6 @@ DWORD MMAP_NATIVE::ManualMap(const INJECTION_SOURCE & Source, HANDLE hTargetProc
 		return INJ_ERR_SYMBOL_INIT_NOT_DONE;
 	}
 	data.NtOffsets = g_DynamicOffsets;
-
-	if (!source.DllPath.empty())
-	{
-		const size_t path_length = source.DllPath.length();
-		const size_t maximum_path_length = sizeof(data.szPathBuffer) / sizeof(wchar_t);
-		if (path_length >= maximum_path_length)
-		{
-			INIT_ERROR_DATA(error_data, INJ_ERR_ADVANCED_NOT_DEFINED);
-
-			LOG(1, "Path too long: %zu characters, buffer size: %zu\n", path_length, maximum_path_length);
-
-			return INJ_ERR_STRING_TOO_LONG;
-		}
-
-		data.DllPath.Length = static_cast<WORD>(path_length * sizeof(wchar_t));
-		data.DllPath.MaxLength = static_cast<WORD>(sizeof(data.szPathBuffer));
-		source.DllPath.copy(data.szPathBuffer, path_length);
-		data.szPathBuffer[path_length] = 0;
-	}
 
 	
 	LOG(1, "Shell data initialized\n");
@@ -435,7 +398,13 @@ DWORD MMAP_NATIVE::ManualMap(const INJECTION_SOURCE & Source, HANDLE hTargetProc
 				return INJ_ERR_UPDATE_PROTECTION_FAILED;
 			}
 
-			FlushInstructionCache(hTargetProc, code_base, code_size);
+			// Best-effort: the RX promotion above is the correctness boundary,
+			// but a failure here means the CPU may run stale code, so record it
+			// (same handling as the hijack stub promotion).
+			if (!FlushInstructionCache(hTargetProc, code_base, code_size))
+			{
+				LOG(1, "FlushInstructionCache failed: %08X\n", GetLastError());
+			}
 			LOG(1, "Staging code promoted RW->RX\n");
 		}
 	}
@@ -526,7 +495,7 @@ DWORD MMAP_NATIVE::ManualMap(const INJECTION_SOURCE & Source, HANDLE hTargetProc
 
 #pragma region inlined dependency record functions
 
-__forceinline MM_DEPENDENCY_RECORD * BuildDependencyRecord(MANUAL_MAPPING_FUNCTION_TABLE * f, MM_DEPENDENCY_RECORD ** head, HANDLE DllHandle, const UNICODE_STRING * DllPath)
+__forceinline MM_DEPENDENCY_RECORD * BuildDependencyRecord(MANUAL_MAPPING_FUNCTION_TABLE * f, MM_DEPENDENCY_RECORD ** head, HANDLE DllHandle)
 {
 	if (!head)
 	{
@@ -546,19 +515,6 @@ __forceinline MM_DEPENDENCY_RECORD * BuildDependencyRecord(MANUAL_MAPPING_FUNCTI
 		(*head)->Next = *head;
 		(*head)->Prev = *head;
 		(*head)->DllHandle = DllHandle;
-		
-		if (DllPath)
-		{
-			auto len = DllPath->Length;
-			if (len < sizeof(MM_DEPENDENCY_RECORD::Buffer))
-			{
-				(*head)->DllName.Length		= len;
-				(*head)->DllName.MaxLength	= sizeof(MM_DEPENDENCY_RECORD::Buffer);
-				(*head)->DllName.szBuffer	= (*head)->Buffer;
-
-				f->memmove((*head)->Buffer, DllPath->szBuffer, len);
-			}
-		}
 
 		return (*head);
 	}	
@@ -574,19 +530,6 @@ __forceinline MM_DEPENDENCY_RECORD * BuildDependencyRecord(MANUAL_MAPPING_FUNCTI
 		(*head)->Prev		= next;
 
 		next->DllHandle = DllHandle;
-
-		if (DllPath)
-		{
-			auto len = DllPath->Length;
-			if (len < sizeof(MM_DEPENDENCY_RECORD::Buffer))
-			{
-				next->DllName.Length	= len;
-				next->DllName.MaxLength	= sizeof(MM_DEPENDENCY_RECORD::Buffer);
-				next->DllName.szBuffer	= next->Buffer;
-
-				f->memmove(next->Buffer, DllPath->szBuffer, len);
-			}
-		}
 	}
 
 	return next;
@@ -834,8 +777,7 @@ NTSTATUS __declspec(code_seg(".mmap_sec$13")) __stdcall MMIH_LoadModule(MANUAL_M
 
 			if (!entry)
 			{
-				const void * full_name_ptr = ReCa<const BYTE *>(entry_out) + dyno.LdrEntryFullDllName;
-				entry = BuildDependencyRecord(f, head, ReCa<HANDLE>(*hModule), ReCa<const UNICODE_STRING *>(full_name_ptr));
+				entry = BuildDependencyRecord(f, head, ReCa<HANDLE>(*hModule));
 				// Fail closed on ANY failure to record the dependency, not just
 				// the head-present case: the previous `&& head` meant a caller
 				// that passed head == nullptr fell through to the dereference
@@ -870,9 +812,6 @@ DWORD __declspec(code_seg(".mmap_sec$01")) __stdcall ManualMapping_Shell(MANUAL_
 		return INJ_MM_ERR_NO_DATA;
 	}
 
-	pData->DllPath.szBuffer = pData->szPathBuffer;
-
-	
 	auto * f = pData->FunctionTable;
 	if (!f->pLdrpHeap)
 	{
@@ -1003,14 +942,7 @@ DWORD __declspec(code_seg(".mmap_sec$02")) __stdcall MMI_MapSections(MANUAL_MAPP
 		return INJ_MM_ERR_INVALID_PE_IMAGE;
 	}
 
-	PE_IMAGE::OPTIONS options;
-	options.RequireDll = true;
-	options.RequireRelocations = true;
-	options.ResolveImports = (pData->Flags & (INJ_MM_RESOLVE_IMPORTS | INJ_MM_RUN_DLL_MAIN)) != 0;
-	options.ResolveDelayImports = (pData->Flags & INJ_MM_RESOLVE_DELAY_IMPORTS) != 0;
-	options.EnableExceptions = (pData->Flags & INJ_MM_ENABLE_EXCEPTIONS) != 0;
-	options.InitializeSecurityCookie = (pData->Flags & INJ_MM_INIT_SECURITY_COOKIE) != 0;
-	options.ExecuteTls = (pData->Flags & INJ_MM_EXECUTE_TLS) != 0;
+	PE_IMAGE::OPTIONS options = BuildPeValidationOptions(pData->Flags);
 
 	PE_IMAGE::VIEW view;
 	if (PE_IMAGE::Validate(pData->pRawData, pData->RawSize, IMAGE_FILE_MACHINE_AMD64, options, view) != FILE_ERR_SUCCESS)
@@ -1148,7 +1080,7 @@ DWORD __declspec(code_seg(".mmap_sec$03")) __stdcall MMI_RelocateImage(MANUAL_MA
 		auto * pRelocData = ReCa<IMAGE_BASE_RELOCATION *>(pData->pImageBase + pRelocDir->VirtualAddress);
 		auto * pRelocEnd = ReCa<BYTE *>(pRelocData) + pRelocDir->Size;
 
-		while (ReCa<BYTE *>(pRelocData) < pRelocEnd)
+		while (ReCa<BYTE *>(pRelocData) + sizeof(IMAGE_BASE_RELOCATION) <= pRelocEnd)
 		{
 			if (pRelocData->SizeOfBlock < sizeof(IMAGE_BASE_RELOCATION) ||
 				pRelocData->SizeOfBlock > static_cast<DWORD>(pRelocEnd - ReCa<BYTE *>(pRelocData)) ||
@@ -1911,23 +1843,51 @@ DWORD __declspec(code_seg(".mmap_sec$0A")) __stdcall MMI_HandleTLS(MANUAL_MAPPIN
 		// life of the target. The dummy is at most one page (bounded by the
 		// ldr_size guard above), so per the codebase's leak-on-uncertainty
 		// policy it is kept mapped rather than risk a dangling loader pointer.
-		// The success path below unlinks the entry first and can free safely.
+		// The paths below (which run only after LdrpHandleTlsData succeeded, so
+		// the list is well-formed) unlink the entry first and can free safely.
 		return static_cast<DWORD>(pData->ntRet);
 	}
 
 	
 	ULONG callback_count = 0;
+	DWORD tls_result = INJ_ERR_SUCCESS;
 	auto * pCallback = ReCa<PIMAGE_TLS_CALLBACK *>(pTLS->AddressOfCallBacks);
-	while (pCallback && MMI_InImage(pData, pCallback, sizeof(*pCallback)) && *pCallback && callback_count < 1024)
+	while (pCallback)
 	{
+		// Bound the array slot before reading it, and distinguish a real null
+		// terminator from a pointer that walked out of the image. Ending the
+		// loop on the latter would report SUCCESS with the remaining callbacks
+		// silently skipped, so fail closed instead.
+		if (!MMI_InImage(pData, pCallback, sizeof(*pCallback)))
+		{
+			tls_result = INJ_MM_ERR_TLS_CALLBACK_RANGE;
+			break;
+		}
+
 		auto Callback = *pCallback;
+		if (!Callback)
+		{
+			// Null terminator: the array ended normally.
+			break;
+		}
+
+		// A well-formed array is null-terminated, so a non-null entry this
+		// deep means the terminator is missing. Fail closed rather than
+		// truncate and report SUCCESS.
+		if (callback_count >= 1024)
+		{
+			tls_result = INJ_MM_ERR_TLS_CALLBACK_RANGE;
+			break;
+		}
+
 		if (!MMI_InImage(pData, ReCa<void *>(Callback), sizeof(BYTE)))
 		{
 			// A prefix of the callback array ran; silently dropping the rest
 			// would report SUCCESS for a half-initialized image (whose later
 			// callbacks never ran), so fail closed with a payload-specific
 			// code instead of break-to-SUCCESS.
-			return INJ_MM_ERR_TLS_CALLBACK_RANGE;
+			tls_result = INJ_MM_ERR_TLS_CALLBACK_RANGE;
+			break;
 		}
 
 		Callback(pData->pImageBase, DLL_PROCESS_ATTACH, nullptr);
@@ -1935,7 +1895,13 @@ DWORD __declspec(code_seg(".mmap_sec$0A")) __stdcall MMI_HandleTLS(MANUAL_MAPPIN
 		++pCallback;
 	}
 
-	
+	// The dummy LDR entry may be linked into LdrpTlsList by LdrpHandleTlsData.
+	// Unlink it on every exit from this point - success or failure - before
+	// returning: the shell frees the image on failure, and the dummy's DllBase
+	// points at that image, so a surviving list entry would reference freed
+	// memory for the life of the target. The walk matches by pointer identity,
+	// so it is a no-op when the entry was never linked.
+	bool unlinked = false;
 	if (f->LdrpTlsList)
 	{
 		auto current = f->LdrpTlsList->Flink;
@@ -1948,16 +1914,23 @@ DWORD __declspec(code_seg(".mmap_sec$0A")) __stdcall MMI_HandleTLS(MANUAL_MAPPIN
 			{
 				ReCa<LIST_ENTRY *>(entry_bytes)->Blink->Flink = ReCa<LIST_ENTRY *>(entry_bytes)->Flink;
 				ReCa<LIST_ENTRY *>(entry_bytes)->Flink->Blink = ReCa<LIST_ENTRY *>(entry_bytes)->Blink;
+				unlinked = true;
 
 				break;
 			}
 		}
 	}
 
-	
-	DeleteObject(f, pDummyLdr);
+	// Free the dummy only when the unlink actually removed it. If the entry
+	// was not found (e.g. the module-entry offset did not resolve), it may
+	// still be linked: leak it deliberately rather than leave a dangling
+	// TLS_ENTRY.ModuleEntry in LdrpTlsList.
+	if (unlinked)
+	{
+		DeleteObject(f, pDummyLdr);
+	}
 
-	return INJ_ERR_SUCCESS;
+	return tls_result;
 }
 
 DWORD __declspec(code_seg(".mmap_sec$0B")) __stdcall MMI_ExecuteDllMain(MANUAL_MAPPING_DATA * pData)
@@ -2398,20 +2371,6 @@ DWORD __declspec(code_seg(".mmap_sec$0E")) __stdcall MMI_CleanUp(MANUAL_MAPPING_
 	}
 
 	auto f = pData->FunctionTable;
-
-	// Forensic wipe of the staging block, which carries the operator's on-disk
-	// DLL path (the mapped image never does). This runs only if the shell
-	// reaches MMI_CleanUp. On SR_HT_ERR_RECOVERY_REQUIRED the host deliberately
-	// release()s the block (the release() site in ManualMapping.cpp and the
-	// release() sites in ThreadHijacking.cpp)
-	// because the shell may still be executing from it; if the shell never
-	// reaches this point, the wipe never runs and the path stays readable in
-	// the target. It is therefore best-effort, not a guarantee, and cannot be
-	// hoisted earlier: the block must stay intact while remote code may still
-	// run from it.
-	f->RtlZeroMemory(pData->szPathBuffer, sizeof(pData->szPathBuffer));
-	f->RtlZeroMemory(&pData->DllPath, sizeof(pData->DllPath));
-	f->RtlZeroMemory(pData->NtPathPrefix, sizeof(pData->NtPathPrefix));
 
 	if (pData->pFakeSEHDirectory)
 	{

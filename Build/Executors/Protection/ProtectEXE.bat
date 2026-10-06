@@ -48,7 +48,6 @@ set "WORK_DIR=%RELEASE_CACHE%\Protect"
 set "ASSET_TPL=%ROOT%\Assets\Template"
 set "SCRIPTS_DIR=%BUILD_DIR%\Scripts"
 set "BUILD_VMP_SCRIPT=%SCRIPTS_DIR%\BuildVMP.ps1"
-set "STRIP_SCRIPT=%SCRIPTS_DIR%\StripExporting.ps1"
 rem Kept outside WORK_DIR so the idempotency record survives the cleanup.
 set "STATE_FILE=%RELEASE_CACHE%\Protect.exe.state"
 set "VERIFY_SCRIPT=%BUILD_DIR%\Scripts\VerifyEmbedMagic.ps1"
@@ -78,9 +77,11 @@ if not exist "%OUT_ROOT%" (
 )
 set "TARGET="
 set "RUNTIME_DLL="
+set "EXE_CANDIDATES=0"
 for %%F in ("%OUT_ROOT%\*.exe") do call :consider_exe "%%~fF"
 if not defined TARGET goto :target_missing
 if not exist "%TARGET%" goto :target_missing
+if not "%EXE_CANDIDATES%"=="1" goto :target_ambiguous
 for %%N in ("%TARGET%") do set "TARGET_NAME=%%~nxN"
 rem The runtime DLL name is random per build (V-03): resolve it from the name
 rem state Create.bat recorded instead of assuming an rtdll_* prefix.
@@ -262,6 +263,7 @@ exit /b 0
 :consider_exe
 set "CANDIDATE=%~1"
 if not defined CANDIDATE exit /b 0
+set /a "EXE_CANDIDATES+=1"
 if defined TARGET exit /b 0
 set "TARGET=%CANDIDATE%"
 exit /b 0
@@ -478,7 +480,7 @@ goto :failure
 
 :vmp_missing
 echo   %C_RED%ERROR: VMProtect console not found.%C_RESET%
-echo   %C_YELLOW%       Searched:%%C_RESET%
+echo   %C_YELLOW%       Searched:%C_RESET%
 echo         %PROGRAMFILES%\VMProtect*\VMProtect_Con.exe
 echo         %PROGRAMW6432%\VMProtect*\VMProtect_Con.exe
 echo         %PROGRAMFILES(X86)%\VMProtect*\VMProtect_Con.exe
@@ -492,6 +494,14 @@ goto :failure
 
 :target_missing
 echo   %C_RED%ERROR: no launcher EXE found in the release folder.%C_RESET%
+goto :failure
+
+:target_ambiguous
+rem The release root must hold exactly one launcher EXE. A second one means a
+rem leftover or misnamed build output; silently virtualizing the first match
+rem could protect the wrong binary and leave the real launcher unmutated.
+echo   %C_RED%ERROR: expected exactly one launcher EXE in %OUT_ROOT%, found %EXE_CANDIDATES%.%C_RESET%
+echo   %C_RED%       Refusing to guess which EXE to protect.%C_RESET%
 goto :failure
 
 :project_missing

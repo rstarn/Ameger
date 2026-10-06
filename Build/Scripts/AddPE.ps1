@@ -33,6 +33,7 @@ foreach ($f in $Files) {
       } else {
         Write-Host ("FAILED: " + $f + " : " + $_.Exception.Message)
         $failed = $true
+        break
       }
     }
   }

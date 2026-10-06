@@ -34,8 +34,8 @@ set "MUTATE_SCRIPT=%SCRIPTS_DIR%\BuildPE.ps1"
 set "SEED_SCRIPT=%SCRIPTS_DIR%\CreateSeeds.ps1"
 set "CONFIG_SCRIPT=%SCRIPTS_DIR%\ProtectConfig.ps1"
 set "VERIFY_SCRIPT=%SCRIPTS_DIR%\VerifyEmbedMagic.ps1"
-set "NAMES_SCRIPT=%SCRIPTS_DIR%\GenerateNames.ps1"
-set "RENAME_SCRIPT=%SCRIPTS_DIR%\RenameExports.ps1"
+set "NAMES_SCRIPT=%SCRIPTS_DIR%\ShuffleNaming.ps1"
+set "RENAME_SCRIPT=%SCRIPTS_DIR%\ShuffleExports.ps1"
 rem Per-build deployed file names and the runtime export-rename map. Written
 rem here, consumed by :protect_config, and kept in Cache so the Protect stages
 rem that run after this script can resolve the deployed runtime DLL. It is
@@ -231,6 +231,20 @@ echo.
 
 echo [%C_GREEN%6%C_RESET%/%C_GREEN%6%C_RESET%] Sweeping intermediates into Cache and verifying...
 echo.
+rem The launcher name is hardcoded as "Host - x64.exe" throughout this script
+rem (verify, timestamp, mutation, manifest). Assert the release root really
+rem holds exactly that one EXE so a renamed or leftover second binary can never
+rem be silently ignored by every later step.
+set "EXE_COUNT=0"
+for %%F in ("%OUT64%\*.exe") do set /a "EXE_COUNT+=1"
+if not "%EXE_COUNT%"=="1" (
+  echo   %C_RED%ERROR: expected exactly one launcher EXE in %OUT64%, found %EXE_COUNT%.%C_RESET%
+  goto :verify_error
+)
+if not exist "%OUT64%\Host - x64.exe" (
+  echo   %C_RED%ERROR: expected launcher missing: %OUT64%\Host - x64.exe%C_RESET%
+  goto :verify_error
+)
 call :verify "%OUT64%\Host - x64.exe" "x64 Interface"
 if errorlevel 1 goto :verify_error
 call :verify_embed
@@ -240,6 +254,8 @@ if /i not "%AMEGER_ENCRYPT_CONFIG%"=="0" (
   if errorlevel 1 goto :verify_content_error
 )
 call :verify_deployed_pin
+if errorlevel 1 goto :verify_content_error
+call :verify_config_keys
 if errorlevel 1 goto :verify_content_error
 call :verify "%RUNTIME_DLL%" "x64 runtime"
 if errorlevel 1 goto :verify_error
@@ -263,14 +279,18 @@ if errorlevel 1 goto :timestamp_error
 if not exist "%MUTATE_SCRIPT%" goto :mutate_exe_error
 powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%MUTATE_SCRIPT%" "%OUT64%\Host - x64.exe"
 if errorlevel 1 goto :mutate_exe_error
+rem AddPE/BuildPE rewrite headers, section names, code-cave slack and the DOS
+rem stub. None of that should touch the .rdata runtime-hash dwords, but the
+rem earlier :verify_embed ran BEFORE these mutations; re-prove the embed here
+rem so a mutation that disturbed it fails closed instead of shipping.
+call :verify_embed
+if errorlevel 1 goto :verify_content_error
 
 rem The baseline must be recorded AFTER the EXE mutations above, not earlier:
 rem BuildPE.ps1 renames .text to .main and friends, so a manifest captured
 rem before that point would describe a binary that no longer exists.
 call :write_section_manifest
 if errorlevel 1 goto :manifest_error
-
-:timestamp_skipped
 echo.
 echo Build completed successfully.
 echo.
@@ -336,7 +356,7 @@ rem Draw the per-build deployed file names (V-02/V-03). Fail closed: a missing
 rem script, missing PowerShell or malformed output must abort rather than ship
 rem a stable name.
 if not exist "%NAMES_SCRIPT%" (
-  echo   %C_RED%ERROR: GenerateNames.ps1 not found; refusing to deploy stable names.%C_RESET%
+  echo   %C_RED%ERROR: ShuffleNaming.ps1 not found; refusing to deploy stable names.%C_RESET%
   exit /b 1
 )
 where powershell.exe >nul 2>&1
@@ -358,7 +378,7 @@ rem replacements, in place, and capture the rename map. Fail closed on a missing
 rem script or a script-reported failure: a stable export name on disk is exactly
 rem what this stage exists to remove.
 if not exist "%RENAME_SCRIPT%" (
-  echo   %C_RED%ERROR: RenameExports.ps1 not found; refusing to ship stable export names.%C_RESET%
+  echo   %C_RED%ERROR: ShuffleExports.ps1 not found; refusing to ship stable export names.%C_RESET%
   exit /b 1
 )
 where powershell.exe >nul 2>&1
@@ -397,9 +417,11 @@ set "PROJECT=%~1"
 set "ARCH=%~2"
 set "PROJECT_OUT=%~3"
 set "PROJECT_INT=%~4"
-set "TOOLSET_ARG=%~5"
-set "SDK_ARG=%~6"
-set "HASH_ARG=%~7"
+rem The toolset/SDK/hash arguments are consumed directly as %~5/%~6/%~7 on the
+rem MSBuild line below. They are deliberately NOT copied into the caller's
+rem globals here: re-assigning TOOLSET_ARG/SDK_ARG inside a called label would
+rem clobber the caller's values for no benefit (nothing in this label reads
+rem them by name).
 if not exist "%PROJECT%" exit /b 2
 if not exist "%PROJECT_OUT%" mkdir "%PROJECT_OUT%"
 if not exist "%PROJECT_OUT%" exit /b 2
@@ -432,6 +454,17 @@ rem deployed. A stale pin would make the launcher abort its startup hash check.
 rem The verifier decrypts the deployed config (or reads it plaintext under the
 rem explicit opt-out) and compares its PayloadSha256 to %DEPLOYED_SHA%.
 powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%VERIFY_SCRIPT%" -Check DeployedPin -Path "%OUT_ROOT%\Configuration.ini" -ExpectPin "%DEPLOYED_SHA%"
+exit /b %ERRORLEVEL%
+
+:verify_config_keys
+rem Fail closed: the shipped config must carry the per-build PayloadName,
+rem RuntimeName and ExportMap keys (V-02/V-03/V-32) the launcher uses to
+rem resolve the renamed runtime DLL and its renamed exports. A key silently
+rem dropped during the config merge would otherwise ship a config the launcher
+rem cannot use. The verifier decrypts the deployed config (or reads it
+rem plaintext under the explicit opt-out), so this runs regardless of the
+rem encryption opt-out.
+powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%VERIFY_SCRIPT%" -Check ConfigKeys -Path "%OUT_ROOT%\Configuration.ini"
 exit /b %ERRORLEVEL%
 
 :remove_import_artifacts
@@ -595,7 +628,6 @@ if not defined PAYLOAD_IS_PREPARED (
   echo   %C_YELLOW%[+]%C_RESET% Prepared payload deployed; master pin left pristine.%C_RESET%
 )
 echo   %C_GREEN%[+]%C_RESET% Payload deployed: %C_GREEN%%PAYLOAD_DEST%%C_RESET%
-powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -Command "Set-Clipboard -Value '%PAYLOAD_DEST%'" >nul 2>&1
 exit /b 0
 
 :write_section_manifest
@@ -712,7 +744,7 @@ echo %C_RED%ERROR: one or more expected binaries are missing.%C_RESET%
 goto :failure
 
 :verify_content_error
-echo %C_RED%ERROR: embedded runtime hash, config magic or deployed pin verification failed.%C_RESET%
+echo %C_RED%ERROR: embedded runtime hash, config magic, deployed pin or per-build config key verification failed.%C_RESET%
 goto :failure
 
 :cleanup_error

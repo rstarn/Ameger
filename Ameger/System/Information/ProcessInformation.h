@@ -29,8 +29,6 @@ class ProcessInformation
 	f_NtQuerySystemInformation	m_pNtQuerySystemInformation		= nullptr;
 	f_NtQueryInformationThread	m_pNtQueryInformationThread		= nullptr;
 
-	AMEGER_PEB					* GetPEB_Native();
-
 	UINT_PTR m_WaitFunctionReturnAddress[5] = { 0 };
 
 	HINSTANCE m_hWin32U = NULL;
@@ -63,8 +61,6 @@ public:
 	bool NextThread();
 
 	bool RefreshInformation();
-
-	AMEGER_PEB					* GetPEB();
 
 	DWORD GetThreadId();
 

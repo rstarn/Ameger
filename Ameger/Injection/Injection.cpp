@@ -40,7 +40,6 @@ namespace
 						Stats.DonorPid = GetCurrentProcessId();
 						Stats.GrantedAccess = AccessMask;
 						Stats.NewHandle = PtrToUlong(Duplicated);
-						Stats.SponsorState = 2;
 						Stats.SponsorProbed = (Flags & INJ_SKIP_SPONSOR_ROUNDTRIP) ? 0 : 1;
 						Stats.FailCode = INJ_ERR_SUCCESS;
 						RecordHijackOutcome(Stats, false);
@@ -55,7 +54,6 @@ namespace
 					}
 				}
 
-				Stats.SponsorState = 1;
 				LOG(0, "Sponsor handle failed validation\n");
 			}
 
@@ -67,7 +65,6 @@ namespace
 			if (!(Flags & INJ_NO_DONOR_SCAN))
 			{
 				HANDLE Hijacked = nullptr;
-				const DWORD SavedSponsorState = Stats.SponsorState;
 				const DWORD SavedSponsorValidated = Stats.SponsorValidated;
 				const DWORD SavedSponsorProbed = Stats.SponsorProbed;
 				const DWORD SavedDonorHandle = Stats.DonorHandle;
@@ -77,7 +74,6 @@ namespace
 				// validated as a handle to Pid above and carries DUP_HANDLE.
 				const DWORD HijackRet = HijackProcessHandle(Pid, AccessMask, Hijacked, &Stats,
 					SponsorValue ? ReCa<HANDLE>(SponsorValue) : nullptr);
-				Stats.SponsorState = SavedSponsorState;
 				Stats.SponsorValidated = SavedSponsorValidated;
 				Stats.SponsorProbed = SavedSponsorProbed;
 				if (Stats.Success == 0)
@@ -605,13 +601,6 @@ DWORD __stdcall Memory_Inject(MEMORY_INJECTIONDATA * pData) try
 		return INJ_ERR_ALREADY_RUNNING;
 	}
 
-	// Clear last run's telemetry so a failure this run cannot be reported as the
-	// previous run's success. String stats are excluded for the same reason as in
-	// Inject_Internal.
-	ResetHijackStats();
-	ResetMapStats();
-	ResetThreadExecStats();
-
 	if (!pData)
 	{
 		LOG(0, "pData is invalid\n");
@@ -633,6 +622,13 @@ DWORD __stdcall Memory_Inject(MEMORY_INJECTIONDATA * pData) try
 
 		return INJ_ERR_ALREADY_RUNNING;
 	}
+
+	// Clear last run's telemetry so a failure this run cannot be reported as the
+	// previous run's success. String stats are excluded for the same reason as in
+	// Inject_Internal.
+	ResetHijackStats();
+	ResetMapStats();
+	ResetThreadExecStats();
 
 	// Intentional: unlike InjectA/W (which operate on a private copy), the
 	// memory entry point normalises Mode/Flags and writes hDllOut back on the
@@ -927,20 +923,4 @@ INJECTIONDATA_INTERNAL::INJECTIONDATA_INTERNAL(const MEMORY_INJECTIONDATA * pDat
 	hThreadHandleValue	= pData->hThreadHandleValue;
 	GenerateErrorLog	= pData->GenerateErrorLog;
 	hDllOut				= NULL;
-}
-
-INJECTIONDATA_INTERNAL::INJECTIONDATA_INTERNAL()
-{
-	RawData				= nullptr;
-	RawSize				= 0;
-	ProcessID			= 0;
-	Mode				= INJECTION_MODE::IM_ManualMap;
-	Method				= LAUNCH_METHOD::LM_HijackThread;
-	Flags				= NULL;
-	Timeout				= 2000;
-	hHandleValue		= 0;
-	TargetTid			= 0;
-	hThreadHandleValue	= 0;
-	hDllOut				= NULL;
-	GenerateErrorLog	= true;
 }

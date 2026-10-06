@@ -16,12 +16,12 @@ namespace
 	// g_ThreadExecStats is written by the injection thread (field by field,
 	// plus ResetThreadExecStats) and read by the export/UI thread through
 	// GetLastThreadExecStats with no other synchronization, exactly like the
-	// g_LastMapStats slots in ManualMapping.cpp. A plain 40-byte struct copy is
-	// not atomic, so every whole-struct store/load goes through
+	// g_LastMapStats slots in ManualMapping.cpp. A plain struct copy is not
+	// atomic, so every whole-struct store/load goes through
 	// InterlockedExchange / InterlockedCompareExchange, and each field store is
 	// an InterlockedExchange - a compiler intrinsic on x64, no new import.
-	// THREAD_EXEC_STATS is ten DWORDs (static_assert in InjectionTypes.h), so a
-	// LONG-stride walk covers it exactly.
+	// THREAD_EXEC_STATS is four DWORDs (static_assert in InjectionTypes.h), so
+	// a LONG-stride walk covers it exactly.
 	void StoreThreadExecStat(DWORD & Field, DWORD Value)
 	{
 		InterlockedExchange(ReCa<volatile LONG *>(&Field), static_cast<LONG>(Value));
@@ -243,10 +243,14 @@ DWORD SR_HijackThread(HANDLE hTargetProc, f_Routine pRoutine, void * pArg, DWORD
 			// this check (or vice versa) if the PDB ever resolved Running to
 			// a different value. Fail-closed either way - a sponsor still
 			// must be alertable or Running.
-			const KTHREAD_STATE running_state = static_cast<KTHREAD_STATE>(g_DynamicOffsets.ThreadStateRunning);
 			sponsor_usable = false;
-			if (processInformation.SetProcess(hTargetProc))
+			// Same gate as FindHijackThread: the Running value is
+			// download-dependent, so when the offsets are not ready the
+			// sponsor cannot be proven alertable/Running. Refuse it and fall
+			// through to the search, which refuses too.
+			if (g_DynamicOffsetsReady.load(std::memory_order_acquire) && processInformation.SetProcess(hTargetProc))
 			{
+				const KTHREAD_STATE running_state = static_cast<KTHREAD_STATE>(g_DynamicOffsets.ThreadStateRunning);
 				// Bounded re-validation on fresh snapshots. A TID seen as a
 				// loader worker gets exactly one verdict (stable property -
 				// retrying cannot change it). Absence or a
@@ -344,7 +348,6 @@ DWORD SR_HijackThread(HANDLE hTargetProc, f_Routine pRoutine, void * pArg, DWORD
 				// (Injection.cpp): the identity/state check passed, the
 				// sponsor was used, and its probe ran (unless the caller
 				// opted out of the sponsor roundtrip).
-				Stats.SponsorState = 2;
 				Stats.SponsorValidated = 1;
 				Stats.SponsorProbed = (Flags & INJ_SKIP_SPONSOR_ROUNDTRIP) ? 0 : 1;
 				Stats.FailCode = INJ_ERR_SUCCESS;
@@ -718,11 +721,6 @@ DWORD SR_HijackThread(HANDLE hTargetProc, f_Routine pRoutine, void * pArg, DWORD
 		return SR_HT_ERR_GET_CONTEXT_FAIL;
 	}
 
-	// Recorded only after the capture actually succeeded, so the host reports
-	// whether the original context was captured rather than asserting a
-	// restore happened.
-	StoreThreadExecStat(g_ThreadExecStats.ContextSaved, 1);
-
 	// The stub body (alloc, patch) is already staged above while the victim
 	// ran free; only the ReturnTarget slot needs the captured RIP, so it is
 	// patched below inside the frozen window.
@@ -836,11 +834,6 @@ DWORD SR_HijackThread(HANDLE hTargetProc, f_Routine pRoutine, void * pArg, DWORD
 	}
 
 	LOG(2, "Thread resumed\n");
-
-	// 0 means the thread had actually been suspended, so the hijack is complete
-	// from the loader's point of view. The RIP is restored by the remote shell.
-	StoreThreadExecStat(g_ThreadExecStats.Resumed, 1);
-	StoreThreadExecStat(g_ThreadExecStats.SuspendCount, sr_resume);
 
 	// Wake the resumed victim. The hijack accepts a thread that is either
 	// Running or in an alertable wait (the sponsor/search gate). A Running
@@ -984,10 +977,7 @@ DWORD SR_HijackThread(HANDLE hTargetProc, f_Routine pRoutine, void * pArg, DWORD
 			// that observed the stub frame unwound counts; a thread still inside
 			// the stub means the shell may still be live, so escalate to
 			// recovery-required instead of claiming a clean abort.
-			StoreThreadExecStat(g_ThreadExecStats.ContextRestored, context_restored ? 1 : 0);
-			StoreThreadExecStat(g_ThreadExecStats.Resumed, resumed ? 1 : 0);
 			StoreThreadExecStat(g_ThreadExecStats.Success, (context_restored && resumed) ? 1 : 0);
-			StoreThreadExecStat(g_ThreadExecStats.RestoreMode, 2);
 			StoreThreadExecStat(g_ThreadExecStats.FailCode, context_restored ? error_data.AdvErrorCode : SR_HT_ERR_RECOVERY_REQUIRED);
 
 			SetEvent(g_hInterruptedEvent);
@@ -1036,10 +1026,7 @@ DWORD SR_HijackThread(HANDLE hTargetProc, f_Routine pRoutine, void * pArg, DWORD
 		// left running, so the mode stays unverified and the outcome escalates
 		// to recovery-required rather than reporting a restore that did not
 		// happen.
-		StoreThreadExecStat(g_ThreadExecStats.ContextRestored, context_restored ? 1 : 0);
-		StoreThreadExecStat(g_ThreadExecStats.Resumed, resumed ? 1 : 0);
 		StoreThreadExecStat(g_ThreadExecStats.Success, (context_restored && resumed) ? 1 : 0);
-		StoreThreadExecStat(g_ThreadExecStats.RestoreMode, 2);
 		StoreThreadExecStat(g_ThreadExecStats.FailCode, context_restored ? SR_HT_ERR_RPM_FAIL : SR_HT_ERR_RECOVERY_REQUIRED);
 
 		return context_restored ? SR_HT_ERR_RPM_FAIL : SR_HT_ERR_RECOVERY_REQUIRED;
@@ -1069,10 +1056,7 @@ DWORD SR_HijackThread(HANDLE hTargetProc, f_Routine pRoutine, void * pArg, DWORD
 		// observed the stub frame unwound is reported as pending-timeout; a
 		// thread still inside the stub escalates to recovery-required because
 		// the shell may still be live in the target.
-		StoreThreadExecStat(g_ThreadExecStats.ContextRestored, context_restored ? 1 : 0);
-		StoreThreadExecStat(g_ThreadExecStats.Resumed, resumed ? 1 : 0);
 		StoreThreadExecStat(g_ThreadExecStats.Success, (context_restored && resumed) ? 1 : 0);
-		StoreThreadExecStat(g_ThreadExecStats.RestoreMode, 2);
 		StoreThreadExecStat(g_ThreadExecStats.FailCode, context_restored ? SR_HT_ERR_REMOTE_PENDING_TIMEOUT : SR_HT_ERR_RECOVERY_REQUIRED);
 
 		if (context_restored)
@@ -1158,9 +1142,7 @@ DWORD SR_HijackThread(HANDLE hTargetProc, f_Routine pRoutine, void * pArg, DWORD
 	// frame unwound. Recorded here rather than at the call site so the host
 	// reports this measured outcome instead of a hardcoded "restored
 	// automatically".
-	StoreThreadExecStat(g_ThreadExecStats.ContextRestored, context_restored ? 1 : 0);
 	StoreThreadExecStat(g_ThreadExecStats.Success, context_restored ? 1 : 0);
-	StoreThreadExecStat(g_ThreadExecStats.RestoreMode, 1); // verified: RIP outside, or frame-validated in-page restore
 	StoreThreadExecStat(g_ThreadExecStats.FailCode, context_restored ? ERROR_SUCCESS : SR_HT_ERR_RECOVERY_REQUIRED);
 
 	return context_restored ? SR_ERR_SUCCESS : SR_HT_ERR_RECOVERY_REQUIRED;

@@ -85,8 +85,6 @@ struct MEMORY_INJECTIONDATA
 // was removed entirely. SEH (0x00100000) is inverted table +
 // RtlAddFunctionTable + fake dir only, with zero VEH handlers.
 
-#define MM_DEFAULT (INJ_MM_RESOLVE_IMPORTS | INJ_MM_RESOLVE_DELAY_IMPORTS | INJ_MM_INIT_SECURITY_COOKIE | INJ_MM_EXECUTE_TLS | INJ_MM_ENABLE_EXCEPTIONS | INJ_MM_RUN_DLL_MAIN | INJ_MM_SET_PAGE_PROTECTIONS | INJ_MM_RUN_UNDER_LDR_LOCK)
-
 // Last handle-acquisition outcome (HijackSource / HijackStats live in
 // Core/Foundation/Primitives/InjectionTypes.h, included above).
 

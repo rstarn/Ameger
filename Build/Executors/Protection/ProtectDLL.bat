@@ -55,14 +55,14 @@ set "WORK_DIR=%RELEASE_CACHE%\Protect"
 set "ASSET_TPL=%ROOT%\Assets\Template"
 set "SCRIPTS_DIR=%BUILD_DIR%\Scripts"
 set "BUILD_VMP_SCRIPT=%SCRIPTS_DIR%\BuildVMP.ps1"
-set "STRIP_SCRIPT=%SCRIPTS_DIR%\StripExporting.ps1"
+set "STRIP_SCRIPT=%SCRIPTS_DIR%\StripExportDirs.ps1"
 rem State lives beside WORK_DIR, not inside it, because WORK_DIR is deleted at
 rem the end of every run. Deleting the state would make the script reprotect
 rem an already-protected payload on the next invocation.
 set "STATE_FILE=%RELEASE_CACHE%\Protect.payload.state"
 set "CONFIG_MASTER=%BUILD_DIR%\Configuration.ini"
 set "PAYLOAD_ASSET=%ROOT%\Assets\DLL\Jlov.dll"
-set "CONFIG_SCRIPT=%BUILD_DIR%\Scripts\ProtectConfig.ps1"
+set "CONFIG_SCRIPT=%SCRIPTS_DIR%\ProtectConfig.ps1"
 set "DEPLOYED_CONFIG=%OUT_ROOT%\Configuration.ini"
 rem Per-build deployed names (V-02/V-03). Create.bat records these before the
 rem Protect stages run; they name the payload and runtime DLL on disk. Fail
@@ -75,7 +75,6 @@ rem "Host - x64.exe.vmp", and a plain scan can hand this stage the wrong project
 set "PAYLOAD_ORIGINAL_NAME=Jlov.dll"
 set "PAYLOAD_NAME="
 set "RUNTIME_NAME="
-set "EXPORT_MAP="
 set "VMP_PROJECT="
 set "TARGET_NAME="
 set "VMP_CON="
@@ -98,9 +97,11 @@ if not exist "%DLL_DIR%" (
   goto :failure
 )
 set "TARGET="
+set "DLL_CANDIDATES=0"
 for %%F in ("%DLL_DIR%\*.dll") do call :consider_dll "%%~fF"
 if not defined TARGET goto :target_missing
 if not exist "%TARGET%" goto :target_missing
+if not "%DLL_CANDIDATES%"=="1" goto :target_ambiguous
 for %%N in ("%TARGET%") do set "TARGET_NAME=%%~nxN"
 echo   %C_GREEN%[+]%C_RESET% Target:  %C_GREEN%%TARGET%%C_RESET%
 echo   %C_GREEN%[+]%C_RESET% Skipped: %C_YELLOW%%RUNTIME_NAME% (manual-mapped, never virtualized)%C_RESET%
@@ -293,6 +294,7 @@ rem skipping the recorded runtime name leaves the payload.
 set "CANDIDATE=%~1"
 if not defined CANDIDATE exit /b 0
 if /i "%~nx1"=="%RUNTIME_NAME%" exit /b 0
+set /a "DLL_CANDIDATES+=1"
 if defined TARGET exit /b 0
 set "TARGET=%CANDIDATE%"
 exit /b 0
@@ -499,7 +501,6 @@ rem random name cannot be guessed, so without it the payload cannot be told
 rem apart from the runtime DLL and the wrong file could be virtualized.
 set "PAYLOAD_NAME="
 set "RUNTIME_NAME="
-set "EXPORT_MAP="
 if not exist "%NAMES_STATE%" exit /b 1
 for /f "usebackq tokens=1,* delims==" %%A in ("%NAMES_STATE%") do set "%%A=%%B"
 if not defined PAYLOAD_NAME exit /b 1
@@ -531,7 +532,7 @@ goto :failure
 
 :vmp_missing
 echo   %C_RED%ERROR: VMProtect console not found.%C_RESET%
-echo   %C_YELLOW%       Searched:%%C_RESET%
+echo   %C_YELLOW%       Searched:%C_RESET%
 echo         %PROGRAMFILES%\VMProtect*\VMProtect_Con.exe
 echo         %PROGRAMW6432%\VMProtect*\VMProtect_Con.exe
 echo         %PROGRAMFILES(X86)%\VMProtect*\VMProtect_Con.exe
@@ -550,6 +551,14 @@ goto :failure
 
 :target_missing
 echo   %C_RED%ERROR: no virtualizable payload DLL found in the release folder.%C_RESET%
+goto :failure
+
+:target_ambiguous
+rem The release DLL folder must hold exactly one payload DLL plus the recorded
+rem runtime DLL. A second candidate means a leftover or misnamed build output;
+rem silently protecting the first match could virtualize the wrong file.
+echo   %C_RED%ERROR: expected exactly one virtualizable payload DLL in %DLL_DIR%, found %DLL_CANDIDATES%.%C_RESET%
+echo   %C_RED%       Refusing to guess which DLL to protect.%C_RESET%
 goto :failure
 
 :project_missing

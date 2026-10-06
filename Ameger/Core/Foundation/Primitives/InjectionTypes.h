@@ -57,7 +57,6 @@ struct HijackStats
 	// Foreign-donor scan accounting
 	DWORD TotalHandles = 0;     // raw table entries before filtering
 	DWORD Examined = 0;         // entries that passed the type filter
-	DWORD Duplicated = 0;       // successful duplications
 	DWORD DupDenied = 0;        // duplications refused (donor lacked rights)
 	DWORD VerifyRejected = 0;   // dups that failed functional verification
 	DWORD OwnersOpened = 0;     // distinct donor processes opened (failures included)
@@ -67,12 +66,11 @@ struct HijackStats
 
 	// Sponsor pre-open accounting (process handle; threads are pre-opened by
 	// the interface too and recorded here when the sponsor thread is used)
-	DWORD SponsorState = 0;      // 0 = absent, 1 = present but invalid, 2 = used
 	DWORD SponsorValidated = 0;  // identity + name query passed
 	DWORD SponsorProbed = 0;     // full alloc/write/read/release roundtrip passed
 };
 
-static_assert(sizeof(HijackStats) == 80);
+static_assert(sizeof(HijackStats) == 72);
 
 // What the thread-hijack shell did to the victim thread, recorded in the target
 // and read back by the host (see GetLastThreadExecStats).
@@ -86,22 +84,10 @@ struct THREAD_EXEC_STATS
 	DWORD Attempted = 0;        // 1 when the thread-hijack path was entered
 	DWORD Success = 0;          // 1 when the thread is back on its own code
 	DWORD HijackedTid = 0;      // thread that was hijacked
-	DWORD ContextSaved = 0;     // 1 when the original CONTEXT was captured
-	DWORD ContextRestored = 0;  // 1 when it was reinstated
-	DWORD Resumed = 0;          // 1 when the thread was resumed afterwards
-	DWORD SuspendCount = 0;     // ResumeThread return at the end: 0 = was suspended
 	DWORD FailCode = 0;         // injector error code when Success == 0
-	// How the RIP was put back. The normal path watches the thread until RIP
-	// lands outside the hijack code page; the abort/timeout paths relocate the
-	// saved RIP only after observing the stub frame unwound (RSP back at the
-	// captured baseline) or the thread already left the code page. Reporting
-	// both as "restored" without this distinction would blur a direct
-	// observation with a frame-validated forced restore.
-	DWORD RestoreMode = 0;      // 1 = verified (RIP observed outside), 2 = forced (frame-validated)
-	DWORD Reserved = 0;
 };
 
-static_assert(sizeof(THREAD_EXEC_STATS) == 40);
+static_assert(sizeof(THREAD_EXEC_STATS) == 16);
 
 // What the manual-map shell actually cleaned from the mapped image, recorded by
 // the shell in the target and read back by the host after the shell returns.

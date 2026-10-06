@@ -65,6 +65,12 @@ ProcessInformation::ProcessInformation()
 		}
 	}
 
+	// NtUserMsgWaitForMultipleObjectsEx is the 5th wait stub (arg3 -> R9, see
+	// IsThreadInAlertableState). The build floor here is always satisfied:
+	// GetSupportedWindowsLayout (enforced at startup) rejects everything below
+	// Windows 11 21H2 (22000), which is already far above the 1607 that first
+	// exposed this export. The guard is kept as an explicit platform floor, not
+	// because it can currently be false.
 	if (GetOSBuildVersion() >= g_Windows10_1607)
 	{
 		auto win32u_name = XOR_STR_W(L"win32u.dll");
@@ -253,30 +259,6 @@ bool ProcessInformation::RefreshInformation()
 	return true;
 }
 
-AMEGER_PEB * ProcessInformation::GetPEB()
-{
-	return GetPEB_Native();
-}
-
-AMEGER_PEB * ProcessInformation::GetPEB_Native()
-{
-	if (!m_pFirstProcess || !m_pNtQueryInformationProcess)
-	{
-		return nullptr;
-	}
-
-	PROCESS_BASIC_INFORMATION PBI{ 0 };
-	ULONG size_out = 0;
-	NTSTATUS ntRet = m_pNtQueryInformationProcess(m_hCurrentProcess, PROCESSINFOCLASS::ProcessBasicInformation, &PBI, sizeof(PROCESS_BASIC_INFORMATION), &size_out);
-
-	if (NT_FAIL(ntRet))
-	{
-		return nullptr;
-	}
-
-	return PBI.pPEB;
-}
-
 DWORD ProcessInformation::GetThreadId()
 {
 	if (!m_pCurrentThread)
@@ -435,10 +417,13 @@ bool ProcessInformation::IsThreadInAlertableState()
 
 bool ProcessInformation::IsThreadWorkerThread()
 {
-		if (!m_pCurrentThread)
-		{
-			return false;
-		}
+	// Fail closed whenever the thread cannot be classified: treat it as a
+	// worker so the caller skips it rather than hijacking on a guess. This
+	// matches the missing-offsets guard below.
+	if (!m_pCurrentThread)
+	{
+		return true;
+	}
 
 	// Fail-closed when the PDB offsets are not ready: treat as worker so the
 	// thread is skipped rather than hijacked on a stale guess.
@@ -449,7 +434,8 @@ bool ProcessInformation::IsThreadWorkerThread()
 	BYTE * teb = ReCa<BYTE *>(GetTEB());
 	if (!teb)
 	{
-		return false;
+		// Unreadable TEB: cannot prove this is not a loader worker.
+		return true;
 	}
 
 	USHORT TebInfo = 0;
@@ -458,6 +444,7 @@ bool ProcessInformation::IsThreadWorkerThread()
 		return ((TebInfo & g_DynamicOffsets.SameTebFlagsLoaderWorkerMask) != 0);
 	}
 
-	return false;
+	// TEB present but its flags are unreadable: same fail-closed verdict.
+	return true;
 }
 

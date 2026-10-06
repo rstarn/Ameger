@@ -13,19 +13,6 @@ namespace
 {
 
 SRWLOCK g_ErrorLogLock = SRWLOCK_INIT;
-
-PE_IMAGE::OPTIONS GetPeValidationOptions(DWORD flags)
-{
-	PE_IMAGE::OPTIONS options;
-	options.RequireDll = true;
-	options.RequireRelocations = true;
-	options.ResolveImports = (flags & (INJ_MM_RESOLVE_IMPORTS | INJ_MM_RUN_DLL_MAIN)) != 0;
-	options.ResolveDelayImports = (flags & INJ_MM_RESOLVE_DELAY_IMPORTS) != 0;
-	options.EnableExceptions = (flags & INJ_MM_ENABLE_EXCEPTIONS) != 0;
-	options.InitializeSecurityCookie = (flags & INJ_MM_INIT_SECURITY_COOKIE) != 0;
-	options.ExecuteTls = (flags & INJ_MM_EXECUTE_TLS) != 0;
-	return options;
-}
 }
 
 namespace
@@ -203,7 +190,7 @@ DWORD ValidateDllFile(const std::wstring & FilePath, DWORD target_machine, DWORD
 		}
 
 		PE_IMAGE::VIEW view;
-		const DWORD validation_result = PE_IMAGE::Validate(data.data(), data.size(), target_machine, GetPeValidationOptions(flags), view);
+		const DWORD validation_result = PE_IMAGE::Validate(data.data(), data.size(), target_machine, BuildPeValidationOptions(flags), view);
 		if (validation_result != FILE_ERR_SUCCESS)
 		{
 			LOG(1, "PE validation failed: %08X\n", validation_result);
@@ -229,7 +216,7 @@ DWORD ValidateDllFileInMemory(const BYTE * RawData, DWORD RawSize, DWORD target_
 	}
 
 	PE_IMAGE::VIEW view;
-	const DWORD validation_result = PE_IMAGE::Validate(RawData, RawSize, target_machine, GetPeValidationOptions(flags), view);
+	const DWORD validation_result = PE_IMAGE::Validate(RawData, RawSize, target_machine, BuildPeValidationOptions(flags), view);
 	if (validation_result != FILE_ERR_SUCCESS)
 	{
 		LOG(1, "PE validation failed: %08X\n", validation_result);

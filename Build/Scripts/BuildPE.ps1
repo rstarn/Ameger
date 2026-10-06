@@ -235,7 +235,11 @@ function Invoke-MutateRichHeader([byte[]]$Data, $Layout) {
     }
     if ($rich -lt 0) { return "Rich Header - not found (skipped)" }
     $xorKey = Read-UInt32 $Data ($rich + 4)
-    $dansXored = 0x534E6144 -bxor $xorKey
+    # "DanS" is stored as four ASCII bytes (D,a,n,S = 44 61 6E 53) and read
+    # back little-endian, so the uint32 the scanner must match is 0x536E6144.
+    # The former 0x534E6144 decoded to "DaNS", so the marker was never found
+    # and the wipe silently fell back to 0x80 instead of the DanS offset.
+    $dansXored = 0x536E6144 -bxor $xorKey
     $dans = -1
     for ($i = 0x80; $i -lt $rich; $i += 4) {
         if ((Read-UInt32 $Data $i) -eq $dansXored) {
@@ -522,6 +526,7 @@ try {
                 } else {
                     Write-Host ("  " + (Get-Painted $script:C_Red ("[x] Read failed: " + $f + " : " + $_.Exception.Message)))
                     $failed = $true
+                    break
                 }
             }
         }
@@ -599,6 +604,7 @@ try {
                 } else {
                     Write-Host ("  " + (Get-Painted $script:C_Red ("[x] Write failed: " + $f + " : " + $_.Exception.Message)))
                     $failed = $true
+                    break
                 }
             }
         }

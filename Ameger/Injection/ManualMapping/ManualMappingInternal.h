@@ -30,9 +30,6 @@ typedef struct _MM_DEPENDENCY_RECORD
 	struct _MM_DEPENDENCY_RECORD * Prev = nullptr;
 
 	HANDLE DllHandle = nullptr;
-	UNICODE_STRING DllName{ 0 };
-	wchar_t Buffer[0x100] { 0 };
-	
 } MM_DEPENDENCY_RECORD;
 
 DWORD __declspec(code_seg(".mmap_sec$01")) __stdcall ManualMapping_Shell		(MMAP_NATIVE::MANUAL_MAPPING_DATA * pData);
@@ -142,14 +139,6 @@ namespace MMAP_NATIVE
 		ALIGN NTSTATUS	ntRet		= STATUS_SUCCESS;
 
 
-		ALIGN UNICODE_STRING DllPath{ 0 };
-		ALIGN wchar_t szPathBuffer[MAX_PATH]{ 0 };
-
-		ALIGN wchar_t NtPathPrefix[8] = L"\\??\\\0\0\0";
-
-		ALIGN DWORD OSVersion		= 0;
-		ALIGN DWORD OSBuildNumber	= 0;
-
 		ALIGN void				*	pFakeSEHDirectory	= nullptr;
 
 		// Set by MMI_EnableExceptions only when RtlAddFunctionTable actually
@@ -211,8 +200,9 @@ __forceinline T * NewObject(MMAP_NATIVE::MANUAL_MAPPING_FUNCTION_TABLE * f, size
 	return ReCa<T *>(f->RtlAllocateHeap(f->pLdrpHeap, HEAP_ZERO_MEMORY, sizeof(T) * Count));
 }
 
-// Download-dependent allocation: byte count comes from the PDB-resolved
-// NtOffsets (e.g. LdrEntrySize), never sizeof(static struct).
+// Download-dependent allocation: the byte count normally comes from the
+// PDB-resolved NtOffsets (e.g. LdrEntrySize / LdrpPathSearchContextSize) and
+// falls back to sizeof(static struct) only when the PDB lacked the type.
 __forceinline void * NewBytes(MMAP_NATIVE::MANUAL_MAPPING_FUNCTION_TABLE * f, SIZE_T Size)
 {
 	if (!f || !f->RtlAllocateHeap || !f->pLdrpHeap || !Size || Size > 0x10000)

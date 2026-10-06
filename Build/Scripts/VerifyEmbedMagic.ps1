@@ -1,6 +1,6 @@
 # Post-build integration verifier for Ameger Injector.
 #
-# Create.bat calls this after the interface EXE is built. Four checks, all
+# Create.bat calls this after the interface EXE is built. Five checks, all
 # fatal (exit 1) on failure:
 #   Embed - the interface EXE must contain the runtime DLL's 8 SHA-256 words
 #           (AmegerRuntimeHash0..7, passed from Create.bat) as little-endian
@@ -16,11 +16,16 @@
 #   DeployedPin - the shipped Configuration.ini (DPAPI-encrypted, or plaintext
 #           under the explicit opt-out) must pin the exact payload digest that
 #           ships beside it, so the launcher's startup hash check passes.
+#   ConfigKeys - the shipped Configuration.ini (encrypted or plaintext) must
+#           carry non-empty PayloadName, RuntimeName and ExportMap keys, which
+#           the launcher needs to resolve the renamed runtime DLL and its
+#           renamed exports. A key silently dropped during the config merge
+#           would otherwise ship a config the launcher cannot use.
 #
 # Exit code 0 = verified, 1 = fatal.
 param(
     [Parameter(Mandatory = $true)]
-    [ValidateSet("Embed", "Magic", "PayloadHash", "DeployedPin")]
+    [ValidateSet("Embed", "Magic", "PayloadHash", "DeployedPin", "ConfigKeys")]
     [string]$Check,
 
     [Parameter(Mandatory = $true)]
@@ -200,6 +205,55 @@ if ($Check -eq "DeployedPin") {
         exit 1
     }
     Write-Ok ("Deployed config pin: " + (Get-Painted $script:C_Green $pin) + " (" + (Get-Painted $script:C_Dim $Path) + ")")
+    exit 0
+}
+
+if ($Check -eq "ConfigKeys") {
+    # Recover the config text exactly like DeployedPin: the deployed file may
+    # be DPAPI-encrypted (magic-prefixed) or plaintext (explicit opt-out).
+    $magicBytes = [Text.Encoding]::ASCII.GetBytes("SYSCFG01")
+    $isEncrypted = $false
+    if ($data.Length -gt $magicBytes.Length) {
+        $isEncrypted = $true
+        for ($i = 0; $i -lt $magicBytes.Length; $i++) {
+            if ($data[$i] -ne $magicBytes[$i]) { $isEncrypted = $false; break }
+        }
+    }
+    if ($isEncrypted) {
+        Add-Type -AssemblyName System.Security | Out-Null
+        try {
+            $blob = New-Object byte[] ($data.Length - $magicBytes.Length)
+            [Array]::Copy($data, $magicBytes.Length, $blob, 0, $blob.Length)
+            $plainBytes = [Security.Cryptography.ProtectedData]::Unprotect($blob, $null, [Security.Cryptography.DataProtectionScope]::CurrentUser)
+        } catch {
+            Write-Fail ("DPAPI decrypt failed: " + $_.Exception.Message)
+            exit 1
+        }
+        $text = [Text.Encoding]::UTF8.GetString($plainBytes)
+    } else {
+        $text = [Text.Encoding]::UTF8.GetString($data)
+    }
+
+    # The launcher resolves the deployed runtime DLL and its renamed exports
+    # from these three keys, so each must be present and non-empty. Key match
+    # is case-insensitive, matching the runtime's own ini reader.
+    $present = @{}
+    foreach ($line in ($text -split "\r?\n")) {
+        $trimmed = $line.Trim()
+        if ($trimmed.Length -eq 0 -or $trimmed.StartsWith(";") -or $trimmed.StartsWith("#")) { continue }
+        $eq = $trimmed.IndexOf("=")
+        if ($eq -lt 1) { continue }
+        $k = $trimmed.Substring(0, $eq).Trim()
+        $v = $trimmed.Substring($eq + 1).Trim()
+        if ($k -ieq "PayloadName" -or $k -ieq "RuntimeName" -or $k -ieq "ExportMap") { $present[$k] = $v }
+    }
+    foreach ($k in @("PayloadName", "RuntimeName", "ExportMap")) {
+        if (-not $present.ContainsKey($k) -or [string]::IsNullOrEmpty($present[$k])) {
+            Write-Fail ("Deployed config is missing required key: " + $k + " (" + (Get-Painted $script:C_Dim $Path) + ")")
+            exit 1
+        }
+    }
+    Write-Ok ("Deployed config carries per-build keys: PayloadName, RuntimeName, ExportMap (" + (Get-Painted $script:C_Dim $Path) + ")")
     exit 0
 }
 

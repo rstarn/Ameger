@@ -116,10 +116,10 @@ DWORD ResolveImports(ERROR_DATA & error_data)
 		return INJ_ERR_GET_MODULE_HANDLE_FAIL;
 	}
 
-	// No literal module name here: DEBUG_INFO is on unconditionally, so any
-	// plaintext in a LOG format string lands in .rdata and is caught by the
-	// interface's string-encryption gate. The name itself is already known
-	// from the line above.
+	// No literal module name here: an instrumented build's LOG format strings
+	// land in .rdata as plaintext and are caught by the interface's
+	// string-encryption gate. The name itself is already known from the line
+	// above.
 	LOG(1, "native OS module    loaded at %p\n", g_hNTDLL);
 	LOG(1, "OSVersion = %lu\nOSBuildVersion = %lu\n", GetOSVersion(), GetOSBuildVersion());
 

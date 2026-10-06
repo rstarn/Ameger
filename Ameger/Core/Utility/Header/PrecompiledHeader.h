@@ -52,17 +52,8 @@
 
 #define EXPORT_FUNCTION(export_name, link_name) comment(linker, "/EXPORT:" export_name "=" link_name)
 
-// Stealth: never embed compile-time paths or function names in .rdata.
-// __FILEW__ expands to the full build-machine path per TU and would linger
-// in the binary even when stripped at runtime via wcsrchr. Same for
-// __FUNCTIONW__ (internal names). Error telemetry keeps Line + codes only.
-#define __FILENAMEW__ (L"")
-
 #define ALIGN_8 __declspec(align(8))
 #define ALIGN ALIGN_8
-
-#define DEBUG_INFO
-#define CUSTOM_PRINT
 
 using f_raw_print_callback = void(__stdcall *)(const char * szText);
 inline std::atomic<f_raw_print_callback> g_print_raw_callback{nullptr};
