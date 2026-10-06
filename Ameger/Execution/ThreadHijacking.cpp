@@ -211,6 +211,13 @@ DWORD SR_HijackThread(HANDLE hTargetProc, f_Routine pRoutine, void * pArg, DWORD
 	// unvalidated sponsor is how a never-scheduled TID burns the full
 	// timeout as SR_HT_ERR_REMOTE_PENDING_TIMEOUT (0x1020000B, State stays
 	// Pending). Stealth flags are untouched by this check.
+	// Validation re-reads a fresh snapshot a bounded number of times: the
+	// interface pick is itself a snapshot, and a live game's threads flip
+	// Waiting/Running on millisecond timescales, so a single read can reject
+	// a TID the search would accept a moment later (the donor-scan fallback
+	// then converges on that same TID anyway, as the extra enumeration
+	// buys nothing). Retrying the strict gate on fresh snapshots keeps the
+	// zero-enumeration path without weakening it.
 	if ((Flags & INJ_HANDLE_HIJACKING) && SponsorThread && SponsorTid)
 	{
 		const HANDLE Sponsor = ReCa<HANDLE>(SponsorThread);
@@ -240,42 +247,75 @@ DWORD SR_HijackThread(HANDLE hTargetProc, f_Routine pRoutine, void * pArg, DWORD
 			sponsor_usable = false;
 			if (processInformation.SetProcess(hTargetProc))
 			{
-				// Publish the duplicate we already validated so GetTEB and the
-				// alertable check reuse it instead of opening a second handle on
-				// the same target thread.
-				processInformation.SetCurrentThreadHandle(Duplicated, SponsorTidActual);
-				do
+				// Bounded re-validation on fresh snapshots. A TID seen as a
+				// loader worker gets exactly one verdict (stable property -
+				// retrying cannot change it). Absence or a
+				// not-alertable/non-Running state is transient on a churning
+				// target, so those re-read (same cadence as the search loop
+				// below: refresh + 25 ms). No new handles on any pass: the
+				// borrowed dup is reused, and everything before the suspend
+				// runs while the victim is unfrozen, so the retries cost no
+				// frozen-window time.
+				constexpr int kSponsorValidationPasses = 6;
+				bool sponsor_worker = false;
+				for (int sponsor_pass = 0;
+					sponsor_pass < kSponsorValidationPasses && !sponsor_usable && !sponsor_worker;
+					++sponsor_pass)
 				{
+					if (sponsor_pass > 0)
+					{
+						Sleep(25);
+						if (!processInformation.RefreshInformation() || !processInformation.SetProcess(hTargetProc))
+						{
+							break;
+						}
+					}
+					// Publish the duplicate we already validated so GetTEB and the
+					// alertable check reuse it instead of opening a second handle on
+					// the same target thread.
+					processInformation.SetCurrentThreadHandle(Duplicated, SponsorTidActual);
+					do
+					{
 					// Only the enumeration entry whose TID matches the sponsor is
 					// interesting. Written as a positive test rather than
 					// "continue" on mismatch: continue re-evaluates the while
 					// condition, which does advance the enumeration and is
 					// bounded by the thread count, but reads like a loop-next
 					// and invites a real spin if the condition ever changes.
-					if (processInformation.GetThreadId() == SponsorTidActual)
-					{
-						if (processInformation.IsThreadWorkerThread())
+						if (processInformation.GetThreadId() == SponsorTidActual)
 						{
-							LOG(2, "Sponsor TID %06X is a loader worker; ignoring sponsor\n", SponsorTidActual);
+							if (processInformation.IsThreadWorkerThread())
+							{
+								sponsor_worker = true;
+								LOG(2, "Sponsor TID %06X is a loader worker; ignoring sponsor\n", SponsorTidActual);
+								break;
+							}
+							KTHREAD_STATE st{};
+							KWAIT_REASON wr{};
+							const bool have_state = processInformation.GetThreadState(st, wr);
+							const bool alertable = processInformation.IsThreadInAlertableState();
+							if (alertable || (have_state && st == running_state))
+							{
+								sponsor_usable = true;
+							}
+							else if (sponsor_pass + 1 < kSponsorValidationPasses)
+							{
+								LOG(2, "Sponsor TID %06X not alertable/Running (state=%d reason=%d); re-checking\n",
+									SponsorTidActual, have_state ? static_cast<int>(st) : -1, have_state ? static_cast<int>(wr) : -1);
+							}
+							else
+							{
+								LOG(2, "Sponsor TID %06X not alertable/Running (state=%d reason=%d); ignoring sponsor\n",
+									SponsorTidActual, have_state ? static_cast<int>(st) : -1, have_state ? static_cast<int>(wr) : -1);
+							}
 							break;
 						}
-						KTHREAD_STATE st{};
-						KWAIT_REASON wr{};
-						const bool have_state = processInformation.GetThreadState(st, wr);
-						const bool alertable = processInformation.IsThreadInAlertableState();
-						if (alertable || (have_state && st == running_state))
-						{
-							sponsor_usable = true;
-						}
-						else
-						{
-							LOG(2, "Sponsor TID %06X not alertable/Running (state=%d reason=%d); ignoring sponsor\n",
-								SponsorTidActual, have_state ? static_cast<int>(st) : -1, have_state ? static_cast<int>(wr) : -1);
-						}
-						break;
 					}
+					while (processInformation.NextThread());
+					// No verdict this pass (TID unseen or transient state):
+					// the next pass refreshes. Usable/worker verdicts and an
+					// exhausted budget leave via the loop condition.
 				}
-				while (processInformation.NextThread());
 			}
 			else
 			{

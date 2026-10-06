@@ -113,6 +113,7 @@ set "MUTATE_ARGS=/p:AmegerMmapSentinel=%AmegerMmapSentinel% /p:AmegerStringSeed=
 echo.
 echo   %C_GREEN%[+]%C_RESET% Per-build sentinel: %C_GREEN%%AmegerMmapSentinel%%C_RESET%
 echo   %C_GREEN%[+]%C_RESET% Per-build string seed: %C_GREEN%%AmegerStringSeed%%C_RESET%
+echo.
 goto :seeds_ready
 
 :seeds_missing

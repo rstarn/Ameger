@@ -713,11 +713,18 @@ namespace
     // Picks a hijack-victim thread for the target with a pure
     // SystemProcessInformation query (nothing is opened, nothing is touched
     // in the target). Returns 0 when no suitable thread exists - the runtime
-    // then falls back to its own search. Scoring: a parked Waiting thread
-    // (except WrQueue) beats Running beats anything else. A Running thread
-    // is liable to be inside a scan/dispatch loop, where suspending it skews
-    // timing checks and parks anomalous state; a waiter sits in ntdll with a
-    // clean stack, so borrowing it for the 1-3 s shell run is lower-signal.
+    // then falls back to its own search. Scoring is aligned with the runtime
+    // sponsor gate (SR_HijackThread): a sponsor is used only when it is
+    // alertable OR Running (and not a loader worker). Alertability is not
+    // visible in this handle-free snapshot, so a Waiting pick is a gamble the
+    // runtime usually rejects - each rejection costs the stealthy path and
+    // forces the donor-scan fallback (a full handle-table enumeration plus a
+    // hijack on an arbitrary TID the picker never vetted). Running executes
+    // the stub immediately after ResumeThread, so it is accepted
+    // deterministically and can never burn the full timeout as Pending the
+    // way a parked non-alertable waiter does. Waiting (except WrQueue, which
+    // never wakes on PostThreadMessage) is therefore only the fallback when
+    // the snapshot holds no Running thread at all.
     DWORD PickHijackThreadTid(DWORD target_pid)
     {
         if (!target_pid)
@@ -797,11 +804,11 @@ namespace
                     }
 
                     int score = 1;
-                    if (thread->ThreadState == 5 && thread->WaitReason != 0x0F) // Waiting, not WrQueue
+                    if (thread->ThreadState == 2) // Running: runtime sponsor gate accepts without alertability proof
                     {
                         score = 3;
                     }
-                    else if (thread->ThreadState == 2) // Running
+                    else if (thread->ThreadState == 5 && thread->WaitReason != 0x0F) // Waiting, not WrQueue: fallback only
                     {
                         score = 2;
                     }
